@@ -1,0 +1,20 @@
+# 车顶胶条检测系统 - 依赖清单
+# 沙盒阶段只需前 4 项即可跑通 mock demo；现场联调时取消注释对应行。
+
+# 核心（必装）
+numpy>=1.24
+opencv-python-headless>=4.8
+Pillow>=10.0
+
+# PLC 通信（联调时启用）
+# pymodbus>=3.5
+# python-snap7>=1.4
+
+# 数据库与对象存储（联调时启用）
+# SQLAlchemy>=2.0
+# PyMySQL>=1.1
+# minio>=7.2
+
+# Web UI
+fastapi>=0.110
+uvicorn>=0.29

@@ -1,0 +1,62 @@
+# -*- coding: utf-8 -*-
+"""模块间的数据结构与接口契约。
+
+设计目的：各模块（采集 / 算法 / 存储 / PLC）只通过这些结构通信，
+互不依赖彼此的实现细节。改算法、换相机、换数据库都不影响总控流程。
+"""
+from dataclasses import dataclass, field
+from typing import List
+from enum import Enum
+
+
+class CarModel(str, Enum):
+    TIGUAN = "Tiguan"
+    A5 = "A5"
+    UNKNOWN = "Unknown"
+
+
+@dataclass
+class CaptureRequest:
+    """总控 -> 采集模块：触发采集的请求。"""
+    car_model: str
+    count: int = 8
+    interval_sec: float = 0.5
+
+
+@dataclass
+class CaptureResult:
+    """采集模块 -> 总控：采集结果。"""
+    ok: bool
+    images: List[str] = field(default_factory=list)   # 采集到的图像路径列表
+    message: str = ""
+
+
+@dataclass
+class Defect:
+    """单处缺陷/胶条位置的标注。"""
+    x: int
+    y: int
+    w: int
+    h: int
+    label: str = "seal"
+    confidence: float = 0.0
+
+
+@dataclass
+class DetectionResult:
+    """算法模块 -> 总控：检测结果。"""
+    car_model: str
+    ok: bool                              # 整体判定 OK / NG
+    defects: List[Defect] = field(default_factory=list)
+    confidence: float = 0.0
+    message: str = ""
+
+
+@dataclass
+class InspectionRecord:
+    """一条完整的检测记录，用于落库与 UI 展示。"""
+    car_model: str
+    ok: bool
+    image_refs: List[str] = field(default_factory=list)
+    defects: List[Defect] = field(default_factory=list)
+    timestamp: str = ""
