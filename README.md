@@ -26,7 +26,10 @@ car_roof_seal_detection/
 │   ├── camera.py           # 相机采集（读现场相片 / mock 图）
 │   └── lighting.py         # 照明控制（mock）
 ├── detection/
-│   └── detector.py         # 视觉检测（占位算法，可换深度学习）
+│   └── detector.py         # 视觉检测（胶条外形算法：加亮→ROI→小波→OTSU+阈值扣减+形态学）
+├── tools/
+│   ├── validate_detector.py  # 离线/仿真验证工具（生成仿真图或验证真图目录）
+│   └── make_mock_images.py   # 重新生成匹配真实 ROI 的 mock 演示图
 ├── storage/
 │   ├── database.py         # MySQL 存储（mock）
 │   ├── object_store.py     # MinIO 对象存储（mock）
@@ -49,7 +52,7 @@ car_roof_seal_detection/
 | `plc/state_machine` | 初始化→PLC通信→车型校验→触发 | 状态机编排，只决策不实现 |
 | `plc/plc_controller` | 车辆移动 / 车型 / 结果回写 | PLC 信号读写（mock） |
 | `capture/camera` + `lighting` | 启动取流+照明、采集8张 | 图像采集（读现场相片） |
-| `detection/detector` | 触发检测线程、分车型检测 | 胶条定位与 OK/NG（占位） |
+| `detection/detector` | 触发检测线程、分车型检测 | 胶条外形定位与 OK/NG（gamma加亮→ROI裁剪→db4小波去噪→OTSU+阈值扣减+形态学开闭） |
 | `storage/*` | 写入 MySQL + MinIO | 落库 + 存图 |
 | `ui/app` | UI 定时刷新展示 | 结果/图片展示 |
 
@@ -73,6 +76,23 @@ uvicorn ui.app:app --reload --port 8000
 ```
 
 把现场真实胶条相片（任意文件名）放进 `data/raw_images/`，采集模块会自动优先使用。
+
+### 3.1 用真图快速验证算法（推荐先跑这个）
+
+不需要启动整套流程，用 `tools/validate_detector.py` 直接对 `data/raw_images/`
+里的真图批量跑检测，并把结果画框保存到 `tools/results/`：
+
+```bash
+# 把真图放进 data/raw_images/ 后
+python tools/validate_detector.py --src data/raw_images
+# 生成仿真图自检（无真图时）：一张有胶条(应OK)、一张无胶条(应NG)
+python tools/validate_detector.py
+```
+
+`detection/detector.py` 顶部集中了全部算法参数（`ROI`、`OTSU_*`、
+`MIN_CONTOUR_AREA`、形态学核等），现场调参只改这一处即可。
+当前算法要求**胶条明显暗于车身**（灰度 ≤ 阈值下限 40 的最暗区域），
+若你的真图胶条不够暗，请调大 `OTSU_THRESHOLD_DELTA` 或调低 `OTSU_MIN_THRESH`。
 
 ---
 

@@ -37,7 +37,10 @@ class CameraCapture:
         raw = sorted(glob.glob(os.path.join(C.RAW_IMAGE_DIR, "*")))
         if raw:
             return raw
-        return sorted(glob.glob(os.path.join(C.MOCK_IMAGE_DIR, "*.png")))
+        imgs = []
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+            imgs.extend(sorted(glob.glob(os.path.join(C.MOCK_IMAGE_DIR, ext))))
+        return sorted(imgs)
 
     def capture(self, req: CaptureRequest) -> CaptureResult:
         imgs = self._list_images()

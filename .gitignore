@@ -3,6 +3,7 @@ __pycache__/
 *.db
 data/raw_images/
 data/stored_images/
+tools/results/
 .venv/
 venv/
 .DS_Store
