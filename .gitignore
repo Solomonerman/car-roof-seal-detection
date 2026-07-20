@@ -3,6 +3,7 @@ __pycache__/
 *.db
 data/raw_images/
 data/stored_images/
+data/calibration/
 tools/results/
 .venv/
 venv/
