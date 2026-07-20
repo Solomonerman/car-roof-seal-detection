@@ -33,13 +33,23 @@ class CaptureResult:
 
 @dataclass
 class Defect:
-    """单处缺陷/胶条位置的标注。"""
+    """单处缺陷/胶条位置的标注。
+
+    label 取值：
+      seal      : 正常检出的胶条段（信息，不计入 NG）
+      width     : 宽度超出 20±5mm
+      missing   : ROI 内整段无胶条
+      break     : 断胶（纵向空洞 / 段间间隙离群）
+      overspray : 过喷（主胶条附近离散暗斑）
+    meta: 附加过程信息（如 width_mm），落库时一并保存。
+    """
     x: int
     y: int
     w: int
     h: int
     label: str = "seal"
     confidence: float = 0.0
+    meta: dict = None
 
 
 @dataclass

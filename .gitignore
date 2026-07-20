@@ -4,6 +4,7 @@ __pycache__/
 data/raw_images/
 data/stored_images/
 data/calibration/
+data/process_data/
 tools/results/
 .venv/
 venv/

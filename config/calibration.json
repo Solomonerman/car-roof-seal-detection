@@ -1,0 +1,10 @@
+{
+  "mm_per_pixel": 0.30466,
+  "pixel_per_mm": 3.282,
+  "square_spacing_px": 32.823,
+  "pattern_inner_corners": [19, 14],
+  "source_image": "Image__2026-06-10__17-43-250 bbiaoding1.bmp",
+  "camera_side": "left",
+  "note": "1cm方格标定（20x15方格 -> 19x14内角点）；车身弧度未校正，必要时后续做畸变校正",
+  "saved_at": "2026-06-10"
+}
