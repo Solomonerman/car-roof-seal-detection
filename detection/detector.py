@@ -23,7 +23,9 @@ LINEAR_ALPHA = 1.0
 LINEAR_BETA = 5
 
 # Step2 ROI：(x左上, y左上, 宽度w, 高度h)
-ROI = (0, 405, 1439, 259)
+# 实测相机分辨率为 1920x1200，ROI 宽度设 1920 覆盖整幅；
+# _detect_one 内部用 min() 把 ROI clamp 到图像边界，更窄图像(如 1440)也自适应。
+ROI = (0, 405, 1920, 259)
 
 # Step3 小波滤波
 WAVELET_TYPE = 'db4'
@@ -33,7 +35,7 @@ OTSU_INVERTED = True         # 灰度<=阈值→白色（胶条）
 OTSU_THRESHOLD_DELTA = 120   # 实际阈值 = OTSU自动阈值 - 120，过滤暗背景误判
 OTSU_MAX_THRESH = 220        # 阈值上限保护
 OTSU_MIN_THRESH = 40         # 阈值下限保护
-MIN_CONTOUR_AREA = 150        # 面积过滤：仅保留大面积胶条
+MIN_CONTOUR_AREA = 300        # 面积过滤：滤除 17x15 级小噪声碎片，仅保留大面积胶条
 
 # Step4.5 形态学开闭运算
 MORPHOLOGY_ENABLE = True

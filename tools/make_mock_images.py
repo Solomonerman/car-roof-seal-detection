@@ -32,10 +32,11 @@ def make_roof(width, height, seed=0):
     sy = y + int(h * 0.35)
     sh = int(h * 0.30)
     # 暗色胶条：模拟接近黑色的橡胶密封条（灰度~30），匹配算法阈值下限40
-    seal = np.full((sh, w, 3), 30.0, dtype=np.float32)
-    hl = rng.normal(0, 6, (sh, w)).astype(np.float32)[..., None]
+    # 胶条横向铺满整幅图宽(width)，非 ROI 宽，避免 1920 宽 ROI 越界
+    seal = np.full((sh, width, 3), 30.0, dtype=np.float32)
+    hl = rng.normal(0, 6, (sh, width)).astype(np.float32)[..., None]
     seal = np.clip(seal + hl, 0, 255).astype(np.uint8)
-    vis[sy:sy + sh, 0:w] = seal
+    vis[sy:sy + sh, 0:width] = seal
     return vis
 
 

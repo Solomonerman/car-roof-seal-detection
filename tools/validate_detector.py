@@ -49,10 +49,10 @@ def make_roof(width, height, with_seal=True, seed=0):
 
     if with_seal:
         x, y, w, h = ROI
-        # 胶条落在 ROI 带中部，留一点上下边距
+        # 胶条落在 ROI 带中部，留一点上下边距；胶条横向铺满整幅图宽(width)，非 ROI 宽
         sy = y + int(h * 0.35)
         sh = int(h * 0.30)
-        sx, sw = 0, w
+        sx, sw = 0, width
         # 暗色胶条主体：模拟接近黑色的橡胶密封条（灰度~30）
         seal = np.full((sh, sw, 3), 30.0, dtype=np.float32)
         # 胶条上的反光高光（局部提亮，但不改变"暗"的本质）
