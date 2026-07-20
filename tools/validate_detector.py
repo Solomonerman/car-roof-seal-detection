@@ -21,6 +21,7 @@
 import os
 import sys
 import glob
+import subprocess
 import argparse
 import numpy as np
 import cv2
@@ -87,10 +88,43 @@ def annotate(src_path, result, out_path):
     cv2.imwrite(out_path, img)
 
 
+def _open_file(path):
+    """用系统默认程序打开文件（主要用于自动展示 HTML 报告）。"""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception as e:
+        print(f"[提示] 无法自动打开 {path}：{e}")
+
+
+def _write_html(out_dir, rows, title="胶条检测结果"):
+    parts = [f"<html><head><meta charset='utf-8'>"
+             f"<title>{title}</title></head><body>"
+             f"<h1>{title}</h1>"
+             f"<p>每张图上的绿框=检出的胶条，红框=缺失。</p>"]
+    for name, ok, n_seal, n_miss, conf, annot in rows:
+        color = "#1a7f1a" if ok else "#c01414"
+        verdict = "OK" if ok else "NG"
+        parts.append(
+            f"<h3 style='color:{color}'>{name} → {verdict} "
+            f"(胶条={n_seal} 缺失={n_miss} 置信={conf:.3f})</h3>"
+            f"<img src='{annot}' style='max-width:95%;border:1px solid #ccc;"
+            f"margin-bottom:16px;'><hr>")
+    parts.append("</body></html>")
+    html_path = os.path.join(out_dir, "report.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+    return html_path
+
+
 # ----------------------- 验证主流程 -----------------------
 def validate_paths(paths, out_dir):
     det = SealDetector()
-    report_lines = []
+    rows = []
     for p in paths:
         res = det.detect("TEST", [p])
         out_path = os.path.join(out_dir, "annot_" + os.path.basename(p))
@@ -100,8 +134,9 @@ def validate_paths(paths, out_dir):
         line = (f"{os.path.basename(p):20s} -> {'OK' if res.ok else 'NG'} | "
                 f"胶条={len(seals)} 缺失={len(miss)} 置信={res.confidence:.3f}")
         print(line)
-        report_lines.append(line)
-    return report_lines
+        rows.append((os.path.basename(p), res.ok, len(seals), len(miss),
+                     res.confidence, os.path.basename(out_path)))
+    return rows
 
 
 def main():
@@ -121,7 +156,12 @@ def main():
             print(f"[警告] {args.src} 下没有图片")
             return
         print(f"=== 验证真图：{len(paths)} 张 ===")
-        validate_paths(paths, out_dir)
+        rows = validate_paths(paths, out_dir)
+        # 生成 HTML 报告并自动用浏览器打开，直接看画框结果
+        html_path = _write_html(out_dir, rows,
+                                title=f"胶条检测结果（{len(paths)} 张真图）")
+        print(f"=== 报告已生成并打开: {html_path} ===")
+        _open_file(html_path)
         return
 
     # 默认：生成仿真图并验证
