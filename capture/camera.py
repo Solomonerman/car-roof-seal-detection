@@ -33,24 +33,29 @@ class CameraCapture:
             self.lighting.off()
         print("[采集] 相机取流已停止")
 
-    def _list_images(self) -> list:
+    def _list_images(self):
+        """返回 (图像路径列表, 是否真实相片)。
+        优先读 data/raw_images；为空则回退 mock 占位图。"""
         raw = sorted(glob.glob(os.path.join(C.RAW_IMAGE_DIR, "*")))
         if raw:
-            return raw
+            return raw, True
         imgs = []
         for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
             imgs.extend(sorted(glob.glob(os.path.join(C.MOCK_IMAGE_DIR, ext))))
-        return sorted(imgs)
+        return sorted(imgs), False
 
     def capture(self, req: CaptureRequest) -> CaptureResult:
-        imgs = self._list_images()
+        imgs, is_real = self._list_images()
         if not imgs:
             return CaptureResult(ok=False, message="未找到任何图像")
         # 模拟按时间节点采集：从可用图像中按间隔挑选 count 张
         step = max(1, len(imgs) // req.count)
         selected = imgs[::step][:req.count]
-        while len(selected) < req.count and imgs:
-            selected.append(imgs[len(selected) % len(imgs)])
+        # 仅 mock 演示模式才复制补满 count 张；真实相片不复制，
+        # 避免“1 张真图被重复检测 N 次”导致缺陷数虚高。
+        if not is_real:
+            while len(selected) < req.count and imgs:
+                selected.append(imgs[len(selected) % len(imgs)])
         # 模拟采集时间间隔（沙盒里压缩等待，避免拖慢 demo）
         for _ in selected:
             time.sleep(min(req.interval_sec, 0.01))
