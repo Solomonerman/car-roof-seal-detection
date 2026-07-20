@@ -31,11 +31,11 @@ from common.interfaces import DetectionResult, Defect
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ===================== 算法参数（来自用户定义） =====================
-# Step1 轻度加亮
+# Step1 加亮：gamma<1 提亮暗部，值越小越亮（用户要求再加亮）
 BRIGHT_MODE = 'gamma'        # 'gamma' 或 'linear'
-GAMMA_VALUE = 0.95           # 轻度提亮暗部
+GAMMA_VALUE = 0.82           # 提亮暗部，增强胶条与背景对比
 LINEAR_ALPHA = 1.0
-LINEAR_BETA = 5
+LINEAR_BETA = 8              # linear 模式下的额外提亮偏移
 
 # Step2 ROI：(x左上, y左上, 宽度w, 高度h)
 # 实测相机分辨率为 1920x1200，ROI 宽度设 1920 覆盖整幅；
@@ -47,7 +47,7 @@ WAVELET_TYPE = 'db4'
 
 # Step4 OTSU 参数
 OTSU_INVERTED = True         # 灰度<=阈值→白色（胶条）
-OTSU_THRESHOLD_DELTA = 120   # 实际阈值 = OTSU自动阈值 - 120，过滤暗背景误判
+OTSU_THRESHOLD_DELTA = 135   # 实际阈值 = OTSU自动阈值 - delta；delta 越大判定越严（去误检）
 OTSU_MAX_THRESH = 220        # 阈值上限保护
 OTSU_MIN_THRESH = 40         # 阈值下限保护
 MIN_CONTOUR_AREA = 300        # 面积过滤：滤除 17x15 级小噪声碎片，仅保留大面积胶条
@@ -142,13 +142,21 @@ def _wavelet_denoise(gray: np.ndarray) -> np.ndarray:
 
 
 def _build_mask(gray: np.ndarray):
-    """Step2~4.5：输入灰度 ROI，输出 (mask_closed, mask_open) 两张二值图。
+    """Step1~4.5：输入灰度 ROI，返回 (mask_closed, mask_open, steps)。
 
     mask_open  : 仅做开运算，保留真实断裂（用于连续性/断胶判定）
     mask_closed: 闭+开，胶条更连贯平滑（用于显示与测宽）
+    steps      : dict{名称: 灰度图/二值图}，用于逐步过程可视化
+                0_roi / 1_bright / 2_wavelet / 3_otsu / 4_open / 5_close
     """
+    out = {}
+    # Step1 加亮（增强胶条与背景对比）
+    roi = _brighten(gray)
+    out['1_bright'] = roi.copy()
+
     # Step3 小波去噪
-    roi = _wavelet_denoise(gray)
+    roi = _wavelet_denoise(roi)
+    out['2_wavelet'] = roi.copy()
 
     # Step4 OTSU + 阈值扣减
     if OTSU_INVERTED:
@@ -161,22 +169,27 @@ def _build_mask(gray: np.ndarray):
                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         actual = int(otsu_val) - OTSU_THRESHOLD_DELTA
     actual = max(OTSU_MIN_THRESH, min(OTSU_MAX_THRESH, actual))
+    out['_actual_thresh'] = actual  # 仅记录，不存图
 
     if OTSU_INVERTED:
         mask = (roi <= actual).astype(np.uint8) * 255   # 灰度<=阈值 → 胶条(白)
     else:
         mask = (roi >= actual).astype(np.uint8) * 255
+    out['3_otsu'] = mask.copy()
 
     if not MORPHOLOGY_ENABLE:
-        return mask, mask
+        out['5_close'] = mask.copy()
+        return mask, mask, out
 
     open_k = cv2.getStructuringElement(cv2.MORPH_CROSS, OPEN_KERNEL_SIZE)
     mask_open = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k,
                                  iterations=MORPHOLOGY_ITERATIONS)
+    out['4_open'] = mask_open.copy()
     close_k = cv2.getStructuringElement(cv2.MORPH_CROSS, CLOSE_KERNEL_SIZE)
     mask_closed = cv2.morphologyEx(mask_open, cv2.MORPH_CLOSE, close_k,
                                    iterations=MORPHOLOGY_ITERATIONS)
-    return mask_closed, mask_open
+    out['5_close'] = mask_closed.copy()
+    return mask_closed, mask_open, out
 
 
 # ===================== 几何测量 =====================
@@ -244,9 +257,11 @@ def _detect_one(path: str, process_dir: str = None):
     else:
         roi_gray = gray_full[y0:y1, x0:x1]
 
-    # 加亮 + 建 mask
-    roi_bright = _brighten(roi_gray)
-    mask_closed, mask_open = _build_mask(roi_bright)
+    # 加亮 + 建 mask（含每一步中间图，供逐步调参确认）
+    mask_closed, mask_open, steps = _build_mask(roi_gray)
+    if process_dir:
+        print(f"[过程] {os.path.basename(path)} OTSU 实际阈值 = "
+              f"{steps.get('_actual_thresh', 0)}")
 
     defects: list = []
 
@@ -272,7 +287,8 @@ def _detect_one(path: str, process_dir: str = None):
         defects.append(Defect(x0, y0, x1 - x0, y1 - y0, "missing", 0.9,
                               meta={"reason": "ROI内未检出胶条"}))
         if process_dir:
-            _save_process(img, (x0, y0, x1, y1), mask_closed, defects, path, process_dir)
+            _save_process(img, (x0, y0, x1, y1), mask_closed, defects,
+                          path, process_dir, steps, roi_gray)
         return defects
 
     # 主胶条段 vs 过喷候选
@@ -360,24 +376,36 @@ def _detect_one(path: str, process_dir: str = None):
                               meta={"area_px": int(s["area"])}))
 
     if process_dir:
-        _save_process(img, (x0, y0, x1, y1), mask_closed, defects, path, process_dir)
+        _save_process(img, (x0, y0, x1, y1), mask_closed, defects,
+                      path, process_dir, steps, roi_gray)
     return defects
 
 
-def _save_process(img, roi_box, mask, defects, src_path, process_dir):
-    """保存过程数据：纯 mask + mask 叠加验证图。"""
+def _save_process(img, roi_box, mask, defects, src_path, process_dir,
+                  steps=None, roi_gray=None):
+    """保存过程数据：每一步中间图 + 纯 mask + mask 叠加验证图。"""
     os.makedirs(process_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(src_path))[0]
     x0, y0, x1, y1 = roi_box
     h, w = img.shape[:2]
 
-    # 1) 纯 mask（白=胶条，黑=背景）
+    # 逐步过程图（灰度/二值）
+    if steps:
+        # 0_roi：ROI 裁剪后的原始灰度（与 1_bright 对比看加亮效果）
+        if roi_gray is not None:
+            cv2.imwrite(os.path.join(process_dir, f"{base}_0_roi.png"), roi_gray)
+        for name in ("1_bright", "2_wavelet", "3_otsu", "4_open", "5_close"):
+            if name in steps:
+                cv2.imwrite(os.path.join(process_dir, f"{base}_{name}.png"),
+                            steps[name])
+
+    # 纯 mask（白=胶条，黑=背景）
     mask_full = np.zeros((h, w), np.uint8)
     mask_full[y0:y1, x0:x1] = mask
     mask_path = os.path.join(process_dir, base + "_mask.png")
     cv2.imwrite(mask_path, mask_full)
 
-    # 2) 叠加验证图：把真实检测到的胶条像素染成青色，并画框
+    # 叠加验证图：把真实检测到的胶条像素染成青色，并画框
     vis = img.copy()
     roi_vis = vis[y0:y1, x0:x1]
     mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
