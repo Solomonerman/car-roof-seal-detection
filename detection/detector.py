@@ -37,6 +37,13 @@ GAMMA_VALUE = 0.82           # 提亮暗部，增强胶条与背景对比
 LINEAR_ALPHA = 1.0
 LINEAR_BETA = 8              # linear 模式下的额外提亮偏移
 
+# Step1.5 反光 / 非均匀光照抑制
+# 模型：图像 = 光照(低频) × 反射率(高频)。反光是局部高光照，胶条是低反射率(暗)。
+# 'retinex'：用大核高斯估计光照并除掉，反光被抵消、胶条因低反射率仍保持暗 → 分离二者
+# 'none'   ：关闭
+REFLECTION_CORRECTION = 'retinex'
+RETINEX_SIGMA = 31           # 光照估计的高斯模糊半径(px)，越大越平滑、去越大块反光
+
 # Step2 ROI：(x左上, y左上, 宽度w, 高度h)
 # 实测相机分辨率为 1920x1200，ROI 宽度设 1920 覆盖整幅；
 # _detect_one 内部用 min() 把 ROI clamp 到图像边界，更窄图像(如 1440)也自适应。
@@ -120,6 +127,20 @@ def _brighten(gray: np.ndarray) -> np.ndarray:
     return cv2.convertScaleAbs(gray, alpha=LINEAR_ALPHA, beta=LINEAR_BETA)
 
 
+def _illumination_normalize(gray: np.ndarray, sigma: int = 31) -> np.ndarray:
+    """Step1.5 Retinex 光照归一化：估计并除掉低频光照(含反光)，保留反射率。
+
+    图像 = 光照(低频) × 反射率(高频)。用大核高斯估计光照分量，
+    在 log 域相减后还原：反光(高光照)被抵消，胶条(低反射率)仍保持暗。
+    """
+    roi = gray.astype(np.float32) + 1.0
+    illum = cv2.GaussianBlur(roi, (0, 0), sigma)
+    illum = np.clip(illum, 1.0, None)
+    r = np.log(roi) - np.log(illum)              # 反射率（log 域）
+    r = (r - np.min(r)) / (np.ptp(r) + 1e-6)     # 归一化到 0~1
+    return (r * 255).astype(np.uint8)
+
+
 def _wavelet_denoise(gray: np.ndarray) -> np.ndarray:
     """Step3：db4 小波去噪，保留边缘；pywt 不可用时降级为中值滤波。"""
     try:
@@ -153,6 +174,13 @@ def _build_mask(gray: np.ndarray):
     # Step1 加亮（增强胶条与背景对比）
     roi = _brighten(gray)
     out['1_bright'] = roi.copy()
+
+    # Step1.5 反光/非均匀光照抑制：Retinex 光照归一化
+    if REFLECTION_CORRECTION == 'retinex':
+        roi = _illumination_normalize(roi, RETINEX_SIGMA)
+        out['1b_reflect'] = roi.copy()
+    else:
+        out['1b_reflect'] = roi.copy()
 
     # Step3 小波去噪
     roi = _wavelet_denoise(roi)
@@ -394,7 +422,8 @@ def _save_process(img, roi_box, mask, defects, src_path, process_dir,
         # 0_roi：ROI 裁剪后的原始灰度（与 1_bright 对比看加亮效果）
         if roi_gray is not None:
             cv2.imwrite(os.path.join(process_dir, f"{base}_0_roi.png"), roi_gray)
-        for name in ("1_bright", "2_wavelet", "3_otsu", "4_open", "5_close"):
+        for name in ("1_bright", "1b_reflect", "2_wavelet",
+                     "3_otsu", "4_open", "5_close"):
             if name in steps:
                 cv2.imwrite(os.path.join(process_dir, f"{base}_{name}.png"),
                             steps[name])
