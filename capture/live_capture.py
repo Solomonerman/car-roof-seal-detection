@@ -118,13 +118,21 @@ def _configure_camera(cam):
         print(f"[采集] 像素格式已设为 {PIXEL_FORMAT}")
     except Exception:
         print(f"[采集] 像素格式设置失败，将使用相机当前值")
+    # 曝光：自动模式先关掉，否则手动曝光值写不进去
+    try:
+        auto_node = nodemap.GetNode("ExposureAuto")
+        if auto_node:
+            auto_node.SetValue("Off")
+            print("[采集] 曝光自动已设为 Off")
+    except Exception:
+        pass
     # 曝光时间
     try:
         exp_node = nodemap.GetNode("ExposureTime")
         exp_node.SetValue(EXPOSURE_TIME_US)
         print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs")
     except Exception:
-        print("[采集] 曝光时间设置失败")
+        print("[采集] 曝光时间设置失败（可能曝光自动未关或越界）")
     # 增益（None = 沿用相机当前值，不修改）
     if GAIN_DB is None:
         print("[采集] 增益沿用相机当前值（不修改）")

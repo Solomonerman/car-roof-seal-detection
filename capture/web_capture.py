@@ -145,12 +145,20 @@ class CameraStreamer:
             conf_log.append(f"像素格式={PIXEL_FORMAT}")
         except Exception:
             conf_log.append("像素格式设置失败(沿用当前值)")
+        # 曝光：自动模式必须先关掉，否则手动曝光值写不进去
+        try:
+            auto_node = nodemap.GetNode("ExposureAuto")
+            if auto_node:
+                auto_node.SetValue("Off")
+                conf_log.append("曝光自动=Off")
+        except Exception:
+            pass
         # 曝光
         try:
             nodemap.GetNode("ExposureTime").SetValue(EXPOSURE_TIME_US)
             conf_log.append(f"曝光={EXPOSURE_TIME_US}µs")
         except Exception:
-            conf_log.append("曝光设置失败")
+            conf_log.append("曝光设置失败(可能曝光自动未关或越界)")
         # 增益（None = 沿用相机当前值，不修改）
         if GAIN_DB is None:
             conf_log.append("增益=沿用相机当前值(不修改)")
