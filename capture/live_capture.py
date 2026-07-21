@@ -37,9 +37,15 @@ DURATION_SEC = 7       # 连拍持续时长（秒）
 
 # ===================== 相机连接参数 =====================
 # 二选一：填 IP 或序列号（都填则以 IP 优先）
-CAMERA_IP = ""         # 例如 "192.168.1.100"
-CAMERA_SERIAL = ""     # 例如 "12345678"
+CAMERA_IP = "172.30.173.249"   # 现场左侧 Basler aca1920-48gm
+CAMERA_SERIAL = ""             # 例如 "12345678"
 # 如果两个都空，脚本自动搜索第一台可用的 Basler 相机
+
+# ===================== 相机采集参数 =====================
+EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
+GAIN_DB = 0.0                # 增益（dB），默认 0
+GAMMA = 1.0                  # Gamma，默认 1.0
+PIXEL_FORMAT = "Mono8"       # 像素格式：aca1920-48gm 是黑白相机，Mono8 = 8bit 灰度
 
 # ===================== 存储参数 =====================
 SAVE_DIR = os.path.join(ROOT, "data", "raw_images")
@@ -92,6 +98,47 @@ def _find_camera():
     return cam, info
 
 
+def _configure_camera(cam):
+    """设置相机采集参数：曝光、增益、Gamma、像素格式。"""
+    nodemap = cam.GetNodeMap()
+    # 像素格式
+    try:
+        fmt_node = nodemap.GetNode("PixelFormat")
+        fmt_node.SetValue(PIXEL_FORMAT)
+        print(f"[采集] 像素格式已设为 {PIXEL_FORMAT}")
+    except Exception:
+        print(f"[采集] 像素格式设置失败，将使用相机当前值")
+    # 曝光时间
+    try:
+        exp_node = nodemap.GetNode("ExposureTime")
+        exp_node.SetValue(EXPOSURE_TIME_US)
+        print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs")
+    except Exception:
+        print("[采集] 曝光时间设置失败")
+    # 增益
+    try:
+        gain_node = nodemap.GetNode("Gain")
+        gain_node.SetValue(GAIN_DB)
+        print(f"[采集] 增益已设为 {GAIN_DB} dB")
+    except Exception:
+        print("[采集] 增益设置失败")
+    # Gamma
+    try:
+        gamma_node = nodemap.GetNode("Gamma")
+        gamma_node.SetValue(GAMMA)
+        print(f"[采集] Gamma 已设为 {GAMMA}")
+    except Exception:
+        print("[采集] Gamma 设置失败")
+
+
+def _get_pixel_format_name(grab_result):
+    """从抓取结果获取像素格式的友好名称。"""
+    try:
+        return grab_result.GetPixelType()
+    except Exception:
+        return "未知"
+
+
 def _format_filename(prefix="Image"):
     """生成带时间戳的文件名，与现有 raw_images 命名一致。"""
     ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
@@ -119,6 +166,7 @@ def main():
           f"  序列号={info['serial']}  IP={info.get('ip', 'N/A')}")
 
     # 配置相机
+    _configure_camera(cam)
     cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
     # 获取一张以确认分辨率和像素格式
     grab = cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
@@ -131,7 +179,8 @@ def main():
     img = grab.Array
     h, w = img.shape[:2]
     is_color = len(img.shape) == 3
-    print(f"[采集] 分辨率={w}×{h}  色彩={'彩色' if is_color else '黑白'}  像素格式={grab.GetPixelType()}")
+    actual_fmt = _get_pixel_format_name(grab)
+    print(f"[采集] 分辨率={w}×{h}  色彩={'彩色' if is_color else '黑白'}  像素格式={actual_fmt}")
     grab.Release()
 
     os.makedirs(save_dir, exist_ok=True)
