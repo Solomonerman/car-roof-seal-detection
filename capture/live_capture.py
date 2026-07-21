@@ -111,36 +111,8 @@ def _find_camera():
 def _configure_camera(cam):
     """设置相机采集参数：曝光、增益、Gamma、像素格式。"""
     nodemap = cam.GetNodeMap()
-    # 像素格式
-    try:
-        fmt_node = nodemap.GetNode("PixelFormat")
-        fmt_node.SetValue(PIXEL_FORMAT)
-        print(f"[采集] 像素格式已设为 {PIXEL_FORMAT}")
-    except Exception:
-        print(f"[采集] 像素格式设置失败，将使用相机当前值")
-    # 曝光：自动模式先关掉，否则手动曝光值写不进去
-    try:
-        auto_node = nodemap.GetNode("ExposureAuto")
-        if auto_node:
-            auto_node.SetValue("Off")
-            print("[采集] 曝光自动已设为 Off")
-    except Exception as e:
-        print(f"[采集] 曝光自动设置异常: {e}")
-    # 曝光模式设为 Timed（部分相机默认非 Timed，手动曝光会写不进）
-    try:
-        mode_node = nodemap.GetNode("ExposureMode")
-        if mode_node:
-            mode_node.SetValue("Timed")
-            print("[采集] 曝光模式已设为 Timed")
-    except Exception as e:
-        print(f"[采集] 曝光模式设置异常: {e}")
-    # 曝光时间
-    try:
-        exp_node = nodemap.GetNode("ExposureTime")
-        exp_node.SetValue(EXPOSURE_TIME_US)
-        print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs")
-    except Exception as e:
-        print(f"[采集] 曝光时间设置失败: {e}")
+    # 顺序注意：先配增益/Gamma/曝光，最后再改像素格式。
+    # 改 PixelFormat 会触发相机重配置，可能让曝光节点暂时不可写。
     # 增益（None = 沿用相机当前值，不修改）
     if GAIN_DB is None:
         print("[采集] 增益沿用相机当前值（不修改）")
@@ -158,6 +130,44 @@ def _configure_camera(cam):
         print(f"[采集] Gamma 已设为 {GAMMA}")
     except Exception:
         print("[采集] Gamma 设置失败")
+    # 曝光：自动模式先关掉，否则手动曝光值写不进去
+    try:
+        auto_node = nodemap.GetNode("ExposureAuto")
+        if auto_node:
+            auto_node.SetValue("Off")
+            print("[采集] 曝光自动已设为 Off")
+    except Exception as e:
+        print(f"[采集] 曝光自动设置异常: {e}")
+    # 曝光模式设为 Timed（部分相机默认非 Timed，手动曝光会写不进）
+    try:
+        mode_node = nodemap.GetNode("ExposureMode")
+        if mode_node:
+            mode_node.SetValue("Timed")
+            print("[采集] 曝光模式已设为 Timed")
+    except Exception as e:
+        print(f"[采集] 曝光模式设置异常: {e}")
+    # 曝光时间：依次尝试 ExposureTime / ExposureTimeAbs
+    exp_ok = False
+    for name in ("ExposureTime", "ExposureTimeAbs"):
+        try:
+            node = nodemap.GetNode(name)
+            if node is None:
+                continue
+            node.SetValue(EXPOSURE_TIME_US)
+            print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs ({name})")
+            exp_ok = True
+            break
+        except Exception as e:
+            print(f"[采集] {name} 设置失败: {e}")
+    if not exp_ok:
+        print("[采集] 曝光未写入，沿用相机当前曝光值")
+    # 像素格式放最后
+    try:
+        fmt_node = nodemap.GetNode("PixelFormat")
+        fmt_node.SetValue(PIXEL_FORMAT)
+        print(f"[采集] 像素格式已设为 {PIXEL_FORMAT}")
+    except Exception:
+        print(f"[采集] 像素格式设置失败，将使用相机当前值")
 
 
 def _get_pixel_format_name(grab_result):

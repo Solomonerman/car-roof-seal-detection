@@ -139,12 +139,23 @@ class CameraStreamer:
     def _configure(self):
         nodemap = self.cam.GetNodeMap()
         conf_log = []
-        # 像素格式
+        # 顺序注意：先配增益/Gamma/曝光，最后再改像素格式。
+        # 改 PixelFormat 会触发相机重配置，可能让曝光节点暂时不可写。
+        # 增益（None = 沿用相机当前值，不修改）
+        if GAIN_DB is None:
+            conf_log.append("增益=沿用相机当前值(不修改)")
+        else:
+            try:
+                nodemap.GetNode("Gain").SetValue(GAIN_DB)
+                conf_log.append(f"增益={GAIN_DB}dB")
+            except Exception as e:
+                conf_log.append(f"增益设置异常: {e}")
+        # Gamma
         try:
-            nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
-            conf_log.append(f"像素格式={PIXEL_FORMAT}")
-        except Exception:
-            conf_log.append("像素格式设置失败(沿用当前值)")
+            nodemap.GetNode("Gamma").SetValue(GAMMA)
+            conf_log.append(f"Gamma={GAMMA}")
+        except Exception as e:
+            conf_log.append(f"Gamma设置异常: {e}")
         # 曝光：自动模式必须先关掉，否则手动曝光值写不进去
         try:
             auto_node = nodemap.GetNode("ExposureAuto")
@@ -161,27 +172,27 @@ class CameraStreamer:
                 conf_log.append("曝光模式=Timed")
         except Exception as e:
             conf_log.append(f"曝光模式设置异常: {e}")
-        # 曝光
-        try:
-            nodemap.GetNode("ExposureTime").SetValue(EXPOSURE_TIME_US)
-            conf_log.append(f"曝光={EXPOSURE_TIME_US}µs")
-        except Exception as e:
-            conf_log.append(f"曝光设置失败: {e}")
-        # 增益（None = 沿用相机当前值，不修改）
-        if GAIN_DB is None:
-            conf_log.append("增益=沿用相机当前值(不修改)")
-        else:
+        # 曝光：依次尝试 ExposureTime / ExposureTimeAbs
+        exp_ok = False
+        for name in ("ExposureTime", "ExposureTimeAbs"):
             try:
-                nodemap.GetNode("Gain").SetValue(GAIN_DB)
-                conf_log.append(f"增益={GAIN_DB}dB")
-            except Exception:
-                conf_log.append("增益设置失败")
-        # Gamma
+                node = nodemap.GetNode(name)
+                if node is None:
+                    continue
+                node.SetValue(EXPOSURE_TIME_US)
+                conf_log.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
+                exp_ok = True
+                break
+            except Exception as e:
+                conf_log.append(f"{name} 设置失败: {e}")
+        if not exp_ok:
+            conf_log.append("曝光未写入，沿用相机当前曝光值")
+        # 像素格式放最后
         try:
-            nodemap.GetNode("Gamma").SetValue(GAMMA)
-            conf_log.append(f"Gamma={GAMMA}")
-        except Exception:
-            conf_log.append("Gamma设置失败")
+            nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
+            conf_log.append(f"像素格式={PIXEL_FORMAT}")
+        except Exception as e:
+            conf_log.append(f"像素格式设置异常(沿用当前值): {e}")
         self._conf_log = conf_log
 
     def start(self):
