@@ -38,11 +38,15 @@ LINEAR_ALPHA = 1.0
 LINEAR_BETA = 8              # linear 模式下的额外提亮偏移
 
 # Step1.5 反光 / 非均匀光照抑制
-# 模型：图像 = 光照(低频) × 反射率(高频)。反光是局部高光照，胶条是低反射率(暗)。
-# 'retinex'：用大核高斯估计光照并除掉，反光被抵消、胶条因低反射率仍保持暗 → 分离二者
-# 'none'   ：关闭
-REFLECTION_CORRECTION = 'retinex'
-RETINEX_SIGMA = 31           # 光照估计的高斯模糊半径(px)，越大越平滑、去越大块反光
+# 两种方案可选：
+#  'repair'  ：反光点修复（推荐）。估计局部背景，把明显亮于背景的反光斑填平；
+#             胶条是暗的、不会亮于背景，故暗度完全不动，只去亮反光。最贴合本项目。
+#  'retinex' ：光照归一化（同态滤波简化）。会改变绝对灰度对比，已验证会让胶条变浅漏检，慎用。
+#  'none'    ：关闭
+REFLECTION_CORRECTION = 'repair'
+REPAIR_SIGMA = 31           # 局部背景估计的高斯模糊半径(px)
+REPAIR_DIFF_THRESH = 25     # 比局部背景亮超过此值(px灰度)视为反光，填平
+RETINEX_SIGMA = 31          # 仅 'retinex' 模式使用
 
 # Step2 ROI：(x左上, y左上, 宽度w, 高度h)
 # 实测相机分辨率为 1920x1200，ROI 宽度设 1920 覆盖整幅；
@@ -141,6 +145,21 @@ def _illumination_normalize(gray: np.ndarray, sigma: int = 31) -> np.ndarray:
     return (r * 255).astype(np.uint8)
 
 
+def _repair_reflection(gray: np.ndarray, sigma: int = 31, thresh: int = 25) \
+        -> np.ndarray:
+    """Step1.5 反光点修复：估计局部背景，把明显亮于背景的反光斑填平。
+
+    胶条是暗的（不会亮于背景），所以暗度完全不动；只有亮反光被背景灰度填平。
+    这不改变"胶条比背景暗"的绝对灰度关系，因此不会像 Retinex 那样把胶条洗浅漏检。
+    """
+    bg = cv2.GaussianBlur(gray, (0, 0), sigma)          # 平滑后的局部背景估计
+    diff = gray.astype(np.int16) - bg.astype(np.int16)  # 比局部背景亮多少
+    repaired = gray.copy()
+    mask_refl = diff > thresh                           # 显著偏亮 = 反光
+    repaired[mask_refl] = bg[mask_refl]
+    return repaired
+
+
 def _wavelet_denoise(gray: np.ndarray) -> np.ndarray:
     """Step3：db4 小波去噪，保留边缘；pywt 不可用时降级为中值滤波。"""
     try:
@@ -175,9 +194,12 @@ def _build_mask(gray: np.ndarray):
     roi = _brighten(gray)
     out['1_bright'] = roi.copy()
 
-    # Step1.5 反光/非均匀光照抑制：Retinex 光照归一化
+    # Step1.5 反光/非均匀光照抑制
     if REFLECTION_CORRECTION == 'retinex':
         roi = _illumination_normalize(roi, RETINEX_SIGMA)
+        out['1b_reflect'] = roi.copy()
+    elif REFLECTION_CORRECTION == 'repair':
+        roi = _repair_reflection(roi, REPAIR_SIGMA, REPAIR_DIFF_THRESH)
         out['1b_reflect'] = roi.copy()
     else:
         out['1b_reflect'] = roi.copy()
