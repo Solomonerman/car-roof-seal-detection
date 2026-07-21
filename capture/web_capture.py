@@ -151,14 +151,22 @@ class CameraStreamer:
             if auto_node:
                 auto_node.SetValue("Off")
                 conf_log.append("曝光自动=Off")
-        except Exception:
-            pass
+        except Exception as e:
+            conf_log.append(f"曝光自动设置异常: {e}")
+        # 曝光模式设为 Timed（部分相机默认非 Timed，手动曝光会写不进）
+        try:
+            mode_node = nodemap.GetNode("ExposureMode")
+            if mode_node:
+                mode_node.SetValue("Timed")
+                conf_log.append("曝光模式=Timed")
+        except Exception as e:
+            conf_log.append(f"曝光模式设置异常: {e}")
         # 曝光
         try:
             nodemap.GetNode("ExposureTime").SetValue(EXPOSURE_TIME_US)
             conf_log.append(f"曝光={EXPOSURE_TIME_US}µs")
-        except Exception:
-            conf_log.append("曝光设置失败(可能曝光自动未关或越界)")
+        except Exception as e:
+            conf_log.append(f"曝光设置失败: {e}")
         # 增益（None = 沿用相机当前值，不修改）
         if GAIN_DB is None:
             conf_log.append("增益=沿用相机当前值(不修改)")

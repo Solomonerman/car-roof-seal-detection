@@ -124,15 +124,23 @@ def _configure_camera(cam):
         if auto_node:
             auto_node.SetValue("Off")
             print("[采集] 曝光自动已设为 Off")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[采集] 曝光自动设置异常: {e}")
+    # 曝光模式设为 Timed（部分相机默认非 Timed，手动曝光会写不进）
+    try:
+        mode_node = nodemap.GetNode("ExposureMode")
+        if mode_node:
+            mode_node.SetValue("Timed")
+            print("[采集] 曝光模式已设为 Timed")
+    except Exception as e:
+        print(f"[采集] 曝光模式设置异常: {e}")
     # 曝光时间
     try:
         exp_node = nodemap.GetNode("ExposureTime")
         exp_node.SetValue(EXPOSURE_TIME_US)
         print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs")
-    except Exception:
-        print("[采集] 曝光时间设置失败（可能曝光自动未关或越界）")
+    except Exception as e:
+        print(f"[采集] 曝光时间设置失败: {e}")
     # 增益（None = 沿用相机当前值，不修改）
     if GAIN_DB is None:
         print("[采集] 增益沿用相机当前值（不修改）")
