@@ -173,6 +173,8 @@ class CameraStreamer:
         except Exception as e:
             conf_log.append(f"曝光模式设置异常: {e}")
         # 曝光：依次尝试 ExposureTime / ExposureTimeAbs
+        # 注：aca1920-48gm 上 ExposureTime 是占位节点(not available)，
+        #     真正可写的是 ExposureTimeAbs；占位失败属预期，静默跳过避免误报。
         exp_ok = False
         for name in ("ExposureTime", "ExposureTimeAbs"):
             try:
@@ -184,7 +186,10 @@ class CameraStreamer:
                 exp_ok = True
                 break
             except Exception as e:
-                conf_log.append(f"{name} 设置失败: {e}")
+                msg = str(e)
+                if "not available" in msg.lower() or "placeholder" in msg.lower():
+                    continue
+                conf_log.append(f"{name} 设置失败: {msg}")
         if not exp_ok:
             conf_log.append("曝光未写入，沿用相机当前曝光值")
         # 像素格式放最后
