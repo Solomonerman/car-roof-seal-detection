@@ -69,7 +69,15 @@ def _find_camera():
     if CAMERA_IP:
         info = py.DeviceInfo()
         info.SetPropertyValue("IpAddress", CAMERA_IP)
-        cam = py.InstantCamera(factory.CreateDevice(info))
+        try:
+            cam = py.InstantCamera(factory.CreateDevice(info))
+        except Exception:
+            print(f"[错误] 无法连接 IP={CAMERA_IP} 的相机。请检查：")
+            print("  1) 相机是否已通电、网线是否连接")
+            print("  2) 上位机 IP 是否与相机在同一网段")
+            print("  3) 防火墙是否阻止了 GigE 通信")
+            print(f"  4) 用 Basler pylon IP Configurator 确认相机 IP 是否为 {CAMERA_IP}")
+            sys.exit(1)
         cam.Open()
         return cam, {"ip": CAMERA_IP, "serial": cam.GetDeviceInfo().GetSerialNumber()}
 
