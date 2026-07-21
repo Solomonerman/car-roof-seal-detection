@@ -43,7 +43,9 @@ CAMERA_SERIAL = ""             # 例如 "12345678"
 
 # ===================== 相机采集参数 =====================
 EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
-GAIN_DB = 0.0                # 增益（dB），默认 0
+# 增益：None = 沿用相机当前值（不修改）。现场暗光、曝光锁 2000µs 时，
+# 你在 pylon Viewer 设的 Gain Raw 136 会被保留。想固定值就填 dB，例如 6.0。
+GAIN_DB = None
 GAMMA = 1.0                  # Gamma，默认 1.0
 PIXEL_FORMAT = "Mono8"       # 像素格式：aca1920-48gm 是黑白相机，Mono8 = 8bit 灰度
 
@@ -123,13 +125,16 @@ def _configure_camera(cam):
         print(f"[采集] 曝光时间已设为 {EXPOSURE_TIME_US} µs")
     except Exception:
         print("[采集] 曝光时间设置失败")
-    # 增益
-    try:
-        gain_node = nodemap.GetNode("Gain")
-        gain_node.SetValue(GAIN_DB)
-        print(f"[采集] 增益已设为 {GAIN_DB} dB")
-    except Exception:
-        print("[采集] 增益设置失败")
+    # 增益（None = 沿用相机当前值，不修改）
+    if GAIN_DB is None:
+        print("[采集] 增益沿用相机当前值（不修改）")
+    else:
+        try:
+            gain_node = nodemap.GetNode("Gain")
+            gain_node.SetValue(GAIN_DB)
+            print(f"[采集] 增益已设为 {GAIN_DB} dB")
+        except Exception:
+            print("[采集] 增益设置失败")
     # Gamma
     try:
         gamma_node = nodemap.GetNode("Gamma")

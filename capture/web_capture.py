@@ -59,7 +59,12 @@ CAMERA_SERIAL = ""             # 留空则用 IP；也可填序列号直连
 
 # ===================== 相机采集参数 =====================
 EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
-GAIN_DB = 0.0                # 增益（dB），默认 0。现场暗光可上调（见说明）
+# 增益：设为 None = 沿用相机【当前值】、不修改。
+#   你在 pylon Viewer 里已设 Gain Raw 136（现场暗光、曝光锁 2000µs 的可用档），
+#   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
+#   若想强制指定固定值，填 dB 数字，例如 6.0。
+#   ⚠️ 注意：相机断电/复位后会恢复默认（通常 0 dB），届时需要重设或在此填固定值。
+GAIN_DB = None
 GAMMA = 1.0                  # Gamma，默认 1.0（保持线性，利于检测）
 PIXEL_FORMAT = "Mono8"       # 黑白相机 8bit 灰度
 
@@ -146,12 +151,15 @@ class CameraStreamer:
             conf_log.append(f"曝光={EXPOSURE_TIME_US}µs")
         except Exception:
             conf_log.append("曝光设置失败")
-        # 增益
-        try:
-            nodemap.GetNode("Gain").SetValue(GAIN_DB)
-            conf_log.append(f"增益={GAIN_DB}dB")
-        except Exception:
-            conf_log.append("增益设置失败")
+        # 增益（None = 沿用相机当前值，不修改）
+        if GAIN_DB is None:
+            conf_log.append("增益=沿用相机当前值(不修改)")
+        else:
+            try:
+                nodemap.GetNode("Gain").SetValue(GAIN_DB)
+                conf_log.append(f"增益={GAIN_DB}dB")
+            except Exception:
+                conf_log.append("增益设置失败")
         # Gamma
         try:
             nodemap.GetNode("Gamma").SetValue(GAMMA)
@@ -282,7 +290,9 @@ class CameraStreamer:
                 "fps": FPS, "duration_sec": DURATION_SEC,
                 "total": int(FPS * DURATION_SEC),
                 "exposure_us": EXPOSURE_TIME_US,
-                "gain_db": GAIN_DB, "gamma": GAMMA,
+                "gain_db": GAIN_DB,
+                "gain_display": "相机当前值" if GAIN_DB is None else f"{GAIN_DB} dB",
+                "gamma": GAMMA,
             },
             "save_dir": SAVE_DIR,
             "last_result": self._last_result,
@@ -369,7 +379,7 @@ function refreshStatus(){{
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
     h+=`<b>连拍</b>：${{s.params.fps}} 张/秒 × ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b><br>`;
-    h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_db}} dB · Gamma：${{s.params.gamma}}<br>`;
+    h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
     h+=`<b>保存目录</b>：${{s.save_dir}}`;
     meta.innerHTML=h;
   }}).catch(()=>{{state.textContent='● 连接失败';state.style.background='#b5482f';}});
