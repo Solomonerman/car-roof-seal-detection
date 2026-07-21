@@ -166,6 +166,17 @@ def _configure_camera(cam):
             print(f"[采集] {name} 设置失败: {msg}")
     if not exp_ok:
         print("[采集] 曝光未写入，沿用相机当前曝光值")
+    # 采集帧率：锁成 FPS，保证连拍时序确定（避免 RetrieveResult 阻塞导致时长漂移）
+    try:
+        fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+        if fr_en is not None:
+            fr_en.SetValue(True)
+        fr = nodemap.GetNode("AcquisitionFrameRate")
+        if fr is not None:
+            fr.SetValue(FPS)
+            print(f"[采集] 采集帧率已设为 {FPS}fps")
+    except Exception as e:
+        print(f"[采集] 采集帧率设置异常: {e}")
     # 像素格式放最后
     try:
         fmt_node = nodemap.GetNode("PixelFormat")

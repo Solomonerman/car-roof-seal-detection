@@ -25,6 +25,7 @@ import time
 import datetime
 import threading
 import argparse
+import collections
 
 import cv2
 
@@ -51,6 +52,12 @@ WEB_PORT = 5000          # 浏览器访问端口（上位机防火墙需放行�
 FPS = 3                # 连拍帧率（张/秒）
 DURATION_SEC = 5       # 连拍持续时长（秒）
 # 总张数 = FPS × DURATION_SEC，当前 3×5 = 15 张
+# 触发方式：
+#   "pre"  = 预触发环形缓冲（推荐）：后台一直缓存最近 DURATION_SEC 秒的帧，
+#            点按钮立即把缓冲里已有的帧存盘 → 拍的是点击那一刻及之前的画面，
+#            对运动物体无延迟（解决"点的时候是车头、拍到的是车身"问题）。
+#   "post" = 点击后才开始连拍 DURATION_SEC 秒（旧逻辑，运动物体会有明显延迟）。
+CAPTURE_MODE = "pre"
 
 # ===================== 相机连接参数 =====================
 CAMERA_IP = "172.30.173.249"   # 现场左侧 Basler aca1920-48gm
@@ -97,6 +104,9 @@ class CameraStreamer:
         self._capture_req = threading.Event()   # 触发连拍
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
+
+        # 预触发环形缓冲：始终保留最近 total 帧（点击即存，避免运动物体延迟）
+        self._ring = collections.deque(maxlen=int(FPS * DURATION_SEC) + 5)
 
         self._thread = None
         self._error = None
@@ -192,6 +202,17 @@ class CameraStreamer:
                 conf_log.append(f"{name} 设置失败: {msg}")
         if not exp_ok:
             conf_log.append("曝光未写入，沿用相机当前曝光值")
+        # 采集帧率：锁成 FPS，保证时序确定（避免 RetrieveResult 阻塞导致时长漂移）
+        try:
+            fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+            if fr_en is not None:
+                fr_en.SetValue(True)
+            fr = nodemap.GetNode("AcquisitionFrameRate")
+            if fr is not None:
+                fr.SetValue(FPS)
+                conf_log.append(f"采集帧率={FPS}fps")
+        except Exception as e:
+            conf_log.append(f"采集帧率设置异常: {e}")
         # 像素格式放最后
         try:
             nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
@@ -201,7 +222,9 @@ class CameraStreamer:
         self._conf_log = conf_log
 
     def start(self):
-        self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+        # OneByOne：每帧只取一次，保证环形缓冲里是去重的连续帧
+        # （LatestImageOnly 在轮询快于出图时会重复返回同一帧，导致缓冲里都是复本）
+        self.cam.StartGrabbing(py.GrabStrategy_OneByOne)
         # 取一张确认分辨率
         grab = self.cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
         if not grab.GrabSucceeded():
@@ -222,59 +245,54 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """持续取流，维护最新帧；检测连拍事件。"""
-        frame_interval = 1.0 / FPS
+        """持续取流：最新帧给预览，每帧写入环形缓冲；检测连拍事件。"""
         while self.running:
             try:
-                grab = self.cam.RetrieveResult(200, py.TimeoutHandling_Return)
+                grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
             except Exception:
                 time.sleep(0.05)
                 continue
             if grab and grab.GrabSucceeded():
                 frame = grab.Array.copy()
                 grab.Release()
+                ts = time.time()
                 with self._lock:
                     self._latest = frame
-                # 处理连拍请求（在取到帧后顺手处理）
+                self._ring.append((ts, frame))
                 if self._capture_req.is_set():
-                    self._do_burst(frame_interval)
+                    self._flush_buffer()
             elif grab:
                 grab.Release()
 
-    def _do_burst(self, frame_interval):
-        """执行一轮连拍。"""
+    def _flush_buffer(self):
+        """预触发：把环形缓冲里最近的 total 帧立即存盘。
+
+        拍的是点击那一刻及之前的画面（缓冲已缓存最近 DURATION_SEC 秒），
+        因此对运动物体没有"点击后才开始抓"的延迟。
+        """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
+        frames = list(self._ring)
+        if len(frames) > total:
+            frames = frames[-total:]
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
         t0 = time.perf_counter()
-        for i in range(total):
-            t_start = time.perf_counter()
-            try:
-                grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
-            except Exception:
-                break
-            if not grab.GrabSucceeded():
-                grab.Release()
-                continue
-            img_save = grab.Array.copy()
-            grab.Release()
-            fname = self._format_filename()
+        for ts, frame in frames:
+            fname = self._format_filename_ts(ts)
             fpath = os.path.join(SAVE_DIR, fname)
-            cv2.imwrite(fpath, img_save)
+            cv2.imwrite(fpath, frame)
             batch.append(os.path.basename(fpath))
-            elapsed = time.perf_counter() - t_start
-            wait = max(0, int((frame_interval - elapsed) * 1000))
-            if wait > 0 and i < total - 1:
-                time.sleep(wait / 1000.0)
-        total_elapsed = time.perf_counter() - t0
-        actual_fps = len(batch) / total_elapsed if total_elapsed > 0 else 0
+        elapsed = time.perf_counter() - t0
+        span = (frames[-1][0] - frames[0][0]) if len(frames) > 1 else 0.0
         self._last_result = {
             "ok": True,
             "saved": len(batch),
             "total": total,
-            "elapsed": round(total_elapsed, 1),
-            "actual_fps": round(actual_fps, 1),
+            "elapsed": round(elapsed, 2),
+            "span_sec": round(span, 2),
+            "actual_fps": round(len(batch) / span, 1) if span > 0 else 0,
+            "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
             "files": batch,
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -283,6 +301,12 @@ class CameraStreamer:
     def _format_filename(self, prefix="Image"):
         ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
         return f"{prefix}__{ts}{SAVE_EXT}"
+
+    def _format_filename_ts(self, ts):
+        """用帧的实际采集时间戳（来自缓冲）命名，保证顺序正确。"""
+        dt = datetime.datetime.fromtimestamp(ts)
+        s = dt.strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
+        return f"Image__{s}{SAVE_EXT}"
 
     def request_capture(self):
         """外部触发连拍，阻塞直到完成，返回结果 dict。"""
@@ -390,7 +414,7 @@ def index():
 <div class="wrap">
   <div class="video"><img id="feed" src="/video_feed"></div>
   <div class="bar">
-    <button id="cap" onclick="capture()">📸 连拍一轮（{int(FPS*DURATION_SEC)} 张）</button>
+    <button id="cap" onclick="capture()">📸 拍最近{DURATION_SEC}秒（{int(FPS*DURATION_SEC)} 张）</button>
     <span id="capState" class="meta"></span>
   </div>
   <div class="meta" id="meta"></div>
@@ -410,7 +434,7 @@ function refreshStatus(){{
     else{{state.textContent='● 离线';state.style.background='#b5482f';}}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
-    h+=`<b>连拍</b>：${{s.params.fps}} 张/秒 × ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b><br>`;
+    h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
     h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
     h+=`<b>保存目录</b>：${{s.save_dir}}`;
     meta.innerHTML=h;
@@ -491,8 +515,8 @@ def main():
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
-    print(f"[网页采集] 连拍参数：{st['params']['fps']}张/秒 × {st['params']['duration_sec']}秒 "
-          f"= {st['params']['total']} 张")
+    print(f"[网页采集] 预触发缓冲：点按钮即存最近 {st['params']['duration_sec']}秒 "
+          f"= {st['params']['total']} 张（{st['params']['fps']}fps）")
     print(f"[网页采集] 保存目录：{SAVE_DIR}")
     print("=" * 55)
     print(f"[网页采集] 请用浏览器打开（上位机本机或同网段电脑）：")
