@@ -56,6 +56,8 @@ def main():
     parser.add_argument("--slot", type=int, default=PLC_SLOT)
     parser.add_argument("--interval", type=float, default=10.0,
                         help="轮询间隔(毫秒)，越小边沿分辨越准（默认10）")
+    parser.add_argument("--ctx-interval", type=float, default=200.0,
+                        help="DB230 上下文采样间隔(毫秒)，用于定位车号有效窗口（默认200）")
     args = parser.parse_args()
 
     print("=" * 55)
@@ -72,13 +74,17 @@ def main():
         print("[连接] 成功 ✅  开始监测（上升沿 = 车信号到来）...")
 
         poll_s = args.interval / 1000.0
+        ctx_s = args.ctx_interval / 1000.0
         prev = 0
         rising_t = None
         last_fall_t = None
         count = 0
         widths = []   # 脉冲宽度（秒）
         gaps = []     # 相邻车间隔（秒）
+        last_ctx_key = None
+        last_ctx_t = 0.0
 
+        print("提示：车号/车型在 DB230 的有效窗口未知，下面会持续采样 DB230 变化。")
         while True:
             try:
                 d = client.read_area(S7AreaDB, *DB130)   # 仅读 1 字节
@@ -94,7 +100,7 @@ def main():
                 rising_t = now
                 if last_fall_t is not None:
                     gaps.append(now - last_fall_t)
-                # 读上下文（仅在车到来时读一次，降低 PLC 负担）
+                # 读上下文（车到来时读一次）
                 try:
                     a = bytes(client.read_area(S7AreaDB, *DB230_A))
                     b = bytes(client.read_area(S7AreaDB, *DB230_B))
@@ -112,6 +118,33 @@ def main():
                     widths.append(w)
                     print(f"        下降沿 脉冲宽度 = {w * 1000:.0f} ms")
                     last_fall_t = now
+                # 下降沿也读一次上下文，对比车离开时是否还有数据
+                try:
+                    a = bytes(client.read_area(S7AreaDB, *DB230_A))
+                    b = bytes(client.read_area(S7AreaDB, *DB230_B))
+                    no_paint, skid, model, pin = parse_context(a, b)
+                    print(f"        下降沿上下文 NO_Paint={no_paint} 滑橇={skid} "
+                          f"车型=0x{model:08X} PIN={pin!r}")
+                except Exception as e:
+                    print(f"        下降沿读上下文失败: {e}")
+
+            # 持续采样 DB230，定位车号/车型的有效窗口
+            if now - last_ctx_t >= ctx_s:
+                last_ctx_t = now
+                try:
+                    a = bytes(client.read_area(S7AreaDB, *DB230_A))
+                    b = bytes(client.read_area(S7AreaDB, *DB230_B))
+                    no_paint, skid, model, pin = parse_context(a, b)
+                    key = (no_paint, skid, model, pin)
+                    if key != last_ctx_key:
+                        nonzero = not (skid == 0 and model == 0 and pin.strip("\x00") == "")
+                        print(f"[DB230] {time.strftime('%H:%M:%S')} sig={bit} "
+                              f"NO_Paint={no_paint} 滑橇={skid} 车型=0x{model:08X} PIN={pin!r}"
+                              f"{'  *非空*' if nonzero else ''}")
+                        last_ctx_key = key
+                except Exception as e:
+                    print(f"[DB230读错] {e}")
+
             prev = bit
             time.sleep(poll_s)
 
