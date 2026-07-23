@@ -4,7 +4,8 @@
 监测 DB130.DBX0.1（输送出车信号）：
   - 高频轮询该位，检测【上升沿 / 下降沿】
   - 测每次车信号的持续时间（脉冲宽度）与相邻车间隔
-  - 上升沿时读取上下文：NO Paint / 车型代码 / 滑橇号 / PIN
+  - 持续锁存 DB230 上下文（车型/滑橇/PIN/NO_Paint），上升沿打印【锁存】值
+    因 PLC 在出车信号后清零 DB230，故须“先锁存、后打印”，避免读空
 目的：搞清该信号的确切时序（脉冲还是电平、宽度多少），为自动触发做准备。
 ⚠️ 全程只读 read_area，无任何写 / 停机 / 下载操作。
 """
@@ -89,10 +90,10 @@ def main():
         count = 0
         widths = []   # 脉冲宽度（秒）
         gaps = []     # 相邻车间隔（秒）
-        last_ctx_key = None
+        latched = None      # 最近一次“非空”的 DB230 上下文（PLC 清零前锁存）
         last_ctx_t = 0.0
 
-        print("提示：车号/车型在 DB230 的有效窗口未知，下面会持续采样 DB230 变化。")
+        print("提示：PLC 在出车信号后清零 DB230，故采用【先锁存、上升沿打印】策略；空行已跳过。")
         while True:
             try:
                 d = client.read_area(S7AreaDB, *DB130)   # 仅读 1 字节
@@ -103,55 +104,48 @@ def main():
                 continue
 
             now = time.perf_counter()
-            if bit == 1 and prev == 0:
-                # 上升沿
-                rising_t = now
-                if last_fall_t is not None:
-                    gaps.append(now - last_fall_t)
-                # 读上下文（车到来时读一次）
-                try:
-                    a = bytes(client.read_area(S7AreaDB, *DB230_A))
-                    b = bytes(client.read_area(S7AreaDB, *DB230_B))
-                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
-                except Exception as e:
-                    no_paint = skid = model = None
-                    pin = str(e)
-                count += 1
-                print(f"[车 {count}] 上升沿 {time.strftime('%H:%M:%S')}  "
-                      f"NO_Paint={no_paint} 滑橇={skid} 车型={model_ascii}(0x{model:08X}) PIN={pin!r}")
-            elif bit == 0 and prev == 1:
-                # 下降沿
-                if rising_t is not None:
-                    w = now - rising_t
-                    widths.append(w)
-                    print(f"        下降沿 脉冲宽度 = {w * 1000:.0f} ms")
-                    last_fall_t = now
-                # 下降沿也读一次上下文，对比车离开时是否还有数据
-                try:
-                    a = bytes(client.read_area(S7AreaDB, *DB230_A))
-                    b = bytes(client.read_area(S7AreaDB, *DB230_B))
-                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
-                    print(f"        下降沿上下文 NO_Paint={no_paint} 滑橇={skid} "
-                          f"车型={model_ascii}(0x{model:08X}) PIN={pin!r}")
-                except Exception as e:
-                    print(f"        下降沿读上下文失败: {e}")
 
-            # 持续采样 DB230，定位车号/车型的有效窗口
+            # —— 持续采样 DB230：仅在“非空”时更新锁存，且跳过空行（不打印）——
             if now - last_ctx_t >= ctx_s:
                 last_ctx_t = now
                 try:
                     a = bytes(client.read_area(S7AreaDB, *DB230_A))
                     b = bytes(client.read_area(S7AreaDB, *DB230_B))
                     no_paint, skid, model, model_ascii, pin = parse_context(a, b)
-                    key = (no_paint, skid, model, pin)
-                    if key != last_ctx_key:
-                        nonzero = not (skid == 0 and model == 0 and pin.strip("\x00") == "")
-                        print(f"[DB230] {time.strftime('%H:%M:%S')} sig={bit} "
-                              f"NO_Paint={no_paint} 滑橇={skid} 车型={model_ascii}(0x{model:08X}) PIN={pin!r}"
-                              f"{'  *非空*' if nonzero else ''}")
-                        last_ctx_key = key
+                    # 非空判定：滑橇或 PIN 任一有效，或车型 ASCII 非空
+                    if skid != 0 or pin.strip("\x00") or model_ascii:
+                        latched = (no_paint, skid, model_ascii, pin)
                 except Exception as e:
                     print(f"[DB230读错] {e}")
+
+            if bit == 1 and prev == 0:
+                # 上升沿：优先再读一次（数据可能尚未清零），为空则回退锁存值
+                rising_t = now
+                if last_fall_t is not None:
+                    gaps.append(now - last_fall_t)
+                count += 1
+                try:
+                    a = bytes(client.read_area(S7AreaDB, *DB230_A))
+                    b = bytes(client.read_area(S7AreaDB, *DB230_B))
+                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
+                    if skid != 0 or pin.strip("\x00") or model_ascii:
+                        latched = (no_paint, skid, model_ascii, pin)
+                except Exception:
+                    pass
+                if latched is not None:
+                    no_paint, skid, model_ascii, pin = latched
+                    tag = "（免检 NO_Paint）" if no_paint else ""
+                    print(f"[车 {count}] 上升沿 {time.strftime('%H:%M:%S')}  "
+                          f"滑橇={skid} 车型={model_ascii} PIN={pin.strip(chr(0))!r}{tag}")
+                else:
+                    print(f"[车 {count}] 上升沿 {time.strftime('%H:%M:%S')}  （无锁存车号）")
+            elif bit == 0 and prev == 1:
+                # 下降沿：仅测脉冲宽度，不再读 DB230（此时已被 PLC 清零）
+                if rising_t is not None:
+                    w = now - rising_t
+                    widths.append(w)
+                    print(f"        下降沿 脉冲宽度 = {w * 1000:.0f} ms")
+                    last_fall_t = now
 
             prev = bit
             time.sleep(poll_s)
