@@ -221,7 +221,10 @@ class CameraStreamer:
                 conf_log.append(f"{name} 设置失败: {msg}")
         if not exp_ok:
             conf_log.append("曝光未写入，沿用相机当前曝光值")
-        # 采集帧率：锁成 FPS，保证时序确定（避免 RetrieveResult 阻塞导致时长漂移）
+        # 采集帧率：本意锁成 FPS 以保证时序确定。但 aca1920-48gm 上
+        # AcquisitionFrameRate 是占位节点(not available)，相机端锁定会失败。
+        # 时序确定性改由 _loop 的环形缓冲软件节流保证（与 live_capture.py 连拍一致），
+        # 因此这里仅做“尽力而为”且不报红，失败属预期。
         try:
             fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
             if fr_en is not None:
@@ -229,9 +232,14 @@ class CameraStreamer:
             fr = nodemap.GetNode("AcquisitionFrameRate")
             if fr is not None:
                 fr.SetValue(FPS)
-                conf_log.append(f"采集帧率={FPS}fps")
+                conf_log.append(f"采集帧率=相机锁定 {FPS}fps")
         except Exception as e:
-            conf_log.append(f"采集帧率设置异常: {e}")
+            msg = str(e)
+            if "not available" in msg.lower() or "placeholder" in msg.lower():
+                # 相机未开放帧率锁定节点：预期内，由软件节流兜底
+                conf_log.append(f"采集帧率=相机未开放锁定(占位)，改由软件节流 {FPS}fps")
+            else:
+                conf_log.append(f"采集帧率设置异常(已忽略): {msg}")
         # 像素格式放最后
         try:
             nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
@@ -264,7 +272,16 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """持续取流：最新帧给预览，每帧写入环形缓冲；检测连拍事件。"""
+        """持续取流：最新帧给预览（每帧更新，保持流畅）；
+        环形缓冲按 FPS 节流写入，保证预触发 21 张正好覆盖 DURATION_SEC 秒。
+
+        为什么必须软件节流：aca1920-48gm 上 AcquisitionFrameRate 是占位节点
+        （not available），相机端帧率锁定无法设置，相机将以最高帧率(~48fps)自由运行。
+        若不节流，环形缓冲会在 ~0.4s 内塞满 21 张、flush 出来的全是同一时刻的复本，
+        完全失去“7 秒覆盖”的意义。这里用软件节拍兜底，与 live_capture.py 的连拍节流一致。
+        """
+        ring_clock = 0.0
+        target_interval = 1.0 / FPS
         while self.running:
             try:
                 grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
@@ -274,10 +291,13 @@ class CameraStreamer:
             if grab and grab.GrabSucceeded():
                 frame = grab.Array.copy()
                 grab.Release()
-                ts = time.time()
+                ts = time.time()                     # 命名/计时用真实采集时刻
                 with self._lock:
-                    self._latest = frame
-                self._ring.append((ts, frame))
+                    self._latest = frame            # 预览：每帧都更新，最高流畅度
+                clock = time.perf_counter()         # 环形缓冲节拍用单调时钟，避免 NTP 跳变
+                if clock - ring_clock >= target_interval - 1e-3:
+                    self._ring.append((ts, frame))
+                    ring_clock = clock
                 if self._capture_req.is_set():
                     self._flush_buffer()
             elif grab:
