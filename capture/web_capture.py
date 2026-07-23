@@ -90,11 +90,20 @@ RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sideca
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
 JPEG_QUALITY = 80            # 实时流 JPEG 质量（1-100，越小越流畅但越糊）
 
+# ===================== CPU 占用控制（与机器人站共用上位机，必须省）=====================
+# 相机自由运行在 ~48fps，但本程序不上满：预览 + 预触发只要几 fps 就够。
+#  - GRAB_FPS  ：后台取流节拍上限（默认 6）。超出部分由相机/驱动直接丢弃，不进 Python。
+#  - STREAM_FPS：网页 MJPEG 推送上限（默认 12），避免无谓的 JPEG 编码拖 CPU。
+#  - 预触发环形缓冲仍按 FPS(3) 节流写入，保证 21 张铺满 7 秒（见 CameraStreamer._loop）。
+# 三项叠加，相比"48fps 裸取 + 不限速编码"，CPU 与 GigE 带宽下降一个数量级。
+GRAB_FPS = 6
+STREAM_FPS = 12
+
 # ===================== PLC 自动触发参数（--plc-auto 启用）=====================
 PLC_IP = "172.30.173.6"
 PLC_RACK = 0
 PLC_SLOT = 2
-PLC_POLL_MS = 10             # 出车信号轮询间隔（毫秒）
+PLC_POLL_MS = 20             # 出车信号轮询间隔（毫秒，原10；共用上位机降到20省CPU，仍足够抓车）
 PLC_CTX_MS = 200             # DB230 上下文采样间隔（毫秒）
 
 # 缺陷标签集合（出现 → 整体 NG）；与 detection.detector.NG_LABELS 保持一致
@@ -272,17 +281,25 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """持续取流：最新帧给预览（每帧更新，保持流畅）；
-        环形缓冲按 FPS 节流写入，保证预触发 21 张正好覆盖 DURATION_SEC 秒。
+        """后台取流线程（CPU 友好，见文件顶部 GRAB_FPS）。
 
-        为什么必须软件节流：aca1920-48gm 上 AcquisitionFrameRate 是占位节点
-        （not available），相机端帧率锁定无法设置，相机将以最高帧率(~48fps)自由运行。
-        若不节流，环形缓冲会在 ~0.4s 内塞满 21 张、flush 出来的全是同一时刻的复本，
-        完全失去“7 秒覆盖”的意义。这里用软件节拍兜底，与 live_capture.py 的连拍节流一致。
+        - 取流节拍上限 GRAB_FPS（默认 6）：相机自由运行在 ~48fps，但上位机与机器人站
+          共用，不能狂取。超出部分由相机/驱动直接丢弃，我们只要够预览+预触发的帧率。
+        - 环形缓冲仍按 FPS(3) 节流写入，保证预触发 21 张正好覆盖 DURATION_SEC 秒。
+          （aca1920-48gm 上 AcquisitionFrameRate 为占位节点，相机端帧率锁定不可用，
+           故时序完全由软件节拍保证，与 live_capture.py 连拍节流一致。）
         """
         ring_clock = 0.0
         target_interval = 1.0 / FPS
+        grab_clock = 0.0
+        grab_interval = 1.0 / GRAB_FPS
         while self.running:
+            # 取流节拍：睡到下一帧时刻，避免 48fps 狂取拖垮共用上位机 CPU
+            now = time.perf_counter()
+            wait = grab_interval - (now - grab_clock)
+            if wait > 0:
+                time.sleep(wait)
+            grab_clock = time.perf_counter()
             try:
                 grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
             except Exception:
@@ -293,7 +310,7 @@ class CameraStreamer:
                 grab.Release()
                 ts = time.time()                     # 命名/计时用真实采集时刻
                 with self._lock:
-                    self._latest = frame            # 预览：每帧都更新，最高流畅度
+                    self._latest = frame            # 预览：每帧都更新
                 clock = time.perf_counter()         # 环形缓冲节拍用单调时钟，避免 NTP 跳变
                 if clock - ring_clock >= target_interval - 1e-3:
                     self._ring.append((ts, frame))
@@ -595,12 +612,20 @@ hub = CameraHub()
 
 
 def _gen_mjpeg():
-    """MJPEG 流生成器。"""
+    """MJPEG 流生成器（推送节拍上限 STREAM_FPS，避免无谓的 JPEG 编码拖 CPU）。"""
+    last = 0.0
+    interval = 1.0 / STREAM_FPS
     while hub.running:
         jpg = hub.get_primary_jpeg()
         if jpg:
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            # 限速推送：让出 CPU 给机器人站
+            now = time.perf_counter()
+            wait = interval - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+            last = time.perf_counter()
         else:
             time.sleep(0.05)
 
