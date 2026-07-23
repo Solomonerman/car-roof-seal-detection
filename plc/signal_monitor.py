@@ -35,14 +35,22 @@ DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.1）
 
 
 def parse_context(buf_a, buf_b):
-    """buf_a 起始1208 长度30；buf_b 为字节1257。返回 (no_paint, skid, model, pin)。"""
+    """buf_a 起始1208 长度30；buf_b 为字节1257。
+    返回 (no_paint, skid, model_int, model_ascii, pin)。
+    注意：车型代码 DBD1208 是 DWORD，但内容实为 ASCII（如 0x37503234='7P24'），
+          故同时返回整数与原文字符串。
+    """
     def i(off):
         return off - 1208
-    model = int.from_bytes(buf_a[i(1208):i(1208) + 4], "big")          # DBD1208
-    skid = int.from_bytes(buf_a[i(1218):i(1218) + 2], "big")           # DBW1218
+    model_int = int.from_bytes(buf_a[i(1208):i(1208) + 4], "big")     # DBD1208
+    try:
+        model_ascii = buf_a[i(1208):i(1208) + 4].decode("ascii").strip("\x00")
+    except Exception:
+        model_ascii = ""
+    skid = int.from_bytes(buf_a[i(1218):i(1218) + 2], "big")          # DBW1218
     pin = buf_a[i(1224):i(1224) + 14].decode("latin-1", errors="replace")  # DBB1224..1237
-    no_paint = (buf_b[0] >> 1) & 1                                    # DBX1257.1
-    return no_paint, skid, model, pin
+    no_paint = (buf_b[0] >> 1) & 1                                   # DBX1257.1
+    return no_paint, skid, model_int, model_ascii, pin
 
 
 def main():
@@ -104,13 +112,13 @@ def main():
                 try:
                     a = bytes(client.read_area(S7AreaDB, *DB230_A))
                     b = bytes(client.read_area(S7AreaDB, *DB230_B))
-                    no_paint, skid, model, pin = parse_context(a, b)
+                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
                 except Exception as e:
                     no_paint = skid = model = None
                     pin = str(e)
                 count += 1
                 print(f"[车 {count}] 上升沿 {time.strftime('%H:%M:%S')}  "
-                      f"NO_Paint={no_paint} 滑橇={skid} 车型=0x{model:08X} PIN={pin!r}")
+                      f"NO_Paint={no_paint} 滑橇={skid} 车型={model_ascii}(0x{model:08X}) PIN={pin!r}")
             elif bit == 0 and prev == 1:
                 # 下降沿
                 if rising_t is not None:
@@ -122,9 +130,9 @@ def main():
                 try:
                     a = bytes(client.read_area(S7AreaDB, *DB230_A))
                     b = bytes(client.read_area(S7AreaDB, *DB230_B))
-                    no_paint, skid, model, pin = parse_context(a, b)
+                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
                     print(f"        下降沿上下文 NO_Paint={no_paint} 滑橇={skid} "
-                          f"车型=0x{model:08X} PIN={pin!r}")
+                          f"车型={model_ascii}(0x{model:08X}) PIN={pin!r}")
                 except Exception as e:
                     print(f"        下降沿读上下文失败: {e}")
 
@@ -134,12 +142,12 @@ def main():
                 try:
                     a = bytes(client.read_area(S7AreaDB, *DB230_A))
                     b = bytes(client.read_area(S7AreaDB, *DB230_B))
-                    no_paint, skid, model, pin = parse_context(a, b)
+                    no_paint, skid, model, model_ascii, pin = parse_context(a, b)
                     key = (no_paint, skid, model, pin)
                     if key != last_ctx_key:
                         nonzero = not (skid == 0 and model == 0 and pin.strip("\x00") == "")
                         print(f"[DB230] {time.strftime('%H:%M:%S')} sig={bit} "
-                              f"NO_Paint={no_paint} 滑橇={skid} 车型=0x{model:08X} PIN={pin!r}"
+                              f"NO_Paint={no_paint} 滑橇={skid} 车型={model_ascii}(0x{model:08X}) PIN={pin!r}"
                               f"{'  *非空*' if nonzero else ''}")
                         last_ctx_key = key
                 except Exception as e:
