@@ -537,7 +537,8 @@ def handle_car_signal(ctx):
     model = ctx["model"]
     pin = ctx["pin"]
     no_paint = ctx["no_paint"]
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts_dt = datetime.datetime.now()
+    ts = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     # 车型路由：决定是否需要拍照（9X/8X 且 NO_Paint=0）
     from detection.router import route_algorithm
@@ -563,19 +564,23 @@ def handle_car_signal(ctx):
         message="拍照完成·检测待做",
     )
 
-    # 落库（含 skid/pin/no_paint/captured）；StorageService 内部已去重(移动)与轮转
+    # 落库（含 skid/pin/no_paint/captured）；StorageService 内部按 日期/PIN 分层、
+    # 去重移动、轮转，并返回该车文件夹路径
     paths = [os.path.join(SAVE_DIR, f) for f in files]
     db_ok = False
+    rec = None
     try:
         from storage.service import get_service
-        get_service().save(model, det, paths,
-                           skid=skid, pin=pin, no_paint=no_paint, captured=captured)
+        rec = get_service().save(model, det, paths,
+                                 skid=skid, pin=pin, no_paint=no_paint,
+                                 captured=captured, event_time=ts_dt)
         db_ok = True
     except Exception as e:
         print(f"[自动] 落库失败: {e}")
 
-    # 写追溯 sidecar（全字段，含 skid/PIN）
-    write_sidecar(ctx, files, det, db_ok, key, captured)
+    # 写追溯 sidecar：拍照车写入其自包含文件夹(record.json)，未拍照车兜底到 data/records
+    write_sidecar(ctx, files, det, db_ok, key, captured,
+                  folder=getattr(rec, "folder", "") if rec else "")
 
     # 兜底清理调试目录（自动图已移入 stored_images，这里只清手动调试残留）
     _prune_scratch()
@@ -600,11 +605,19 @@ def handle_car_signal(ctx):
           f"→ {action} 库={'已写' if db_ok else '失败'}")
 
 
-def write_sidecar(ctx, files, det, db_ok, model_key, captured):
-    """为本次自动检测写一份追溯 JSON（skid/PIN/车型/拍照/检测状态）。"""
-    os.makedirs(RECORD_DIR, exist_ok=True)
-    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{ts_file}__skid{ctx['skid']}.json"
+def write_sidecar(ctx, files, det, db_ok, model_key, captured, folder=None):
+    """为本次自动检测写追溯 JSON。
+
+    folder 给定时写入该车自包含文件夹(record.json)，与照片同目录、开箱即得全貌；
+    否则兜底写入 data/records（如未拍照的免检车，无照片文件夹）。
+    """
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "record.json")
+    else:
+        os.makedirs(RECORD_DIR, exist_ok=True)
+        ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(RECORD_DIR, f"{ts_file}__skid{ctx['skid']}.json")
     rec = {
         "trigger_ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "source": "plc_auto",
@@ -624,7 +637,6 @@ def write_sidecar(ctx, files, det, db_ok, model_key, captured):
         },
         "db_recorded": db_ok,
     }
-    path = os.path.join(RECORD_DIR, fname)
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rec, f, ensure_ascii=False, indent=2)

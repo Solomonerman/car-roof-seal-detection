@@ -75,3 +75,4 @@ class InspectionRecord:
     pin: str = ""                         # PIN
     no_paint: bool = False                # NO_Paint=1 表示免检（不拍照）
     captured: bool = False                # 是否拍照纳入检测流程（UI"是否检测"列依据）
+    folder: str = ""                      # 该车照片所在目录（data/inspection/<日期>/<车>/），便于按文件夹检索

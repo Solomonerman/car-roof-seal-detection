@@ -6,10 +6,35 @@
 import datetime
 import json
 import os
+import re
 import sqlite3
 from common.interfaces import InspectionRecord
 from storage.database import Database
 from storage.object_store import ObjectStore
+
+
+# ---- 文件名/目录安全化与分层命名 ----
+_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+def _safe(s):
+    """把任意字符串变成文件名安全片段（PIN 可能含特殊字符）。"""
+    return _SAFE_RE.sub("_", str(s)).strip("_")[:40] or "x"
+
+def _car_key(pin, skid):
+    """车的目录名：优先 PIN，退化为 SKID，再退化为 UNK。"""
+    pin = (pin or "").strip()
+    if pin:
+        return "PIN" + _safe(pin)
+    if skid:
+        return "SKID" + _safe(skid)
+    return "UNK"
+
+_STAMP_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})__(\d{2})-(\d{2})-(\d{2})-(\d{3})")
+def _stamp_from_name(fname):
+    """从原文件名(含帧时间戳)提炼 YYYYMMDD_HHMMSS；失败则用当前时刻兜底。"""
+    m = _STAMP_RE.search(os.path.basename(fname))
+    if m:
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}_{m.group(4)}{m.group(5)}{m.group(6)}"
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 # 保留最近 N 条记录，超出则清理旧记录+对应图片（0=不清理，谨慎可设大值）。
@@ -33,18 +58,31 @@ class StorageService:
         self._save_count = 0
 
     def save(self, model: str, det, images: list,
-             skid=None, pin="", no_paint=False, captured=False) -> InspectionRecord:
-        refs = [self.store.upload(p) for p in images]   # upload 内部已去重(移动)
+             skid=None, pin="", no_paint=False, captured=False,
+             event_time=None, cam_idx=0) -> InspectionRecord:
+        # 一台车一个自包含文件夹：data/inspection/<日期>/<车>/
+        ev = event_time or datetime.datetime.now()
+        date = ev.strftime("%Y-%m-%d")
+        car_key = _car_key(pin, skid)
+        subdir = os.path.join(date, car_key)
+        folder = os.path.join(self.store.local_dir, subdir)
+        refs = []
+        for i, p in enumerate(images, 1):
+            ext = os.path.splitext(p)[1] or ".bmp"
+            stamp = _stamp_from_name(p)
+            new_name = f"{i:02d}__{car_key}__cam{cam_idx}__{stamp}{ext}"
+            refs.append(self.store.upload(p, subdir=subdir, new_name=new_name))
         rec = InspectionRecord(
             car_model=model,
             ok=det.ok,
             image_refs=refs,
             defects=det.defects,
-            timestamp=datetime.datetime.now().isoformat(timespec="seconds"),
+            timestamp=ev.isoformat(timespec="seconds"),
             skid=skid,
             pin=pin,
             no_paint=no_paint,
             captured=captured,
+            folder=folder,
         )
         self.db.save_record(rec)
         self._maybe_prune()
@@ -74,14 +112,23 @@ class StorageService:
                     refs = json.loads(refs_json) if refs_json else []
                 except Exception:
                     refs = []
+                car_dir = None
                 for ref in refs:
-                    name = ref.split("/")[-1]
-                    p = os.path.join(self.store.local_dir, name)
+                    rel = ref.split("/")[1:]          # 去掉 bucket 段
+                    p = os.path.join(self.store.local_dir, *rel)
+                    car_dir = os.path.dirname(p)
                     try:
                         if os.path.exists(p):
                             os.remove(p)
                     except Exception:
                         pass
+                # 清理已空的 车→天 文件夹，避免留下一堆空目录
+                if car_dir:
+                    for d in (car_dir, os.path.dirname(car_dir)):
+                        try:
+                            os.rmdir(d)
+                        except OSError:
+                            pass
                 with sqlite3.connect(self.db.db_path) as conn:
                     conn.execute("DELETE FROM records WHERE id=?", (rid,))
         except Exception as e:
