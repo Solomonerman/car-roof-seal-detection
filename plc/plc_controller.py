@@ -35,5 +35,11 @@ class PLCController:
         print(f"[PLC] 回写检测结果 -> {'OK' if ok else 'NG'}")
         return True
 
+    # ⚠️ TODO（项目待办，切勿擅自动手）：
+    #   结果回写（OK/NG）的 DB 写地址【尚未向现场确认】，用户明确要求"先记下来、现在不写"。
+    #   真实实现替换本 mock 时，write_result 会调用 snap7 的【写】操作——属于高风险动作：
+    #   必须在用户明确授权、且最好非生产时段，单独评审后方可启用。当前任何代码都不得写 PLC。
+    #   待确认项：写回用哪个 DB 块/偏移？是否需要回写滑橇号/PIN 以便与来车对应？
+
     def close(self):
         self.connected = False
