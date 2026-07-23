@@ -82,6 +82,7 @@ class PlcMonitor:
         self._lock = threading.Lock()
         self.latched = None          # 最近一次“非空”的 DB230 上下文
         self._thread = None
+        self.connected = False       # 健康态：供 UI/日志观测（断线重连期间为 False）
 
     # ---------- 连接（仅读） ----------
     def connect(self):
@@ -126,12 +127,16 @@ class PlcMonitor:
         prev = 0
         last_ctx_t = 0.0
         while not self._stop.is_set():
+            # 读信号（失败则重连；重连期间本线程阻塞，但不影响相机/Flask）
             try:
                 d = self.client.read_area(S7AreaDB, *DB130_SIG)   # 仅读 1 字节
                 bit = (d[0] >> 1) & 1
+                self.connected = True
             except Exception as e:
+                self.connected = False
                 print(f"[PLC] 读信号失败: {e}")
-                time.sleep(poll_s)
+                if not self._reconnect():
+                    break
                 continue
 
             now = time.perf_counter()
@@ -145,6 +150,7 @@ class PlcMonitor:
                     self._maybe_latch(parse_context(a, b))
                 except Exception as e:
                     print(f"[PLC] 读上下文失败: {e}")
+                    # 上下文采样失败不致命，继续轮询，下次再采
 
             # 上升沿：优先再读一次（数据可能尚未清零），为空则回退锁存值
             if bit == 1 and prev == 0:
@@ -163,6 +169,30 @@ class PlcMonitor:
 
             prev = bit
             time.sleep(poll_s)
+
+    def _reconnect(self):
+        """PLC 断线后指数退避重连，直到连上或收到停止信号。返回是否恢复。
+
+        仅在监控线程内调用，阻塞只影响本线程，绝不波及相机取流 / Flask。
+        """
+        attempt = 0
+        while not self._stop.is_set():
+            attempt += 1
+            try:
+                try:
+                    self.client.disconnect()
+                except Exception:
+                    pass
+                self.client.connect(self.ip, self.rack, self.slot)
+                if self.client.get_connected():
+                    print("[PLC] 已重连恢复")
+                    self.connected = True
+                    return True
+            except Exception as e:
+                if attempt % 10 == 0:
+                    print(f"[PLC] 持续重连中(第{attempt}次): {e}")
+            time.sleep(min(15, 1 + attempt * 0.5))   # 退避封顶 15s
+        return False
 
 
 def has_snap7():

@@ -18,7 +18,10 @@ class ObjectStore:
         name = os.path.basename(local_path)
         dst = os.path.join(self.local_dir, name)
         try:
-            shutil.copy(local_path, dst)
+            # 同文件系统为 rename（零额外 IO），彻底消除 raw+stored 双份存储；
+            # 跨文件系统退化为 复制+删除。MinIO 阶段替换为 put_object 即可。
+            if os.path.abspath(local_path) != os.path.abspath(dst):
+                shutil.move(local_path, dst)
         except Exception as e:
-            print(f"[存储] 复制图片失败 {local_path}: {e}")
+            print(f"[存储] 移动图片失败 {local_path}: {e}")
         return f"{self.bucket}/{name}"

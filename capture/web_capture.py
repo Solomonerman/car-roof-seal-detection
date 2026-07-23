@@ -31,6 +31,7 @@ import datetime
 import threading
 import argparse
 import collections
+import concurrent.futures as _cf
 
 import cv2
 
@@ -294,31 +295,37 @@ class CameraStreamer:
         grab_clock = 0.0
         grab_interval = 1.0 / GRAB_FPS
         while self.running:
-            # 取流节拍：睡到下一帧时刻，避免 48fps 狂取拖垮共用上位机 CPU
-            now = time.perf_counter()
-            wait = grab_interval - (now - grab_clock)
-            if wait > 0:
-                time.sleep(wait)
-            grab_clock = time.perf_counter()
             try:
-                grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
-            except Exception:
-                time.sleep(0.05)
-                continue
-            if grab and grab.GrabSucceeded():
-                frame = grab.Array.copy()
-                grab.Release()
-                ts = time.time()                     # 命名/计时用真实采集时刻
-                with self._lock:
-                    self._latest = frame            # 预览：每帧都更新
-                clock = time.perf_counter()         # 环形缓冲节拍用单调时钟，避免 NTP 跳变
-                if clock - ring_clock >= target_interval - 1e-3:
-                    self._ring.append((ts, frame))
-                    ring_clock = clock
-                if self._capture_req.is_set():
-                    self._flush_buffer()
-            elif grab:
-                grab.Release()
+                # 取流节拍：睡到下一帧时刻，避免 48fps 狂取拖垮共用上位机 CPU
+                now = time.perf_counter()
+                wait = grab_interval - (now - grab_clock)
+                if wait > 0:
+                    time.sleep(wait)
+                grab_clock = time.perf_counter()
+                try:
+                    grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+                if grab and grab.GrabSucceeded():
+                    frame = grab.Array.copy()
+                    grab.Release()
+                    ts = time.time()                     # 命名/计时用真实采集时刻
+                    with self._lock:
+                        self._latest = frame            # 预览：每帧都更新
+                    clock = time.perf_counter()         # 环形缓冲节拍用单调时钟，避免 NTP 跳变
+                    if clock - ring_clock >= target_interval - 1e-3:
+                        self._ring.append((ts, frame))
+                        ring_clock = clock
+                    if self._capture_req.is_set():
+                        self._flush_buffer()
+                elif grab:
+                    grab.Release()
+            except Exception as e:
+                # 单帧异常不应杀死取流线程，否则相机静默停拍且无人察觉
+                self._error = f"取流异常: {e}"
+                print(f"[相机] 取流异常(已忽略，继续): {e}")
+                time.sleep(0.1)
 
     def _flush_buffer(self):
         """预触发：把环形缓冲里最近的 total 帧立即存盘。
@@ -328,31 +335,46 @@ class CameraStreamer:
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
-        frames = list(self._ring)
-        if len(frames) > total:
-            frames = frames[-total:]
-        os.makedirs(SAVE_DIR, exist_ok=True)
-        batch = []
-        t0 = time.perf_counter()
-        for ts, frame in frames:
-            fname = self._format_filename_ts(ts)
-            fpath = os.path.join(SAVE_DIR, fname)
-            cv2.imwrite(fpath, frame)
-            batch.append(os.path.basename(fpath))
-        elapsed = time.perf_counter() - t0
-        span = (frames[-1][0] - frames[0][0]) if len(frames) > 1 else 0.0
-        self._last_result = {
-            "ok": True,
-            "saved": len(batch),
-            "total": total,
-            "elapsed": round(elapsed, 2),
-            "span_sec": round(span, 2),
-            "actual_fps": round(len(batch) / span, 1) if span > 0 else 0,
-            "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
-            "files": batch,
-            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        self._capture_done.set()
+        try:
+            frames = list(self._ring)
+            if len(frames) > total:
+                frames = frames[-total:]
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            batch = []
+            t0 = time.perf_counter()
+            for ts, frame in frames:
+                fname = self._format_filename_ts(ts)
+                fpath = os.path.join(SAVE_DIR, fname)
+                cv2.imwrite(fpath, frame)
+                batch.append(os.path.basename(fpath))
+            elapsed = time.perf_counter() - t0
+            span = (frames[-1][0] - frames[0][0]) if len(frames) > 1 else 0.0
+            self._last_result = {
+                "ok": True,
+                "saved": len(batch),
+                "total": total,
+                "elapsed": round(elapsed, 2),
+                "span_sec": round(span, 2),
+                "actual_fps": round(len(batch) / span, 1) if span > 0 else 0,
+                "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
+                "files": batch,
+                "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        except Exception as e:
+            # 存盘失败（磁盘满等）不能让等待方卡 12s，也不能杀线程
+            self._error = f"连拍存盘失败: {e}"
+            print(f"[相机] 连拍存盘失败: {e}")
+            self._last_result = {
+                "ok": False,
+                "error": str(e),
+                "saved": 0,
+                "total": total,
+                "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
+                "files": [],
+                "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        finally:
+            self._capture_done.set()
 
     def _format_filename(self, prefix="Image"):
         ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
@@ -408,6 +430,7 @@ class CameraStreamer:
             },
             "save_dir": SAVE_DIR,
             "last_result": self._last_result,
+            "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
 
     def stop(self):
@@ -540,19 +563,22 @@ def handle_car_signal(ctx):
         message="拍照完成·检测待做",
     )
 
-    # 落库（含 skid/pin/no_paint/captured）+ 复制图到 stored_images
+    # 落库（含 skid/pin/no_paint/captured）；StorageService 内部已去重(移动)与轮转
     paths = [os.path.join(SAVE_DIR, f) for f in files]
     db_ok = False
     try:
-        from storage.service import StorageService
-        StorageService().save(model, det, paths,
-                               skid=skid, pin=pin, no_paint=no_paint, captured=captured)
+        from storage.service import get_service
+        get_service().save(model, det, paths,
+                           skid=skid, pin=pin, no_paint=no_paint, captured=captured)
         db_ok = True
     except Exception as e:
         print(f"[自动] 落库失败: {e}")
 
     # 写追溯 sidecar（全字段，含 skid/PIN）
     write_sidecar(ctx, files, det, db_ok, key, captured)
+
+    # 兜底清理调试目录（自动图已移入 stored_images，这里只清手动调试残留）
+    _prune_scratch()
 
     # 最近车辆表（网页展示，最多保留 10 台）
     hub.recent_cars.insert(0, {
@@ -609,6 +635,32 @@ def write_sidecar(ctx, files, det, db_ok, model_key, captured):
 # ===================== Flask 应用 =====================
 app = Flask(__name__)
 hub = CameraHub()
+
+# 自动触发的重活（拍照+落库约 12s）派发到独立线程，PLC 监控线程立即返回继续轮询，
+# 避免出车信号触发期间停止轮询导致漏检。max_workers=1 保证相机一次只拍一台、不重叠。
+_capture_exec = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-capture")
+
+
+def _prune_scratch(max_age_days=7, max_files=2000):
+    """清理调试用 raw_images：删除超过 N 天或总数超上限的最旧文件，防磁盘涨满。
+
+    自动拍照的图在 StorageService.save 中已被移到 stored_images（去重），
+    故本目录只残留手动调试连拍的图，低频但需兜底清理。
+    """
+    try:
+        files = [os.path.join(SAVE_DIR, f) for f in os.listdir(SAVE_DIR)]
+        files = [f for f in files if os.path.isfile(f)]
+        if len(files) <= max_files:
+            cutoff = time.time() - max_age_days * 86400
+            for f in files:
+                if os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+        else:
+            files.sort(key=os.path.getmtime)
+            for f in files[:-max_files]:
+                os.remove(f)
+    except Exception:
+        pass
 
 
 def _gen_mjpeg():
@@ -760,6 +812,7 @@ def api_capture():
         return jsonify({"ok": False, "error": "相机未运行"})
     # 手动按钮：纯拍照（不检测、不入库），用于远程盯屏调试/补拍
     result = hub.request_capture_primary()
+    _prune_scratch()   # 手动调试图也兜底清理，防磁盘涨满
     return jsonify(result)
 
 
@@ -814,7 +867,8 @@ def main():
                 plc = PlcMonitor(ip=PLC_IP, rack=PLC_RACK, slot=PLC_SLOT,
                                  poll_ms=PLC_POLL_MS, ctx_ms=PLC_CTX_MS)
                 plc.connect()
-                plc.start(handle_car_signal)
+                # 重活派发到独立线程，PLC 线程立即返回继续轮询（避免阻塞漏检）
+                plc.start(lambda ctx: _capture_exec.submit(handle_car_signal, ctx))
                 print(f"[PLC] 已连接 {PLC_IP}（只读）· 自动触发已启用"
                       f"（记录全部车；仅 9X/8X 且 NO_Paint=0 拍照）")
         except Exception as e:
@@ -841,6 +895,10 @@ def main():
         if plc is not None:
             plc.disconnect()
             print("\n[PLC] 已断开（仅读，未写任何地址）")
+        try:
+            _capture_exec.shutdown(wait=False)
+        except Exception:
+            pass
         print("\n[网页采集] 已停止，相机已释放")
 
 

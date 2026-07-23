@@ -62,9 +62,8 @@ class Database:
                  int(rec.captured))
             )
             conn.commit()
-        print(f"[存储] 落库: 车型={rec.car_model} 结果={'OK' if rec.ok else 'NG'} "
-              f"图片={len(rec.image_refs)}张 缺陷={len(rec.defects)}处 "
-              f"滑橇={rec.skid} PIN={rec.pin!r} NO_Paint={rec.no_paint} 拍照={rec.captured}")
+        # 不在此 print：逐条打印既与 sidecar/UI 重复，又会被日志系统回灌成上下文噪声。
+        # 需要审计时查 data/records 下的 sidecar JSON 或监控 UI 即可。
         return rec
 
     def get_records(self, limit: int = 50) -> list:
