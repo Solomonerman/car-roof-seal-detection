@@ -66,7 +66,12 @@ class DetectionResult:
 class InspectionRecord:
     """一条完整的检测记录，用于落库与 UI 展示。"""
     car_model: str
-    ok: bool
+    ok: bool                              # 整体判定 OK / NG
     image_refs: List[str] = field(default_factory=list)
     defects: List[Defect] = field(default_factory=list)
     timestamp: str = ""
+    # —— 追溯与筛选字段（PLC 上下文）——
+    skid: int = None                      # 滑橇号
+    pin: str = ""                         # PIN
+    no_paint: bool = False                # NO_Paint=1 表示免检（不拍照）
+    captured: bool = False                # 是否拍照纳入检测流程（UI"是否检测"列依据）

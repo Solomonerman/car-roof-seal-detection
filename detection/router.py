@@ -3,23 +3,25 @@
 
 现场车型代码（DB230.DBD1208，ASCII）：
   - 以 "MM" 开头（如 "MM**"）→ 9X 车型 → 用现有 SealDetector
-  - 其他（如 "7P24"）→ 未来待接入车型 → 暂不处理（留扩展位）
+  - "NM41" / "NM42" → 8X 车型（同一套检测程序）→ 算法尚未实现，预留
+  - 其他（如 "7P24"）→ 未知/未接入车型 → 暂不处理
 
-扩展新车型：在 route_algorithm 里加一个分支返回新 key，
-并在 get_detector 里为该 key 返回对应检测器即可，总控流程无需改动。
+扩展新车型：在 ROUTING 里加一条 代码前缀→算法 key，并在 get_detector
+里为该 key 返回对应检测器即可，总控流程无需改动。
 """
 from common.interfaces import DetectionResult, Defect
 
 
-# 车型前缀 → 算法 key
+# 车型代码（前缀）→ 算法 key
 ROUTING = {
-    "MM": "9X",      # 9X 车型：现有胶条检测算法
-    # "7P": "FUTURE_B",   # 未来车型：待接入算法后取消注释并补充 get_detector
+    "MM": "9X",       # 9X 车型：现有胶条检测算法
+    "NM41": "8X",     # 8X 车型：算法未实现，预留（与 NM42 同一套程序）
+    "NM42": "8X",     # 8X 车型：同上
 }
 
 
 def route_algorithm(model_ascii: str) -> str:
-    """返回算法 key：'9X' / 'future'（未匹配任何已知规则）。"""
+    """返回算法 key：'9X' / '8X' / 'future'（未匹配任何已知规则）。"""
     m = (model_ascii or "").upper()
     for prefix, key in ROUTING.items():
         if m.startswith(prefix):
@@ -28,11 +30,11 @@ def route_algorithm(model_ascii: str) -> str:
 
 
 def get_detector(key: str):
-    """按算法 key 返回检测器实例；'future' 或未知 → 返回 None（暂不处理）。"""
+    """按算法 key 返回检测器实例；'8X' 及未知 → 返回 None（预留/暂不处理）。"""
     if key == "9X":
         from detection.detector import SealDetector
         return SealDetector()
-    # 未来车型：算法未实现，返回 None，由调用方跳过
+    # 8X 及其他：算法未实现，返回 None，由调用方跳过实际检测（仅拍照存档）
     return None
 
 

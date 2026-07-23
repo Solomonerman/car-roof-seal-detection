@@ -10,7 +10,7 @@
 自动触发（--plc-auto）：
   后台启一个【只读】PLC 监控线程，监测 DB130.DBX0.1（出车信号）上升沿；
   上升沿时按"先锁存后打印"取到车号上下文（滑橇/PIN/车型/NO_Paint），
-  做车型筛选与免检过滤后，复用预触发缓冲立即拍照，再跑检测、落库、写追溯。
+  记录全部车（含免检），并对(9X/8X 且 NO_Paint=0)的车触发预触发拍照；
   全程仅 read_area，绝不写 PLC（结果回写按现场要求暂未实现）。
 
 用法：
@@ -18,7 +18,7 @@
   2) 关闭 pylon Viewer（避免相机被占用）
   3) 手动模式： python capture/web_capture.py
      自动模式： python capture/web_capture.py --plc-auto
-  4) 浏览器打开 http://<上位机IP>:5000 看实时画面、点按钮或看自动检测结果
+  4) 浏览器打开 http://<上位机IP>:5000 看实时画面、点按钮或看自动记录
 
 连拍 / 相机参数 / PLC 参数都集中在顶部，按现场情况调整。
 依赖：Flask（网页服务） + pypylon（相机） + opencv（图像） + python-snap7（仅自动模式）
@@ -55,13 +55,13 @@ WEB_PORT = 5000          # 浏览器访问端口（上位机防火墙需放行�
 
 # ===================== 连拍参数（现场可按需修改） =====================
 FPS = 3                # 连拍帧率（张/秒）
-DURATION_SEC = 5       # 连拍持续时长（秒）
-# 总张数 = FPS × DURATION_SEC，当前 3×5 = 15 张
+DURATION_SEC = 7       # 连拍持续时长（秒）
+# 总张数 = FPS × DURATION_SEC，当前 3×7 = 21 张
 # 触发方式：
 #   "pre"  = 预触发环形缓冲（推荐）：后台一直缓存最近 DURATION_SEC 秒的帧，
-#            点按钮立即把缓冲里已有的帧存盘 → 拍的是点击那一刻及之前的画面，
+#            点按钮/出车信号立即把缓冲里已有的帧存盘 → 拍的是信号那一刻及之前的画面，
 #            对运动物体无延迟（解决"点的时候是车头、拍到的是车身"问题）。
-#   "post" = 点击后才开始连拍 DURATION_SEC 秒（旧逻辑，运动物体会有明显延迟）。
+#   "post" = 点击/信号后才开始连拍 DURATION_SEC 秒（旧逻辑，运动物体会有明显延迟）。
 CAPTURE_MODE = "pre"
 
 # ===================== 相机连接参数 =====================
@@ -286,8 +286,8 @@ class CameraStreamer:
     def _flush_buffer(self):
         """预触发：把环形缓冲里最近的 total 帧立即存盘。
 
-        拍的是点击那一刻及之前的画面（缓冲已缓存最近 DURATION_SEC 秒），
-        因此对运动物体没有"点击后才开始抓"的延迟。
+        拍的是信号那一刻及之前的画面（缓冲已缓存最近 DURATION_SEC 秒），
+        因此对运动物体没有"信号后才开始抓"的延迟。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
@@ -393,6 +393,7 @@ class CameraHub:
         self.primary_ip = self.ips[0] if self.ips else None
         self.plc_auto = False          # 是否启用 PLC 自动触发
         self.last_auto = None          # 最近一次自动检测结果（供 UI 展示）
+        self.recent_cars = []          # 最近若干台车（供网页"最近车辆"表展示）
 
     def connect_all(self):
         if not self.ips:
@@ -443,21 +444,30 @@ class CameraHub:
     def status(self):
         if not self.streamers:
             return {"running": False, "plc_auto": self.plc_auto,
-                    "last_auto": self.last_auto, "cameras": []}
+                    "last_auto": self.last_auto, "recent_cars": self.recent_cars,
+                    "cameras": []}
         base = self.streamers[0].status()
         base["cameras"] = [s.status() for s in self.streamers]
         base["primary_ip"] = self.primary_ip
         base["plc_auto"] = self.plc_auto
         base["last_auto"] = self.last_auto
+        base["recent_cars"] = self.recent_cars
         return base
 
 
 # ===================== PLC 自动触发回调（仅 --plc-auto）=====================
 def handle_car_signal(ctx):
-    """出车信号上升沿回调：免检过滤 → 车型路由 → 拍照 → 检测 → 落库 → 写追溯。
+    """出车信号上升沿回调：记录全部车 → 仅(9X/8X 且 NO_Paint=0)拍照 → 落库+写追溯。
 
+    流程（用户定义）：
+      上升沿 → 先记录全部车的车型/NO_Paint/滑橇/PIN →
+      若车型是 9X 或 8X 且 NO_Paint=0 → 触发相机拍照（预触发，立即）；
+      否则不拍照（免检车 / 未接入车型）。
+    所有车型用同一出车信号触发，避免拍照时机不一致导致照片错位。
+
+    本迭代【不跑检测】：拍照车用占位结果记录，检测等照片确认后再接。
     全程只读 PLC；本函数不写任何 PLC 地址。
-    ctx 为 plc_monitor.parse_context 的 dict，或在无锁存时为 None。
+    ctx 为 plc_monitor.parse_context 的 dict，无锁存时为 None。
     """
     global hub
     if ctx is None:
@@ -469,55 +479,66 @@ def handle_car_signal(ctx):
     no_paint = ctx["no_paint"]
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1) 免检过滤：NO_Paint=1 不拍照、不记录
-    if no_paint:
-        print(f"[自动] 免检车 滑橇={skid} 车型={model} PIN={pin!r} "
-              f"→ 跳过（不拍照不记录）")
-        return
-
-    # 2) 车型路由：仅 9X（MM**）走现有算法；其他车型暂跳过
-    from detection.router import route_algorithm, get_detector
+    # 车型路由：决定是否需要拍照（9X/8X 且 NO_Paint=0）
+    from detection.router import route_algorithm
     key = route_algorithm(model)
-    if key != "9X":
-        print(f"[自动] 车型={model} 算法未实现（key={key}），暂跳过（仅提示）")
-        return
+    captured = (key in ("9X", "8X")) and (not no_paint)
 
-    # 3) 拍照（复用预触发缓冲，零运动延迟）
-    cap = hub.request_capture_all()
-    files = cap.get("primary_files", [])
-    if not files:
-        print(f"[自动] 拍照失败：{cap.get('primary_result', cap)}")
-        return
+    # 仅需要拍照的车才占相机（统一用出车信号触发）
+    files = []
+    if captured:
+        cap = hub.request_capture_all()
+        files = cap.get("primary_files", [])
+        if not files:
+            print(f"[自动] 拍照失败：{cap.get('primary_result', cap)}")
+            captured = False   # 拍照失败则按未拍照记录
+
+    # 本迭代不跑检测：拍照车用占位结果（后续接检测时替换此段）
+    from common.interfaces import DetectionResult, Defect
+    det = DetectionResult(
+        car_model=model, ok=True,
+        defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                        meta={"reason": "拍照完成·检测待做（检测算法待接入）"})],
+        confidence=0.0,
+        message="拍照完成·检测待做",
+    )
+
+    # 落库（含 skid/pin/no_paint/captured）+ 复制图到 stored_images
     paths = [os.path.join(SAVE_DIR, f) for f in files]
-
-    # 4) 检测（当前仅对主相机/左相机图片做检测）
-    detector = get_detector("9X")
-    process_dir = os.path.join(ROOT, "data", "process_data")
-    det = detector.detect(model, paths, process_dir=process_dir)
-
-    # 5) 落库（inspection.db）+ 复制图到 stored_images
     db_ok = False
     try:
         from storage.service import StorageService
-        StorageService().save(model, det, paths)
+        StorageService().save(model, det, paths,
+                               skid=skid, pin=pin, no_paint=no_paint, captured=captured)
         db_ok = True
     except Exception as e:
         print(f"[自动] 落库失败: {e}")
 
-    # 6) 写追溯 sidecar（含 skid/PIN，DB 表无此字段）
-    write_sidecar(ctx, cap, det, db_ok, key)
+    # 写追溯 sidecar（全字段，含 skid/PIN）
+    write_sidecar(ctx, files, det, db_ok, key, captured)
 
-    # 7) 打印结果
-    ng = len([d for d in det.defects if d.label in NG_LABELS])
-    verdict = "OK" if det.ok else f"NG(缺陷{ng})"
-    print(f"[自动] 车 滑橇={skid} 车型={model} → 拍{len(files)}张 检测={verdict} "
-          f"库={'已写' if db_ok else '失败'}")
+    # 最近车辆表（网页展示，最多保留 10 台）
+    hub.recent_cars.insert(0, {
+        "ts": ts, "model": model, "skid": skid, "pin": pin,
+        "no_paint": bool(no_paint), "captured": captured, "key": key,
+    })
+    hub.recent_cars = hub.recent_cars[:10]
     hub.last_auto = {"ts": ts, "skid": skid, "model": model,
-                     "ok": det.ok, "ng": ng}
+                     "ok": True, "captured": captured}
+
+    # 打印
+    if captured:
+        action = f"拍{len(files)}张"
+    elif no_paint:
+        action = "免检跳过（不拍照）"
+    else:
+        action = f"车型未接入({key})跳过"
+    print(f"[自动] 车 滑橇={skid} 车型={model}({key}) NO_Paint={no_paint} "
+          f"→ {action} 库={'已写' if db_ok else '失败'}")
 
 
-def write_sidecar(ctx, cap, det, db_ok, model_key):
-    """为本次自动检测写一份追溯 JSON（skid/PIN/车型/检测结果/图片清单）。"""
+def write_sidecar(ctx, files, det, db_ok, model_key, captured):
+    """为本次自动检测写一份追溯 JSON（skid/PIN/车型/拍照/检测状态）。"""
     os.makedirs(RECORD_DIR, exist_ok=True)
     ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{ts_file}__skid{ctx['skid']}.json"
@@ -529,16 +550,14 @@ def write_sidecar(ctx, cap, det, db_ok, model_key):
         "model": ctx["model"],
         "model_key": model_key,
         "no_paint": bool(ctx["no_paint"]),
+        "captured": captured,
         "capture": {
-            "saved": len(cap.get("primary_files", [])),
-            "span_sec": (cap.get("primary_result") or {}).get("span_sec"),
-            "files": cap.get("primary_files", []),
+            "saved": len(files),
+            "files": files,
         },
         "detection": {
-            "ok": det.ok,
+            "done": False,
             "message": det.message,
-            "defect_count": len(det.defects),
-            "confidence": det.confidence,
         },
         "db_recorded": db_ok,
     }
@@ -580,7 +599,7 @@ def index():
         align-items:center;gap:12px;flex-wrap:wrap}}
  header h1{{font-size:16px;margin:0}}
  .badge{{font-size:12px;padding:2px 8px;border-radius:10px;background:#2d6cdf;color:#fff}}
- .wrap{{padding:16px;max-width:1000px;margin:0 auto}}
+ .wrap{{padding:16px;max-width:1100px;margin:0 auto}}
  .video{{background:#000;border:1px solid #333;border-radius:8px;overflow:hidden}}
  .video img{{width:100%;display:block}}
  .bar{{display:flex;gap:10px;align-items:center;margin:14px 0;flex-wrap:wrap}}
@@ -592,6 +611,12 @@ def index():
       font-family:monospace;font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto}}
  .meta{{font-size:12px;color:#aaa;line-height:1.7}}
  .meta b{{color:#eee}}
+ .ctab{{border-collapse:collapse;width:100%;font-size:12px;margin-top:4px}}
+ .ctab th,.ctab td{{border:1px solid #333;padding:4px 6px;text-align:left}}
+ .ctab th{{background:#222;color:#ccc}}
+ .ctab td{{color:#ddd}}
+ .ctab .yes{{color:#5ad15a;font-weight:bold}}
+ .ctab .no{{color:#d18a5a}}
 </style></head>
 <body>
 <header><h1>车顶密封条相机 · 实时取景</h1>
@@ -604,8 +629,12 @@ def index():
     <span id="capState" class="meta"></span>
   </div>
   <div class="meta" id="meta"></div>
-  <h3 style="font-size:14px;margin:18px 0 6px">自动检测（PLC 触发）</h3>
-  <div id="auto" class="meta">手动模式</div>
+  <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
+  <table class="ctab"><thead><tr>
+    <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测</th>
+  </tr></thead><tbody id="carbody">
+    <tr><td colspan="7" class="meta">手动模式</td></tr>
+  </tbody></table>
   <h3 style="font-size:14px;margin:18px 0 6px">采集日志</h3>
   <div id="log">等待操作…</div>
 </div>
@@ -617,6 +646,7 @@ const plcstate=document.getElementById('plcstate');
 const capBtn=document.getElementById('cap');
 const capState=document.getElementById('capState');
 const auto=document.getElementById('auto');
+const carbody=document.getElementById('carbody');
 
 function refreshStatus(){{
   fetch('/api/status').then(r=>r.json()).then(s=>{{
@@ -624,13 +654,17 @@ function refreshStatus(){{
     else{{state.textContent='● 离线';state.style.background='#b5482f';}}
     if(s.plc_auto){{
       plcstate.textContent='● PLC自动';plcstate.style.background='#2d6cdf';
-      let a=s.last_auto;
-      if(a){{auto.innerHTML=`<b>最近</b>：${{a.ts}} · 车型 <b>${{a.model}}</b> · 滑橇 ${{a.skid}} · `
-        +`<b>${{a.ok?'OK':'NG('+a.ng+')'}}</b>`;}}
-      else{{auto.textContent='等待出车信号…';}}
+      let rows=(s.recent_cars||[]).map(c=>{{
+        let ph=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
+        let dt=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
+        return `<tr><td>${{c.ts}}</td><td>${{c.model}}(${{c.key}})</td><td>${{c.skid}}</td>`
+          +`<td>${{c.pin}}</td><td>${{c.no_paint?'<span class="no">是</span>':'<span class="yes">否</span>'}}</td>`
+          +`<td>${{ph}}</td><td>${{dt}}</td></tr>`;
+      }}).join('');
+      carbody.innerHTML = rows || `<tr><td colspan="7" class="meta">等待出车信号…</td></tr>`;
     }}else{{
       plcstate.textContent='● PLC未启用';plcstate.style.background='#555';
-      auto.textContent='手动模式：PLC 自动触发未启用（加 --plc-auto 开启）';
+      carbody.innerHTML='<tr><td colspan="7" class="meta">手动模式：PLC 自动触发未启用（加 --plc-auto 开启）</td></tr>';
     }}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
@@ -689,7 +723,7 @@ def main():
     parser.add_argument("--host", default=WEB_HOST)
     parser.add_argument("--port", type=int, default=WEB_PORT)
     parser.add_argument("--plc-auto", action="store_true",
-                        help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→拍照→检测→记录）")
+                        help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→记录全部车→拍照→记录）")
     parser.add_argument("--no-browser-note", action="store_true")
     args = parser.parse_args()
 
@@ -720,7 +754,7 @@ def main():
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
-    print(f"[网页采集] 预触发缓冲：点按钮即存最近 {st['params']['duration_sec']}秒 "
+    print(f"[网页采集] 预触发缓冲：点按钮/出车信号即存最近 {st['params']['duration_sec']}秒 "
           f"= {st['params']['total']} 张（{st['params']['fps']}fps）")
     print(f"[网页采集] 保存目录：{SAVE_DIR}")
 
@@ -737,7 +771,7 @@ def main():
                 plc.connect()
                 plc.start(handle_car_signal)
                 print(f"[PLC] 已连接 {PLC_IP}（只读）· 自动触发已启用"
-                      f"（NO_Paint=1 跳过；非9X车型暂跳过）")
+                      f"（记录全部车；仅 9X/8X 且 NO_Paint=0 拍照）")
         except Exception as e:
             print(f"[警告] PLC 自动触发启动失败：{e}（回退手动模式）")
             plc = None

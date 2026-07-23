@@ -14,7 +14,8 @@ class StorageService:
         self.db = Database()
         self.store = ObjectStore()
 
-    def save(self, model: str, det, images: list) -> InspectionRecord:
+    def save(self, model: str, det, images: list,
+             skid=None, pin="", no_paint=False, captured=False) -> InspectionRecord:
         refs = [self.store.upload(p) for p in images]
         rec = InspectionRecord(
             car_model=model,
@@ -22,6 +23,10 @@ class StorageService:
             image_refs=refs,
             defects=det.defects,
             timestamp=datetime.datetime.now().isoformat(timespec="seconds"),
+            skid=skid,
+            pin=pin,
+            no_paint=no_paint,
+            captured=captured,
         )
         self.db.save_record(rec)
         return rec

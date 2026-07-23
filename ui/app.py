@@ -29,11 +29,13 @@ def records():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    def yn(b):
+        return '<span class="yes">是</span>' if b else '<span class="no">否</span>'
     rows = "".join(
-        f"<tr><td>{r.timestamp}</td><td>{r.car_model}</td>"
+        f"<tr><td>{r.timestamp}</td><td>{r.car_model}</td><td>{r.skid}</td>"
+        f"<td>{r.pin}</td><td>{yn(r.no_paint)}</td>"
         f"<td>{'OK' if r.ok else 'NG'}</td>"
-        f"<td>{len(r.image_refs)}</td>"
-        f"<td>{len(r.defects)}</td></tr>"
+        f"<td>{yn(r.captured)}</td><td>{len(r.image_refs)}</td></tr>"
         for r in _db.get_records(limit=20)
     )
     return f"""
@@ -43,18 +45,21 @@ def index():
       <title>车顶胶条检测监控</title>
       <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; }}
-        table {{ border-collapse: collapse; width: 100%; max-width: 800px; }}
+        table {{ border-collapse: collapse; width: 100%; max-width: 1000px; }}
         th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
         th {{ background: #f2f2f2; }}
         .ok {{ color: green; font-weight: bold; }}
         .ng {{ color: red; font-weight: bold; }}
+        .yes {{ color: green; }}
+        .no {{ color: #c60; }}
       </style>
     </head>
     <body>
       <h2>车顶胶条检测 - 实时监控</h2>
       <p>记录数：{_db.count()}（每 5 秒自动刷新）</p>
       <table>
-        <tr><th>时间</th><th>车型</th><th>结果</th><th>图片数</th><th>缺陷数</th></tr>
+        <tr><th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th>
+            <th>结果</th><th>检测</th><th>图片数</th></tr>
         {rows}
       </table>
     </body></html>

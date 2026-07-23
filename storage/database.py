@@ -16,6 +16,10 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "data", "inspection.db")
 
 
 class Database:
+    # records 表列顺序（用于 SELECT * 结果按名取值，兼容旧库缺列）
+    _COLUMNS = ["id", "car_model", "ok", "image_refs", "defects", "timestamp",
+                "skid", "pin", "no_paint", "captured"]
+
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self._init_db()
@@ -32,21 +36,35 @@ class Database:
                     timestamp TEXT
                 )
             """)
+            # 向后兼容：旧库可能没有追溯字段，按需加列（重复列忽略）
+            for col, ctype in (("skid", "INTEGER"), ("pin", "TEXT"),
+                               ("no_paint", "INTEGER"), ("captured", "INTEGER")):
+                try:
+                    conn.execute(f"ALTER TABLE records ADD COLUMN {col} {ctype}")
+                except Exception:
+                    pass
             conn.commit()
 
     def save_record(self, rec: InspectionRecord) -> InspectionRecord:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO records (car_model, ok, image_refs, defects, timestamp) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO records "
+                "(car_model, ok, image_refs, defects, timestamp, skid, pin, no_paint, captured) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (rec.car_model,
                  int(rec.ok),
                  json.dumps(rec.image_refs),
                  json.dumps([d.__dict__ for d in rec.defects]),
-                 rec.timestamp)
+                 rec.timestamp,
+                 rec.skid,
+                 rec.pin,
+                 int(rec.no_paint),
+                 int(rec.captured))
             )
             conn.commit()
         print(f"[存储] 落库: 车型={rec.car_model} 结果={'OK' if rec.ok else 'NG'} "
-              f"图片={len(rec.image_refs)}张 缺陷={len(rec.defects)}处")
+              f"图片={len(rec.image_refs)}张 缺陷={len(rec.defects)}处 "
+              f"滑橇={rec.skid} PIN={rec.pin!r} NO_Paint={rec.no_paint} 拍照={rec.captured}")
         return rec
 
     def get_records(self, limit: int = 50) -> list:
@@ -56,12 +74,26 @@ class Database:
             ).fetchall()
         out = []
         for row in rows:
+            # 兼容旧库：新列（skid/pin/no_paint/captured）可能为 NULL 或不存在
+            def col(name, default):
+                try:
+                    idx = Database._COLUMNS.index(name)
+                    if idx < len(row):
+                        v = row[idx]
+                        return v if v is not None else default
+                except ValueError:
+                    pass
+                return default
             out.append(InspectionRecord(
                 car_model=row[1],
                 ok=bool(row[2]),
                 image_refs=json.loads(row[3]) if row[3] else [],
                 defects=[Defect(**d) for d in json.loads(row[4])] if row[4] else [],
-                timestamp=row[5]
+                timestamp=row[5],
+                skid=col("skid", None),
+                pin=col("pin", ""),
+                no_paint=bool(col("no_paint", 0)),
+                captured=bool(col("captured", 0)),
             ))
         return out
 
