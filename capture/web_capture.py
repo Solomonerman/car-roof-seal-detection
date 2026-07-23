@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""现场相机 · 网页版实时取景 + 远程触发采集。
+"""现场相机 · 网页版实时取景 + 远程触发采集 + PLC 自动触发检测。
 
 为什么用这个：
   你在工位远程操作上位机，看不到现场车子。pylon Viewer 的实时窗口在
@@ -7,21 +7,26 @@
   这个工具把相机的实时画面通过浏览器（局域网/公网）推给你，你在网页上
   就能看到车有没有到位，点一下按钮就触发连拍，无需远程桌面、无需 pylon Viewer。
 
+自动触发（--plc-auto）：
+  后台启一个【只读】PLC 监控线程，监测 DB130.DBX0.1（出车信号）上升沿；
+  上升沿时按"先锁存后打印"取到车号上下文（滑橇/PIN/车型/NO_Paint），
+  做车型筛选与免检过滤后，复用预触发缓冲立即拍照，再跑检测、落库、写追溯。
+  全程仅 read_area，绝不写 PLC（结果回写按现场要求暂未实现）。
+
 用法：
   1) 上位机安装依赖： pip install pypylon opencv-python flask
   2) 关闭 pylon Viewer（避免相机被占用）
-  3) python capture/web_capture.py
-  4) 在本机或任意能访问上位机 IP 的电脑浏览器打开：
-       http://<上位机IP>:5000
-  5) 网页里看实时画面，点【连拍一轮】即触发；拍完结果直接落入 data/raw_images/
+  3) 手动模式： python capture/web_capture.py
+     自动模式： python capture/web_capture.py --plc-auto
+  4) 浏览器打开 http://<上位机IP>:5000 看实时画面、点按钮或看自动检测结果
 
-连拍 / 相机参数都集中在顶部，按现场情况调整。
-
-依赖：Flask（网页服务） + pypylon（相机） + opencv（图像）
+连拍 / 相机参数 / PLC 参数都集中在顶部，按现场情况调整。
+依赖：Flask（网页服务） + pypylon（相机） + opencv（图像） + python-snap7（仅自动模式）
 """
 import os
 import sys
 import time
+import json
 import datetime
 import threading
 import argparse
@@ -60,9 +65,10 @@ DURATION_SEC = 5       # 连拍持续时长（秒）
 CAPTURE_MODE = "pre"
 
 # ===================== 相机连接参数 =====================
-CAMERA_IP = "172.30.173.249"   # 现场左侧 Basler aca1920-48gm
-CAMERA_SERIAL = ""             # 留空则用 IP；也可填序列号直连
-# 两个都空 → 自动连第一台可用 Basler 相机
+# 现场相机 IP 列表（多相机就绪：左右相机共用同一出车信号，分别把 IP 追加进来即可，
+# 其余代码无需改动；当前仅左相机一台）。第二台接入后，自动模式会同时触发全部相机。
+CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
+CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
 
 # ===================== 相机采集参数 =====================
 EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
@@ -78,18 +84,30 @@ PIXEL_FORMAT = "Mono8"       # 黑白相机 8bit 灰度
 # ===================== 存储参数 =====================
 SAVE_DIR = os.path.join(ROOT, "data", "raw_images")
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
+RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON
 
 # ===================== 预览参数 =====================
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
 JPEG_QUALITY = 80            # 实时流 JPEG 质量（1-100，越小越流畅但越糊）
 
+# ===================== PLC 自动触发参数（--plc-auto 启用）=====================
+PLC_IP = "172.30.173.6"
+PLC_RACK = 0
+PLC_SLOT = 2
+PLC_POLL_MS = 10             # 出车信号轮询间隔（毫秒）
+PLC_CTX_MS = 200             # DB230 上下文采样间隔（毫秒）
+
+# 缺陷标签集合（出现 → 整体 NG）；与 detection.detector.NG_LABELS 保持一致
+NG_LABELS = {"missing", "break", "overspray", "width"}
+
 # ================================================================
 
 
 class CameraStreamer:
-    """后台线程：持续取流 → 存最新帧；按需执行连拍。"""
+    """后台线程：持续取流 → 存最新帧；按需执行连拍。单台相机。"""
 
-    def __init__(self):
+    def __init__(self, camera_ip=None):
+        self.camera_ip = camera_ip
         self.cam = None
         self.running = False
         self.is_color = False
@@ -117,14 +135,15 @@ class CameraStreamer:
             raise RuntimeError("未安装 pypylon，请先在上位机执行：pip install pypylon")
 
         factory = py.TlFactory.GetInstance()
-        if CAMERA_IP:
+        ip = self.camera_ip
+        if ip:
             info = py.DeviceInfo()
-            info.SetPropertyValue("IpAddress", CAMERA_IP)
+            info.SetPropertyValue("IpAddress", ip)
             try:
                 self.cam = py.InstantCamera(factory.CreateDevice(info))
             except Exception:
                 raise RuntimeError(
-                    f"无法连接 IP={CAMERA_IP} 的相机。检查：通电/网线/同网段/防火墙/"
+                    f"无法连接 IP={ip} 的相机。检查：通电/网线/同网段/防火墙/"
                     f"用 pylon IP Configurator 确认 IP。若 pylon Viewer 开着请先关闭。"
                 )
         elif CAMERA_SERIAL:
@@ -141,8 +160,8 @@ class CameraStreamer:
         self.camera_info = {
             "model": self.cam.GetDeviceInfo().GetModelName(),
             "serial": self.cam.GetDeviceInfo().GetSerialNumber(),
-            "ip": CAMERA_IP or (self.cam.GetDeviceInfo().GetIpAddress()
-                                if hasattr(self.cam.GetDeviceInfo(), "GetIpAddress") else "N/A"),
+            "ip": ip or (self.cam.GetDeviceInfo().GetIpAddress()
+                         if hasattr(self.cam.GetDeviceInfo(), "GetIpAddress") else "N/A"),
         }
         self._configure()
 
@@ -365,15 +384,181 @@ class CameraStreamer:
             pass
 
 
+class CameraHub:
+    """多相机封装（当前仅一台，列表化以便加第二台）。网页用主相机预览。"""
+
+    def __init__(self, ips=None):
+        self.ips = list(ips if ips is not None else CAMERA_IPS)
+        self.streamers = []
+        self.primary_ip = self.ips[0] if self.ips else None
+        self.plc_auto = False          # 是否启用 PLC 自动触发
+        self.last_auto = None          # 最近一次自动检测结果（供 UI 展示）
+
+    def connect_all(self):
+        if not self.ips:
+            raise RuntimeError("未配置相机 IP（CAMERA_IPS 为空）")
+        self.streamers = [CameraStreamer(ip) for ip in self.ips]
+        for s in self.streamers:
+            s.connect()
+        self.primary_ip = self.ips[0]
+
+    def start_all(self):
+        for s in self.streamers:
+            s.start()
+
+    def stop_all(self):
+        for s in self.streamers:
+            s.stop()
+
+    @property
+    def running(self):
+        return any(s.running for s in self.streamers)
+
+    def get_primary_jpeg(self):
+        if not self.streamers:
+            return None
+        return self.streamers[0].get_latest_jpeg()
+
+    def request_capture_primary(self):
+        """手动按钮用：返回主相机连拍结果 dict（含 files/saved/...）。"""
+        if not self.streamers:
+            return {"ok": False, "error": "相机未运行"}
+        return self.streamers[0].request_capture()
+
+    def request_capture_all(self):
+        """自动触发用：触发全部相机，返回主相机文件列表 + 各相机结果。"""
+        by_camera = {}
+        primary_files = []
+        primary_result = None
+        for ip, s in zip(self.ips, self.streamers):
+            r = s.request_capture()
+            by_camera[ip] = r
+            if ip == self.primary_ip:
+                primary_files = r.get("files", [])
+                primary_result = r
+        return {"primary_files": primary_files,
+                "primary_result": primary_result,
+                "by_camera": by_camera}
+
+    def status(self):
+        if not self.streamers:
+            return {"running": False, "plc_auto": self.plc_auto,
+                    "last_auto": self.last_auto, "cameras": []}
+        base = self.streamers[0].status()
+        base["cameras"] = [s.status() for s in self.streamers]
+        base["primary_ip"] = self.primary_ip
+        base["plc_auto"] = self.plc_auto
+        base["last_auto"] = self.last_auto
+        return base
+
+
+# ===================== PLC 自动触发回调（仅 --plc-auto）=====================
+def handle_car_signal(ctx):
+    """出车信号上升沿回调：免检过滤 → 车型路由 → 拍照 → 检测 → 落库 → 写追溯。
+
+    全程只读 PLC；本函数不写任何 PLC 地址。
+    ctx 为 plc_monitor.parse_context 的 dict，或在无锁存时为 None。
+    """
+    global hub
+    if ctx is None:
+        print("[自动] 上升沿但无锁存车号，跳过")
+        return
+    skid = ctx["skid"]
+    model = ctx["model"]
+    pin = ctx["pin"]
+    no_paint = ctx["no_paint"]
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) 免检过滤：NO_Paint=1 不拍照、不记录
+    if no_paint:
+        print(f"[自动] 免检车 滑橇={skid} 车型={model} PIN={pin!r} "
+              f"→ 跳过（不拍照不记录）")
+        return
+
+    # 2) 车型路由：仅 9X（MM**）走现有算法；其他车型暂跳过
+    from detection.router import route_algorithm, get_detector
+    key = route_algorithm(model)
+    if key != "9X":
+        print(f"[自动] 车型={model} 算法未实现（key={key}），暂跳过（仅提示）")
+        return
+
+    # 3) 拍照（复用预触发缓冲，零运动延迟）
+    cap = hub.request_capture_all()
+    files = cap.get("primary_files", [])
+    if not files:
+        print(f"[自动] 拍照失败：{cap.get('primary_result', cap)}")
+        return
+    paths = [os.path.join(SAVE_DIR, f) for f in files]
+
+    # 4) 检测（当前仅对主相机/左相机图片做检测）
+    detector = get_detector("9X")
+    process_dir = os.path.join(ROOT, "data", "process_data")
+    det = detector.detect(model, paths, process_dir=process_dir)
+
+    # 5) 落库（inspection.db）+ 复制图到 stored_images
+    db_ok = False
+    try:
+        from storage.service import StorageService
+        StorageService().save(model, det, paths)
+        db_ok = True
+    except Exception as e:
+        print(f"[自动] 落库失败: {e}")
+
+    # 6) 写追溯 sidecar（含 skid/PIN，DB 表无此字段）
+    write_sidecar(ctx, cap, det, db_ok, key)
+
+    # 7) 打印结果
+    ng = len([d for d in det.defects if d.label in NG_LABELS])
+    verdict = "OK" if det.ok else f"NG(缺陷{ng})"
+    print(f"[自动] 车 滑橇={skid} 车型={model} → 拍{len(files)}张 检测={verdict} "
+          f"库={'已写' if db_ok else '失败'}")
+    hub.last_auto = {"ts": ts, "skid": skid, "model": model,
+                     "ok": det.ok, "ng": ng}
+
+
+def write_sidecar(ctx, cap, det, db_ok, model_key):
+    """为本次自动检测写一份追溯 JSON（skid/PIN/车型/检测结果/图片清单）。"""
+    os.makedirs(RECORD_DIR, exist_ok=True)
+    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{ts_file}__skid{ctx['skid']}.json"
+    rec = {
+        "trigger_ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": "plc_auto",
+        "skid": ctx["skid"],
+        "pin": ctx["pin"],
+        "model": ctx["model"],
+        "model_key": model_key,
+        "no_paint": bool(ctx["no_paint"]),
+        "capture": {
+            "saved": len(cap.get("primary_files", [])),
+            "span_sec": (cap.get("primary_result") or {}).get("span_sec"),
+            "files": cap.get("primary_files", []),
+        },
+        "detection": {
+            "ok": det.ok,
+            "message": det.message,
+            "defect_count": len(det.defects),
+            "confidence": det.confidence,
+        },
+        "db_recorded": db_ok,
+    }
+    path = os.path.join(RECORD_DIR, fname)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[自动] 写 sidecar 失败 {path}: {e}")
+
+
 # ===================== Flask 应用 =====================
 app = Flask(__name__)
-streamer = CameraStreamer()
+hub = CameraHub()
 
 
 def _gen_mjpeg():
     """MJPEG 流生成器。"""
-    while streamer.running:
-        jpg = streamer.get_latest_jpeg()
+    while hub.running:
+        jpg = hub.get_primary_jpeg()
         if jpg:
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
@@ -383,7 +568,7 @@ def _gen_mjpeg():
 
 @app.route("/")
 def index():
-    st = streamer.status()
+    st = hub.status()
     cam_lines = "".join(f"<li>{c}</li>" for c in st["config"])
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -410,7 +595,8 @@ def index():
 </style></head>
 <body>
 <header><h1>车顶密封条相机 · 实时取景</h1>
-  <span class="badge" id="state">连接中…</span></header>
+  <span class="badge" id="state">连接中…</span>
+  <span class="badge" id="plcstate">PLC…</span></header>
 <div class="wrap">
   <div class="video"><img id="feed" src="/video_feed"></div>
   <div class="bar">
@@ -418,6 +604,8 @@ def index():
     <span id="capState" class="meta"></span>
   </div>
   <div class="meta" id="meta"></div>
+  <h3 style="font-size:14px;margin:18px 0 6px">自动检测（PLC 触发）</h3>
+  <div id="auto" class="meta">手动模式</div>
   <h3 style="font-size:14px;margin:18px 0 6px">采集日志</h3>
   <div id="log">等待操作…</div>
 </div>
@@ -425,13 +613,25 @@ def index():
 const meta=document.getElementById('meta');
 const log=document.getElementById('log');
 const state=document.getElementById('state');
+const plcstate=document.getElementById('plcstate');
 const capBtn=document.getElementById('cap');
 const capState=document.getElementById('capState');
+const auto=document.getElementById('auto');
 
 function refreshStatus(){{
   fetch('/api/status').then(r=>r.json()).then(s=>{{
     if(s.running){{state.textContent='● 在线';state.style.background='#2d8c4a';}}
     else{{state.textContent='● 离线';state.style.background='#b5482f';}}
+    if(s.plc_auto){{
+      plcstate.textContent='● PLC自动';plcstate.style.background='#2d6cdf';
+      let a=s.last_auto;
+      if(a){{auto.innerHTML=`<b>最近</b>：${{a.ts}} · 车型 <b>${{a.model}}</b> · 滑橇 ${{a.skid}} · `
+        +`<b>${{a.ok?'OK':'NG('+a.ng+')'}}</b>`;}}
+      else{{auto.textContent='等待出车信号…';}}
+    }}else{{
+      plcstate.textContent='● PLC未启用';plcstate.style.background='#555';
+      auto.textContent='手动模式：PLC 自动触发未启用（加 --plc-auto 开启）';
+    }}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
     h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
@@ -464,7 +664,7 @@ setInterval(refreshStatus, 5000);
 
 @app.route("/video_feed")
 def video_feed():
-    if not streamer.running:
+    if not hub.running:
         return Response("相机未运行", status=503)
     return Response(_gen_mjpeg(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -472,21 +672,24 @@ def video_feed():
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(streamer.status())
+    return jsonify(hub.status())
 
 
 @app.route("/api/capture", methods=["POST"])
 def api_capture():
-    if not streamer.running:
+    if not hub.running:
         return jsonify({"ok": False, "error": "相机未运行"})
-    result = streamer.request_capture()
+    # 手动按钮：纯拍照（不检测、不入库），用于远程盯屏调试/补拍
+    result = hub.request_capture_primary()
     return jsonify(result)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="现场相机网页版实时取景+远程触发")
+    parser = argparse.ArgumentParser(description="现场相机网页版实时取景+远程触发(+PLC自动触发)")
     parser.add_argument("--host", default=WEB_HOST)
     parser.add_argument("--port", type=int, default=WEB_PORT)
+    parser.add_argument("--plc-auto", action="store_true",
+                        help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→拍照→检测→记录）")
     parser.add_argument("--no-browser-note", action="store_true")
     args = parser.parse_args()
 
@@ -495,22 +698,24 @@ def main():
         print("  pip install pypylon opencv-python flask")
         sys.exit(1)
 
+    hub.plc_auto = args.plc_auto
+
     print("=" * 55)
     print("[网页采集] 正在连接 Basler 相机 ...")
     try:
-        streamer.connect()
+        hub.connect_all()
     except Exception as e:
         print(f"[错误] {e}")
         sys.exit(1)
 
     try:
-        streamer.start()
+        hub.start_all()
     except Exception as e:
         print(f"[错误] {e}")
-        streamer.stop()
+        hub.stop_all()
         sys.exit(1)
 
-    st = streamer.status()
+    st = hub.status()
     print(f"[网页采集] 已连接：{st['camera']['model']}  IP={st['camera']['ip']}")
     for c in st["config"]:
         print(f"  - {c}")
@@ -518,6 +723,27 @@ def main():
     print(f"[网页采集] 预触发缓冲：点按钮即存最近 {st['params']['duration_sec']}秒 "
           f"= {st['params']['total']} 张（{st['params']['fps']}fps）")
     print(f"[网页采集] 保存目录：{SAVE_DIR}")
+
+    plc = None
+    if args.plc_auto:
+        try:
+            from plc.plc_monitor import PlcMonitor, has_snap7
+            if not has_snap7():
+                print("[警告] 未安装 python-snap7，自动触发不可用（pip install python-snap7）。"
+                      "回退手动模式。")
+            else:
+                plc = PlcMonitor(ip=PLC_IP, rack=PLC_RACK, slot=PLC_SLOT,
+                                 poll_ms=PLC_POLL_MS, ctx_ms=PLC_CTX_MS)
+                plc.connect()
+                plc.start(handle_car_signal)
+                print(f"[PLC] 已连接 {PLC_IP}（只读）· 自动触发已启用"
+                      f"（NO_Paint=1 跳过；非9X车型暂跳过）")
+        except Exception as e:
+            print(f"[警告] PLC 自动触发启动失败：{e}（回退手动模式）")
+            plc = None
+
+    if not args.plc_auto:
+        print("[模式] 手动模式：PLC 自动触发未启用（加 --plc-auto 开启）")
     print("=" * 55)
     print(f"[网页采集] 请用浏览器打开（上位机本机或同网段电脑）：")
     print(f"  http://localhost:{args.port}")
@@ -532,7 +758,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        streamer.stop()
+        hub.stop_all()
+        if plc is not None:
+            plc.disconnect()
+            print("\n[PLC] 已断开（仅读，未写任何地址）")
         print("\n[网页采集] 已停止，相机已释放")
 
 
