@@ -313,8 +313,13 @@ class CameraStreamer:
                 if wait > 0:
                     time.sleep(wait)
                 grab_clock = time.perf_counter()
+                # 取流方式对齐已验证可用的 live_capture.py：
+                #   TimeoutHandling_ThrowException + 3000ms 超时 → 阻塞等待直到
+                #   相机产出真正的新帧，绝不返回旧缓冲/重复帧。
+                #   Return 模式在低轮询率下可能反复返回同一帧（此前 21 张同帧
+                #   的根因之一）；ThrowException 确保拿不到就重试，不糊弄。
                 try:
-                    grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
+                    grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
                 except Exception:
                     time.sleep(0.05)
                     continue
