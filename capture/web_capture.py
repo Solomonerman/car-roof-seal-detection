@@ -30,7 +30,6 @@ import json
 import datetime
 import threading
 import argparse
-import collections
 import concurrent.futures as _cf
 
 import cv2
@@ -133,9 +132,6 @@ class CameraStreamer:
         self._capture_req = threading.Event()   # 触发连拍
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
-
-        # 预触发环形缓冲：始终保留最近 total 帧（点击即存，避免运动物体延迟）
-        self._ring = collections.deque(maxlen=int(FPS * DURATION_SEC) + 5)
 
         self._thread = None
         self._error = None
@@ -293,113 +289,92 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """后台取流线程。
+        """后台预览线程：轻量取流 → 更新 _latest 供网页实时预览。
 
-        - 按 FPS(3) 节拍取图并写入环形缓冲,21 张 × 1/3s = 7s。
-        - 采用 busy-wait + 短 sleep 保证节拍精度,避免 Windows time.sleep 提前唤醒
-          导致节奏漂移、同一帧被连续写两次(现场复现:01/02、03/04…成对相同)。
-        - 额外防呆:连续写入 ring 的帧若时间戳相同(同一次取流结果),只保留一份。
+        连拍不依赖环形缓冲，而是在信号到来时同步执行 _do_capture（与
+        live_capture.py 完全一致的逻辑：按 FPS 节拍、取一帧存一帧、不做预缓冲）。
+        彻底消除"同一帧重复写入 ring"导致 21 张相同的脆弱性问题。
         """
-        frame_interval = 1.0 / FPS
-        next_frame_clock = time.perf_counter()
-        last_ring_ts = 0.0
+        preview_interval = 1.0 / max(FPS, 6)  # 预览 6fps 足够流畅，不费 CPU
+        next_preview = time.perf_counter()
         while self.running:
             try:
-                #  busy-wait + 短 sleep 到下一帧时刻,精度高于纯 time.sleep
-                while True:
-                    now = time.perf_counter()
-                    wait = next_frame_clock - now
-                    if wait <= 0:
-                        break
-                    if wait > 0.02:
-                        time.sleep(wait - 0.01)
-                next_frame_clock += frame_interval  # 累加固定间隔,不依赖当前时间
+                wait = next_preview - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                next_preview = time.perf_counter() + preview_interval
 
                 try:
-                    grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
+                    grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
                 except Exception:
                     time.sleep(0.05)
                     continue
                 if grab and grab.GrabSucceeded():
-                    frame = grab.Array.copy()
-                    grab.Release()
-                    ts = time.time()                     # 命名/计时用真实采集时刻
                     with self._lock:
-                        self._latest = frame            # 预览：每帧都更新
-                    # 防呆:如果这一帧跟上一帧时间戳完全一样,说明同一帧被取了两次,
-                    # 直接丢弃,避免成对重复。
-                    if ts == last_ring_ts:
-                        continue
-                    self._ring.append((ts, frame))
-                    last_ring_ts = ts
+                        self._latest = grab.Array.copy()
+                    grab.Release()
+                    # 出车信号来了 → 立即同步连拍（阻塞 _loop，拍完才恢复预览）
                     if self._capture_req.is_set():
-                        self._flush_buffer()
+                        self._do_capture()
                 elif grab:
                     grab.Release()
             except Exception as e:
-                # 单帧异常不应杀死取流线程，否则相机静默停拍且无人察觉
-                self._error = f"取流异常: {e}"
-                print(f"[相机] 取流异常(已忽略，继续): {e}")
+                self._error = f"预览异常: {e}"
+                print(f"[相机] 预览异常(已忽略，继续): {e}")
                 time.sleep(0.1)
 
-    def _flush_buffer(self):
-        """预触发：把环形缓冲里最近的 total 帧立即存盘。
+    def _do_capture(self):
+        """同步连拍：与 live_capture.py 完全一致的逻辑。
 
-        拍的是信号那一刻及之前的画面（缓冲已缓存最近 DURATION_SEC 秒），
-        因此对运动物体没有"信号后才开始抓"的延迟。
+        - 按 FPS(3) 节拍取一帧、存一帧，重复 total=21 次，共 7 秒。
+        - 不依赖环形缓冲，不依赖时间戳去重——每帧都是 RetrieveResult 真正取到的
+          新帧，绝无重复（与 live_capture.py 现场验证一致）。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
-        try:
-            frames = list(self._ring)
-            if len(frames) > total:
-                frames = frames[-total:]
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            batch = []
-            t0 = time.perf_counter()
-            for ts, frame in frames:
-                fname = self._format_filename_ts(ts)
-                fpath = os.path.join(SAVE_DIR, fname)
-                cv2.imwrite(fpath, frame)
-                batch.append(os.path.basename(fpath))
-            elapsed = time.perf_counter() - t0
-            span = (frames[-1][0] - frames[0][0]) if len(frames) > 1 else 0.0
-            self._last_result = {
-                "ok": True,
-                "saved": len(batch),
-                "total": total,
-                "elapsed": round(elapsed, 2),
-                "span_sec": round(span, 2),
-                "actual_fps": round(len(batch) / span, 1) if span > 0 else 0,
-                "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
-                "files": batch,
-                "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        except Exception as e:
-            # 存盘失败（磁盘满等）不能让等待方卡 12s，也不能杀线程
-            self._error = f"连拍存盘失败: {e}"
-            print(f"[相机] 连拍存盘失败: {e}")
-            self._last_result = {
-                "ok": False,
-                "error": str(e),
-                "saved": 0,
-                "total": total,
-                "mode": f"预触发缓冲(最近{DURATION_SEC}s)",
-                "files": [],
-                "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        finally:
-            self._capture_done.set()
+        frame_interval = 1.0 / FPS
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        batch = []
+        t0 = time.perf_counter()
+        for i in range(total):
+            t_start = time.perf_counter()
+            try:
+                grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
+            except Exception:
+                print(f"[相机] 第 {i+1}/{total} 张取图失败")
+                continue
+            if not grab.GrabSucceeded():
+                print(f"[相机] 第 {i+1}/{total} 张取图失败(GrabSucceeded=False)")
+                grab.Release()
+                continue
+            frame = grab.Array.copy()
+            grab.Release()
+            fname = self._format_filename()
+            fpath = os.path.join(SAVE_DIR, fname)
+            cv2.imwrite(fpath, frame)
+            batch.append(os.path.basename(fpath))
+            elapsed = time.perf_counter() - t_start
+            wait = frame_interval - elapsed
+            if wait > 0 and i < total - 1:
+                time.sleep(wait)
+        elapsed = time.perf_counter() - t0
+        span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
+        self._last_result = {
+            "ok": True,
+            "saved": len(batch),
+            "total": total,
+            "elapsed": round(elapsed, 2),
+            "span_sec": round(span, 2),
+            "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
+            "mode": f"同步连拍(拍完{DURATION_SEC}s,共{total}张)",
+            "files": batch,
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._capture_done.set()
 
     def _format_filename(self, prefix="Image"):
         ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
         return f"{prefix}__{ts}{SAVE_EXT}"
-
-    def _format_filename_ts(self, ts):
-        """用帧的实际采集时间戳（来自缓冲）命名，保证顺序正确。"""
-        dt = datetime.datetime.fromtimestamp(ts)
-        s = dt.strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
-        return f"Image__{s}{SAVE_EXT}"
 
     def request_capture(self):
         """外部触发连拍，阻塞直到完成，返回结果 dict。"""
