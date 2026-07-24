@@ -560,15 +560,25 @@ def handle_car_signal(ctx):
             print(f"[自动] 拍照失败：{cap.get('primary_result', cap)}")
             captured = False   # 拍照失败则按未拍照记录
 
-    # 本迭代不跑检测：拍照车用占位结果（后续接检测时替换此段）
+    # 检测：9X 车型当前用占位结果（后续接 SealDetector 时替换此段），
+    # 8X 车型仅拍照存档、不检测（NM41/NM42 与 MM** 共用拍照流程，但不跑检测）。
     from common.interfaces import DetectionResult, Defect
-    det = DetectionResult(
-        car_model=model, ok=True,
-        defects=[Defect(0, 0, 0, 0, "pending", 0.0,
-                        meta={"reason": "拍照完成·检测待做（检测算法待接入）"})],
-        confidence=0.0,
-        message="拍照完成·检测待做",
-    )
+    if key == "9X":
+        det = DetectionResult(
+            car_model=model, ok=True,
+            defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                            meta={"reason": "拍照完成·检测待做（检测算法待接入）"})],
+            confidence=0.0,
+            message="拍照完成·检测待做",
+        )
+    else:  # 8X：仅拍照存档，不检测
+        det = DetectionResult(
+            car_model=model, ok=True,
+            defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                            meta={"reason": "8X车型:仅拍照存档,不检测"})],
+            confidence=0.0,
+            message="8X车型·仅拍照存档",
+        )
 
     # 落库（含 skid/pin/no_paint/captured）；StorageService 内部按 日期/PIN 分层、
     # 去重移动、轮转，并返回该车文件夹路径
