@@ -293,31 +293,24 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """后台取流线程（CPU 友好，见文件顶部 GRAB_FPS）。
+        """后台取流线程。
 
-        - 取流节拍上限 GRAB_FPS（默认 6）：相机自由运行在 ~48fps，但上位机与机器人站
-          共用，不能狂取。超出部分由相机/驱动直接丢弃，我们只要够预览+预触发的帧率。
-        - 环形缓冲仍按 FPS(3) 节流写入，保证预触发 21 张正好覆盖 DURATION_SEC 秒。
-          （aca1920-48gm 上 AcquisitionFrameRate 为占位节点，相机端帧率锁定不可用，
-           故时序完全由软件节拍保证，与 live_capture.py 连拍节流一致。）
+        - 直接按 FPS(3) 节拍取图并写入环形缓冲,避免“6fps 取流 + 3fps 写 ring”两层
+          节流的精度误差导致一帧被连续写两次(现场复现:01/02、03/04…成对相同)。
+        - 每帧都用 TimeoutHandling_ThrowException + 3000ms 取最新帧,取不到就等下一拍。
+        - 21 张 × 1/3s = 7s,时序完全由软件节拍保证(aca1920-48gm 帧率节点不可用)。
         """
-        ring_clock = 0.0
-        target_interval = 1.0 / FPS
-        grab_clock = 0.0
-        grab_interval = 1.0 / GRAB_FPS
+        frame_interval = 1.0 / FPS
+        next_frame_clock = time.perf_counter()
         while self.running:
             try:
-                # 取流节拍：睡到下一帧时刻，避免 48fps 狂取拖垮共用上位机 CPU
-                now = time.perf_counter()
-                wait = grab_interval - (now - grab_clock)
+                # 睡到下一帧该来的时刻,然后取一帧、写一次 ring。不取 6fps 中间帧,
+                # 彻底消除同一帧被 throttle 判定通过两次的问题。
+                wait = next_frame_clock - time.perf_counter()
                 if wait > 0:
                     time.sleep(wait)
-                grab_clock = time.perf_counter()
-                # 取流方式对齐已验证可用的 live_capture.py：
-                #   TimeoutHandling_ThrowException + 3000ms 超时 → 阻塞等待直到
-                #   相机产出真正的新帧，绝不返回旧缓冲/重复帧。
-                #   Return 模式在低轮询率下可能反复返回同一帧（此前 21 张同帧
-                #   的根因之一）；ThrowException 确保拿不到就重试，不糊弄。
+                next_frame_clock = time.perf_counter() + frame_interval
+
                 try:
                     grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
                 except Exception:
@@ -329,10 +322,7 @@ class CameraStreamer:
                     ts = time.time()                     # 命名/计时用真实采集时刻
                     with self._lock:
                         self._latest = frame            # 预览：每帧都更新
-                    clock = time.perf_counter()         # 环形缓冲节拍用单调时钟，避免 NTP 跳变
-                    if clock - ring_clock >= target_interval - 1e-3:
-                        self._ring.append((ts, frame))
-                        ring_clock = clock
+                    self._ring.append((ts, frame))      # 每拍只写一次,无重复判定
                     if self._capture_req.is_set():
                         self._flush_buffer()
                 elif grab:
