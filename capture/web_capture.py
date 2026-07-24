@@ -34,6 +34,11 @@ import concurrent.futures as _cf
 
 import cv2
 
+# 版本戳：每次修改后更新，方便现场确认是不是最新代码
+VERSION = "2026-07-24-3f4ca58"  # 内存暂存取帧 + busy-wait 精确节拍
+
+print(f"[web_capture.py] VERSION={VERSION}")
+
 try:
     import pypylon.pylon as py
     HAS_PYPYLON = True
@@ -342,6 +347,7 @@ class CameraStreamer:
             # busy-wait 精确等到目标时刻
             while time.perf_counter() < target_t:
                 pass
+            t_shot = time.perf_counter()
             try:
                 grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
             except Exception:
@@ -354,13 +360,22 @@ class CameraStreamer:
             frame = grab.Array.copy()
             grab.Release()
             fname = self._format_filename()
-            frames_buf.append((fname, frame))
+            frames_buf.append((fname, frame, t_shot))
         # 取帧完毕，批量写盘
-        for fname, frame in frames_buf:
+        write_t0 = time.perf_counter()
+        for fname, frame, _ in frames_buf:
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(fname)
+        write_elapsed = time.perf_counter() - write_t0
         elapsed = time.perf_counter() - t0
+        span = (len(frames_buf) - 1) * frame_interval if len(frames_buf) > 1 else 0.0
+        print(f"[相机] 连拍完成: 取帧{len(frames_buf)}张, span={span:.2f}s, "
+              f"总耗时={elapsed:.2f}s, 写盘耗时={write_elapsed:.2f}s")
+        if len(frames_buf) >= 2:
+            first = frames_buf[0][2]
+            last = frames_buf[-1][2]
+            print(f"[相机] 首张到末张取图时间={last-first:.2f}s, 实际fps={len(frames_buf)/(last-first):.1f}")
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
             "ok": True,
