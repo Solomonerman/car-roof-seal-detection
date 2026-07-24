@@ -3,9 +3,14 @@ __pycache__/
 *.db
 data/raw_images/
 data/stored_images/
+data/inspection/      # 预触发照片按 日期/PIN 分层(运行时生成,不入库)
+data/records/         # 免检车 sidecar JSON 兜底目录(运行时生成,不入库)
 data/calibration/
 data/process_data/
 tools/results/
+.idea/                # PyCharm 项目配置(每人一份,不入库)
 .venv/
 venv/
 .DS_Store
+*.swp
+*.bak
