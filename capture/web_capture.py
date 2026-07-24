@@ -588,11 +588,13 @@ def handle_car_signal(ctx):
     except Exception as e:
         print(f"[自动] 落库失败: {e}")
 
-    # 写追溯 sidecar：拍照车写入其自包含文件夹(record.json)，未拍照车兜底到 data/records
+    # 写追溯 sidecar：仅拍照车在 Inspection 建自包含文件夹(record.json)；
+    # 非拍照车(免检/未接入)不留空文件夹——其追溯已在 SQLite，sidecar 兜底到
+    # data/records/<时间戳>__skid<滑橇>.json（带时间戳+滑橇，不会互相覆盖）。
     write_sidecar(ctx, files, det, db_ok, key, captured,
-                  folder=getattr(rec, "folder", "") if rec else "")
+                  folder=rec.folder if (rec and captured) else "")
 
-    # 兜底清理调试目录（自动图已移入 stored_images，这里只清手动调试残留）
+    # 兜底清理调试目录（自动图已移入 data/inspection，这里只清手动调试残留）
     _prune_scratch()
 
     # 最近车辆表（网页展示，最多保留 10 台）
@@ -666,7 +668,7 @@ _capture_exec = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-c
 def _prune_scratch(max_age_days=7, max_files=2000):
     """清理调试用 raw_images：删除超过 N 天或总数超上限的最旧文件，防磁盘涨满。
 
-    自动拍照的图在 StorageService.save 中已被移到 stored_images（去重），
+    自动拍照的图在 StorageService.save 中已被移到 data/inspection（去重），
     故本目录只残留手动调试连拍的图，低频但需兜底清理。
     """
     try:
