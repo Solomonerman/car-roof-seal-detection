@@ -11,7 +11,7 @@
 
 按现场资料读取（均为只读）：
   - DB130.DBX0.1      BOOL    输送出车信号（相机触发用）
-  - DB230.DBX1257.1   BOOL    NO Paint（是否需要检测）
+  - DB230.DBX1257.0   BOOL    NO Paint（是否需要检测）
   - DB230.DBW1218     INT     滑橇号
   - DB230.DBD1208     DWORD   车型代码
   - DB230.DBB1224..1237  CHAR[14]  PIN 码
@@ -40,7 +40,7 @@ PLC_SLOT = 2          # S7-300 CPU 槽号
 # 只读取你明确给出的地址范围，绝不越界。
 READ_DB130 = (130, 0, 1)          # DB130 字节0（含 DBX0.1）
 READ_DB230_A = (230, 1208, 30)    # DB230 字节1208..1237（车型/滑橇/PIN）
-READ_DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.1）
+READ_DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.0）
 
 
 def parse_db230_a(buf):
@@ -91,12 +91,12 @@ def main():
 
         db, start, size = READ_DB230_B
         data230b = client.read_area(S7AreaDB, db, start, size)
-        no_paint = (data230b[0] >> 1) & 1   # DBX1257.1
+        no_paint = data230b[0] & 1   # DBX1257.0
 
         print("-" * 55)
         print("读取结果（只读，未改动 PLC）：")
         print(f"  输送出车信号 DB130.DBX0.1      : {bool(conveyor)}")
-        print(f"  NO Paint     DB230.DBX1257.1   : {bool(no_paint)}")
+        print(f"  NO Paint     DB230.DBX1257.0   : {bool(no_paint)}")
         print(f"  滑橇号       DB230.DBW1218     : {skid}")
         print(f"  车型代码     DB230.DBD1208     : {model} (0x{model:08X})")
         print(f"  PIN 码       DB230.DBB1224..37 : {pin!r}")

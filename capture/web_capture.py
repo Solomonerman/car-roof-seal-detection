@@ -337,7 +337,13 @@ class CameraStreamer:
         batch = []
         t0 = time.perf_counter()
         for i in range(total):
-            t_start = time.perf_counter()
+            # 精确节拍控制：在每帧的目标时刻开始取图
+            target_t = t0 + i * frame_interval
+            now = time.perf_counter()
+            if now < target_t:
+                # busy-wait 直到目标时刻（Windows sleep 精度不够，用 spin-loop）
+                while time.perf_counter() < target_t:
+                    pass
             try:
                 grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
             except Exception:
@@ -353,10 +359,6 @@ class CameraStreamer:
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(os.path.basename(fpath))
-            elapsed = time.perf_counter() - t_start
-            wait = frame_interval - elapsed
-            if wait > 0 and i < total - 1:
-                time.sleep(wait)
         elapsed = time.perf_counter() - t0
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
