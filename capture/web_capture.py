@@ -233,20 +233,25 @@ class CameraStreamer:
             conf_log.append("曝光未写入，沿用相机当前曝光值")
         # 采集帧率：本意锁成 FPS 以保证时序确定。但 aca1920-48gm 上
         # AcquisitionFrameRate 是占位节点(not available)，相机端锁定会失败。
-        # 时序确定性改由 _loop 的环形缓冲软件节流保证（与 live_capture.py 连拍一致），
-        # 因此这里仅做“尽力而为”且不报红，失败属预期。
+        # 【关键修复】仅当“成功写入帧率值”时才打开帧率限制开关。
+        #   若只打开 AcquisitionFrameRateEnable 却没写进有效帧率值，相机会进入
+        #   异常节流/冻结状态——预触发环形缓冲在 7s 内采到的 21 帧全是同一张
+        #   （现场复现：21 张同一照片）。时序确定性完全由 _loop 的软件节流保证，
+        #   因此相机保持自由运行即可，绝不强行打开锁定开关。
         try:
-            fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
-            if fr_en is not None:
-                fr_en.SetValue(True)
             fr = nodemap.GetNode("AcquisitionFrameRate")
             if fr is not None:
                 fr.SetValue(FPS)
+                fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+                if fr_en is not None:
+                    fr_en.SetValue(True)
                 conf_log.append(f"采集帧率=相机锁定 {FPS}fps")
+            else:
+                conf_log.append(f"采集帧率=相机未开放锁定(占位)，改由软件节流 {FPS}fps")
         except Exception as e:
             msg = str(e)
             if "not available" in msg.lower() or "placeholder" in msg.lower():
-                # 相机未开放帧率锁定节点：预期内，由软件节流兜底
+                # 相机未开放帧率锁定节点：预期内，由软件节流兜底（绝不打开锁定开关）
                 conf_log.append(f"采集帧率=相机未开放锁定(占位)，改由软件节流 {FPS}fps")
             else:
                 conf_log.append(f"采集帧率设置异常(已忽略): {msg}")
@@ -766,7 +771,7 @@ function refreshStatus(){{
       let rows=(s.recent_cars||[]).map(c=>{{
         let ph=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
         let dt=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
-        return `<tr><td>${{c.ts}}</td><td>${{c.model}}(${{c.key}})</td><td>${{c.skid}}</td>`
+        return `<tr><td>${{c.ts}}</td><td>${{c.model}}</td><td>${{c.skid}}</td>`
           +`<td>${{c.pin}}</td><td>${{c.no_paint?'<span class="no">是</span>':'<span class="yes">否</span>'}}</td>`
           +`<td>${{ph}}</td><td>${{dt}}</td></tr>`;
       }}).join('');
