@@ -329,39 +329,56 @@ class CameraStreamer:
                 time.sleep(0.1)
 
     def _do_capture(self):
-        """同步连拍：先全部取帧到内存，拍完再统一写盘。
+        """同步连拍：每次间隔自己刷新 _latest，不依赖 RetrieveResult 阻塞等帧。
 
-        - 按 FPS(3) 节拍取一帧，重复 total=21 次，共 7 秒。
-        - 取帧阶段不写盘（避免磁盘 I/O 干扰节拍），全部取完再批量写入。
-        - 不依赖环形缓冲，不依赖时间戳去重。
+        - 按 FPS(3) 节拍，每 333ms 取一帧，共 21 次 = 7 秒。
+        - busy-wait 精确等到目标时刻，然后用非阻塞 RetrieveResult 取最新帧。
+        - 取帧阶段不写盘，全部取完再批量写入。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
         frame_interval = 1.0 / FPS
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
-        frames_buf = []  # (fname, frame_array) 暂存内存
+        frames_buf = []
         t0 = time.perf_counter()
+        last_img = None  # 去重
         for i in range(total):
             target_t = t0 + i * frame_interval
-            # busy-wait 精确等到目标时刻
             while time.perf_counter() < target_t:
                 pass
             t_shot = time.perf_counter()
+            # 非阻塞取最新帧（timeout=0, Return 立即返回当前缓冲）
+            frame = None
             try:
-                grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
+                grab = self.cam.RetrieveResult(0, py.TimeoutHandling_Return)
+                if grab and grab.GrabSucceeded():
+                    frame = grab.Array.copy()
+                if grab:
+                    grab.Release()
             except Exception:
-                print(f"[相机] 第 {i+1}/{total} 张取图失败")
-                continue
-            if not grab.GrabSucceeded():
-                print(f"[相机] 第 {i+1}/{total} 张取图失败(GrabSucceeded=False)")
-                grab.Release()
-                continue
-            frame = grab.Array.copy()
-            grab.Release()
+                pass
+            if frame is None:
+                # 回退：从 _latest 取
+                with self._lock:
+                    frame = self._latest.copy() if self._latest is not None else None
+                if frame is None:
+                    print(f"[相机] 第 {i+1}/{total} 张取图失败")
+                    continue
+            # 同时更新 _latest（供预览用）
+            with self._lock:
+                self._latest = frame.copy()
+            # 去重
+            if last_img is not None and last_img.shape == frame.shape:
+                try:
+                    if not (frame.astype("int16") - last_img.astype("int16")).any():
+                        continue
+                except Exception:
+                    pass
+            last_img = frame.copy()
             fname = self._format_filename()
             frames_buf.append((fname, frame, t_shot))
-        # 取帧完毕，批量写盘
+        # 批量写盘
         write_t0 = time.perf_counter()
         for fname, frame, _ in frames_buf:
             fpath = os.path.join(SAVE_DIR, fname)
