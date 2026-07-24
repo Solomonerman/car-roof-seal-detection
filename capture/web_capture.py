@@ -83,9 +83,10 @@ GAMMA = 1.0                  # Gamma，默认 1.0（保持线性，利于检测�
 PIXEL_FORMAT = "Mono8"       # 黑白相机 8bit 灰度
 
 # ===================== 存储参数 =====================
-SAVE_DIR = os.path.join(ROOT, "data", "raw_images")
+SAVE_DIR = os.path.join(ROOT, "data", "raw_images")      # 预触发临时缓冲(拍完即被移走)
+INSPECTION_ROOT = os.path.join(ROOT, "data", "inspection")  # 最终存储根(按 日期/PIN 分层)
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
-RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON
+RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON(非拍照车兜底)
 
 # ===================== 预览参数 =====================
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
@@ -438,7 +439,7 @@ class CameraStreamer:
                 "gain_display": "相机当前值" if GAIN_DB is None else f"{GAIN_DB} dB",
                 "gamma": GAMMA,
             },
-            "save_dir": SAVE_DIR,
+            "save_dir": INSPECTION_ROOT,
             "last_result": self._last_result,
             "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
@@ -791,7 +792,7 @@ function refreshStatus(){{
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
     h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
     h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
-    h+=`<b>保存目录</b>：${{s.save_dir}}`;
+    h+=`<b>照片存储</b>：${{s.save_dir}}（按 日期/PIN 分层，临时缓冲在 data/raw_images）`;
     meta.innerHTML=h;
   }}).catch(()=>{{state.textContent='● 连接失败';state.style.background='#b5482f';}});
 }}
@@ -878,7 +879,7 @@ def main():
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
     print(f"[网页采集] 预触发缓冲：点按钮/出车信号即存最近 {st['params']['duration_sec']}秒 "
           f"= {st['params']['total']} 张（{st['params']['fps']}fps）")
-    print(f"[网页采集] 保存目录：{SAVE_DIR}")
+    print(f"[网页采集] 照片存储：{INSPECTION_ROOT}（按 日期/PIN 分层；data/raw_images 仅临时缓冲）")
 
     plc = None
     if args.plc_auto:
