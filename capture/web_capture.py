@@ -295,21 +295,25 @@ class CameraStreamer:
     def _loop(self):
         """后台取流线程。
 
-        - 直接按 FPS(3) 节拍取图并写入环形缓冲,避免“6fps 取流 + 3fps 写 ring”两层
-          节流的精度误差导致一帧被连续写两次(现场复现:01/02、03/04…成对相同)。
-        - 每帧都用 TimeoutHandling_ThrowException + 3000ms 取最新帧,取不到就等下一拍。
-        - 21 张 × 1/3s = 7s,时序完全由软件节拍保证(aca1920-48gm 帧率节点不可用)。
+        - 按 FPS(3) 节拍取图并写入环形缓冲,21 张 × 1/3s = 7s。
+        - 采用 busy-wait + 短 sleep 保证节拍精度,避免 Windows time.sleep 提前唤醒
+          导致节奏漂移、同一帧被连续写两次(现场复现:01/02、03/04…成对相同)。
+        - 额外防呆:连续写入 ring 的帧若时间戳相同(同一次取流结果),只保留一份。
         """
         frame_interval = 1.0 / FPS
         next_frame_clock = time.perf_counter()
+        last_ring_ts = 0.0
         while self.running:
             try:
-                # 睡到下一帧该来的时刻,然后取一帧、写一次 ring。不取 6fps 中间帧,
-                # 彻底消除同一帧被 throttle 判定通过两次的问题。
-                wait = next_frame_clock - time.perf_counter()
-                if wait > 0:
-                    time.sleep(wait)
-                next_frame_clock = time.perf_counter() + frame_interval
+                #  busy-wait + 短 sleep 到下一帧时刻,精度高于纯 time.sleep
+                while True:
+                    now = time.perf_counter()
+                    wait = next_frame_clock - now
+                    if wait <= 0:
+                        break
+                    if wait > 0.02:
+                        time.sleep(wait - 0.01)
+                next_frame_clock += frame_interval  # 累加固定间隔,不依赖当前时间
 
                 try:
                     grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
@@ -322,7 +326,12 @@ class CameraStreamer:
                     ts = time.time()                     # 命名/计时用真实采集时刻
                     with self._lock:
                         self._latest = frame            # 预览：每帧都更新
-                    self._ring.append((ts, frame))      # 每拍只写一次,无重复判定
+                    # 防呆:如果这一帧跟上一帧时间戳完全一样,说明同一帧被取了两次,
+                    # 直接丢弃,避免成对重复。
+                    if ts == last_ring_ts:
+                        continue
+                    self._ring.append((ts, frame))
+                    last_ring_ts = ts
                     if self._capture_req.is_set():
                         self._flush_buffer()
                 elif grab:
