@@ -324,26 +324,24 @@ class CameraStreamer:
                 time.sleep(0.1)
 
     def _do_capture(self):
-        """同步连拍：与 live_capture.py 完全一致的逻辑。
+        """同步连拍：先全部取帧到内存，拍完再统一写盘。
 
-        - 按 FPS(3) 节拍取一帧、存一帧，重复 total=21 次，共 7 秒。
-        - 不依赖环形缓冲，不依赖时间戳去重——每帧都是 RetrieveResult 真正取到的
-          新帧，绝无重复（与 live_capture.py 现场验证一致）。
+        - 按 FPS(3) 节拍取一帧，重复 total=21 次，共 7 秒。
+        - 取帧阶段不写盘（避免磁盘 I/O 干扰节拍），全部取完再批量写入。
+        - 不依赖环形缓冲，不依赖时间戳去重。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
         frame_interval = 1.0 / FPS
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
+        frames_buf = []  # (fname, frame_array) 暂存内存
         t0 = time.perf_counter()
         for i in range(total):
-            # 精确节拍控制：在每帧的目标时刻开始取图
             target_t = t0 + i * frame_interval
-            now = time.perf_counter()
-            if now < target_t:
-                # busy-wait 直到目标时刻（Windows sleep 精度不够，用 spin-loop）
-                while time.perf_counter() < target_t:
-                    pass
+            # busy-wait 精确等到目标时刻
+            while time.perf_counter() < target_t:
+                pass
             try:
                 grab = self.cam.RetrieveResult(3000, py.TimeoutHandling_ThrowException)
             except Exception:
@@ -356,9 +354,12 @@ class CameraStreamer:
             frame = grab.Array.copy()
             grab.Release()
             fname = self._format_filename()
+            frames_buf.append((fname, frame))
+        # 取帧完毕，批量写盘
+        for fname, frame in frames_buf:
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
-            batch.append(os.path.basename(fpath))
+            batch.append(fname)
         elapsed = time.perf_counter() - t0
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {

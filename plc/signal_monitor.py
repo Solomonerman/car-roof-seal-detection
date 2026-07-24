@@ -32,7 +32,7 @@ PLC_SLOT = 2
 # 只读范围（严格限定在你给的地址内）
 DB130 = (130, 0, 1)          # DB130 字节0（含 DBX0.1）
 DB230_A = (230, 1208, 30)    # DB230 字节1208..1237（车型/滑橇/PIN）
-DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.0）
+DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.1）
 
 
 def parse_context(buf_a, buf_b):
@@ -50,7 +50,7 @@ def parse_context(buf_a, buf_b):
         model_ascii = ""
     skid = int.from_bytes(buf_a[i(1218):i(1218) + 2], "big")          # DBW1218
     pin = buf_a[i(1224):i(1224) + 14].decode("latin-1", errors="replace")  # DBB1224..1237
-    no_paint = buf_b[0] & 1                                         # DBX1257.0
+    no_paint = (buf_b[0] >> 1) & 1                                   # DBX1257.1
     return no_paint, skid, model_int, model_ascii, pin
 
 
