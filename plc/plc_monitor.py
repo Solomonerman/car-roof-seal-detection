@@ -58,6 +58,10 @@ def parse_context(buf_a, buf_b):
     skid = int.from_bytes(buf_a[i(1218):i(1218) + 2], "big")          # DBW1218
     pin = buf_a[i(1224):i(1224) + 14].decode("latin-1", errors="replace")  # DBB1224..1237
     no_paint = (buf_b[0] >> 1) & 1                                   # DBX1257.1
+    # 调试：打印字节1257的原始值和二进制，方便确认信号位置
+    print(f"[PLC调试] 字节1257 raw=0x{buf_b[0]:02X} bin={buf_b[0]:08b} "
+          f"bit0={buf_b[0]&1} bit1={(buf_b[0]>>1)&1} bit2={(buf_b[0]>>2)&1} "
+          f"bit3={(buf_b[0]>>3)&1}")
     return {
         "no_paint": no_paint,
         "skid": skid,
