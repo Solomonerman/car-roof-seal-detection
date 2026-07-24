@@ -264,9 +264,14 @@ class CameraStreamer:
         self._conf_log = conf_log
 
     def start(self):
-        # OneByOne：每帧只取一次，保证环形缓冲里是去重的连续帧
-        # （LatestImageOnly 在轮询快于出图时会重复返回同一帧，导致缓冲里都是复本）
-        self.cam.StartGrabbing(py.GrabStrategy_OneByOne)
+        # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
+        # 关键：后台取流线程轮询仅 GRAB_FPS=6，远慢于相机产出 48fps。
+        #   OneByOne 会把帧按顺序塞进有限缓冲池，慢轮询下缓冲池耗尽 → 相机触发
+        #   背压、停采 → RetrieveResult 反复返回同一冻结帧 → 预触发 21 帧全相同
+        #   （现场复现：同一张照片）。LatestImageOnly 始终返回最新帧、自动丢弃旧帧，
+        #   慢轮询也能拿到各不相同的新鲜帧；且轮询(6fps)慢于产出(48fps)，不会重复。
+        #   时序确定性仍由 _loop 的 3fps 软件节流保证，不受策略影响。
+        self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
         # 取一张确认分辨率
         grab = self.cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
         if not grab.GrabSucceeded():
