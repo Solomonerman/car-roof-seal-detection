@@ -36,7 +36,7 @@ import cv2
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-27-ring-copy-fix"  # 内存暂存取帧 + busy-wait 精确节拍
+VERSION = "2026-07-27-per-frame-stats"  # 内存暂存取帧 + busy-wait 精确节拍
 
 print(f"[web_capture.py] VERSION={VERSION}")
 
@@ -395,15 +395,7 @@ class CameraStreamer:
         frames_buf = []  # (fname, frame)
         t0 = time.perf_counter()
 
-        for i in range(total):
-            target_ts = t_start + (i + 1) * frame_interval
-            best = _pick_closest(ring_snapshot, target_ts)
-            if best is None:
-                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")
-                continue
-            _, frame = best
-            fname = self._format_filename()
-            frames_buf.append((fname, frame.copy()))
+        picked_meta = []  # (idx, target_ts, actual_ts, delta_ms)        for i in range(total):            target_ts = t_start + (i + 1) * frame_interval            best = _pick_closest(ring_snapshot, target_ts)            if best is None:                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")                continue            actual_ts, frame = best            delta_ms = (actual_ts - target_ts) * 1000.0            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms))            fname = self._format_filename()            frames_buf.append((fname, frame.copy()))
 
         # 批量写盘
         write_t0 = time.perf_counter()
@@ -414,16 +406,7 @@ class CameraStreamer:
         write_elapsed = time.perf_counter() - write_t0
         elapsed = time.perf_counter() - t0
 
-        # 诊断日志
-        if ring_snapshot:
-            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]
-            print(f"[相机] ring={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s), "
-                  f"取图={len(batch)}/{total}, 目标间隔={frame_interval*1000:.1f}ms, "
-                  f"写盘={write_elapsed:.2f}s, 总耗时={elapsed:.2f}s")
-            if len(batch) >= 2:
-                print(f"[相机] 切片实际fps={len(batch)/((len(batch)-1)*frame_interval):.2f}")
-        else:
-            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
+        # ========== 诊断日志：每张照片时间 + 统计 ==========        if ring_snapshot:            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]            print(f"[相机] ===== 连拍统计 =====")            print(f"[相机] ring缓存={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s) | "                  f"目标张数={total} | 实际张数={len(batch)} | "                  f"写盘耗时={write_elapsed:.2f}s | 总耗时={elapsed:.2f}s")            # 每张照片的详细时间            for idx, target_ts, actual_ts, delta_ms in picked_meta:                offset_s = target_ts - t_start                print(f"[相机] 第{idx:02d}/{total}张 目标={offset_s*1000:6.1f}ms "                      f"实际偏差={delta_ms:+6.1f}ms")            # 相邻间隔统计            if len(picked_meta) >= 2:                actual_intervals = []                for j in range(1, len(picked_meta)):                    iv = (picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0                    actual_intervals.append(iv)                avg_iv = sum(actual_intervals) / len(actual_intervals)                min_iv = min(actual_intervals)                max_iv = max(actual_intervals)                print(f"[相机] 间隔统计: 平均={avg_iv:.1f}ms 最小={min_iv:.1f}ms 最大={max_iv:.1f}ms "                      f"(目标={frame_interval*1000:.1f}ms)")            print(f"[相机] ===== 统计结束 =====")        else:            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
 
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
