@@ -33,10 +33,12 @@ import argparse
 import concurrent.futures as _cf
 
 import cv2
+import numpy as np
+import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-27-per-frame-stats"  # 内存暂存取帧 + busy-wait 精确节拍
+VERSION = "2026-07-28-copy-hardened-selftest"  # 深拷贝加固 + 逐帧哈希去重诊断 + 自检模式
 
 print(f"[web_capture.py] VERSION={VERSION}")
 
@@ -138,6 +140,27 @@ def _pick_closest(ring, target_ts):
         # ring 时间递增，且过 target_ts 后 abs_diff 必然单调不减(因为步长固定)；
         # 为稳妥仍扫描完，500 次循环不影响性能。
     return best
+
+
+
+def _frame_hash(frame):
+    """逐帧内容指纹(md5 前12位)，用于诊断 21 张是否完全相同。"""
+    try:
+        return hashlib.md5(np.ascontiguousarray(frame).tobytes()).hexdigest()[:12]
+    except Exception:
+        return "na"
+
+
+def _grab_to_frame(grab):
+    """pylon grab 结果 → 完全独立的 numpy 数组(真·深拷贝)。
+
+    pypylon 的 grab.Array 返回相机内部缓冲区的【视图】，不同 grab 之间该缓冲区
+    可能被驱动复用。必须在 grab.Release() 之前做一次深拷贝，否则环形缓冲里 21 帧
+    会指向同一块被反复刷新的内存 → 全部相同(现场多次复现)。
+    np.array(..., copy=True) 强制独立拷贝并锁定 dtype=uint8，对任意 pypylon 实现都安全。
+    """
+    return np.array(grab.Array, copy=True, dtype=np.uint8)
+
 
 class CameraStreamer:
     """后台线程：持续取流 → 存最新帧；按需执行连拍。单台相机。"""
@@ -345,13 +368,13 @@ class CameraStreamer:
                     time.sleep(0.05)
                     continue
                 if grab and grab.GrabSucceeded():
-                    arr = grab.Array
+                    frame = _grab_to_frame(grab)   # 深拷贝，杜绝 21 张全同
                     ts = time.perf_counter()
                     # 先写入 ring(给 capture 切片用)，再更新 _latest(给预览用)
                     with self._ring_lock:
-                        self._ring.append((ts, arr.copy()))
+                        self._ring.append((ts, frame))
                     with self._lock:
-                        self._latest = arr.copy()
+                        self._latest = frame
                     grab.Release()
                     # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
@@ -381,6 +404,7 @@ class CameraStreamer:
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)      # 21
         frame_interval = 1.0 / FPS           # 0.333...s
+        identical = False                    # 逐帧去重结论(诊断用)
 
         # 触发基准 = 当前时刻(perf_counter 单调钟)；切片起点 = 触发前 DURATION_SEC
         t_trigger = time.perf_counter()
@@ -392,26 +416,71 @@ class CameraStreamer:
 
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
-        frames_buf = []  # (fname, frame)
+        frames_buf = []  # (idx, frame) —— 直接持有 ring 里的独立深拷贝，无需再 copy
         t0 = time.perf_counter()
 
-        picked_meta = []  # (idx, target_ts, actual_ts, delta_ms)        for i in range(total):            target_ts = t_start + (i + 1) * frame_interval            best = _pick_closest(ring_snapshot, target_ts)            if best is None:                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")                continue            actual_ts, frame = best            delta_ms = (actual_ts - target_ts) * 1000.0            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms))            fname = self._format_filename()            frames_buf.append((fname, frame.copy()))
+        picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
+        for i in range(total):
+            target_ts = t_start + (i + 1) * frame_interval
+            best = _pick_closest(ring_snapshot, target_ts)
+            if best is None:
+                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")
+                continue
+            actual_ts, frame = best
+            delta_ms = (actual_ts - target_ts) * 1000.0
+            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame))
 
-        # 批量写盘
+        # 批量写盘：文件名带帧序号(idx)，避免毫秒级同名覆盖；同时算逐帧指纹用于去重诊断
         write_t0 = time.perf_counter()
-        for fname, frame in frames_buf:
+        batch = []
+        saved_hashes = []
+        for idx, target_ts, actual_ts, delta_ms, frame in picked_meta:
+            fname = self._format_filename(idx=idx)
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(fname)
+            saved_hashes.append(_frame_hash(frame))
         write_elapsed = time.perf_counter() - write_t0
         elapsed = time.perf_counter() - t0
 
-        # ========== 诊断日志：每张照片时间 + 统计 ==========        if ring_snapshot:            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]            print(f"[相机] ===== 连拍统计 =====")            print(f"[相机] ring缓存={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s) | "                  f"目标张数={total} | 实际张数={len(batch)} | "                  f"写盘耗时={write_elapsed:.2f}s | 总耗时={elapsed:.2f}s")            # 每张照片的详细时间            for idx, target_ts, actual_ts, delta_ms in picked_meta:                offset_s = target_ts - t_start                print(f"[相机] 第{idx:02d}/{total}张 目标={offset_s*1000:6.1f}ms "                      f"实际偏差={delta_ms:+6.1f}ms")            # 相邻间隔统计            if len(picked_meta) >= 2:                actual_intervals = []                for j in range(1, len(picked_meta)):                    iv = (picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0                    actual_intervals.append(iv)                avg_iv = sum(actual_intervals) / len(actual_intervals)                min_iv = min(actual_intervals)                max_iv = max(actual_intervals)                print(f"[相机] 间隔统计: 平均={avg_iv:.1f}ms 最小={min_iv:.1f}ms 最大={max_iv:.1f}ms "                      f"(目标={frame_interval*1000:.1f}ms)")            print(f"[相机] ===== 统计结束 =====")        else:            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
+        # ========== 诊断日志：每张照片时间 + 间隔 + 逐帧去重校验 ==========
+        if ring_snapshot:
+            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]
+            unique_hashes = len(set(saved_hashes))
+            identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
+            print(f"[相机] ===== 连拍统计 =====")
+            print(f"[相机] ring缓存={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s) | "
+                  f"目标张数={total} | 实际张数={len(batch)} | "
+                  f"写盘耗时={write_elapsed:.2f}s | 总耗时={elapsed:.2f}s")
+            tag = "⚠️ 全部相同!" if identical else ("✓ 各不相同" if unique_hashes == len(saved_hashes) else "部分重复")
+            print(f"[相机] 逐帧去重: 唯一帧={unique_hashes}/{len(saved_hashes)} → {tag}")
+            if identical:
+                print(f"[相机] ❌ 21张完全相同: 环形缓冲里拿到的帧内容一致。"
+                      f"说明相机未持续出图 或 旧代码未更新(VERSION={VERSION})。")
+            for idx, target_ts, actual_ts, delta_ms, _f in picked_meta:
+                offset_s = target_ts - t_start
+                print(f"[相机] 第{idx:02d}/{total}张 目标={offset_s*1000:6.1f}ms "
+                      f"实际偏差={delta_ms:+6.1f}ms")
+            if len(picked_meta) >= 2:
+                actual_intervals = []
+                for j in range(1, len(picked_meta)):
+                    iv = (picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0
+                    actual_intervals.append(iv)
+                avg_iv = sum(actual_intervals) / len(actual_intervals)
+                min_iv = min(actual_intervals)
+                max_iv = max(actual_intervals)
+                print(f"[相机] 间隔统计: 平均={avg_iv:.1f}ms 最小={min_iv:.1f}ms 最大={max_iv:.1f}ms "
+                      f"(目标={frame_interval*1000:.1f}ms)")
+            print(f"[相机] ===== 统计结束 =====")
+        else:
+            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
 
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
             "ok": True,
             "saved": len(batch),
+            "unique_frames": len(set(saved_hashes)),
+            "identical": identical,
             "total": total,
             "elapsed": round(elapsed, 2),
             "span_sec": round(span, 2),
@@ -426,9 +495,10 @@ class CameraStreamer:
 
 
 
-    def _format_filename(self, prefix="Image"):
+    def _format_filename(self, idx=None, prefix="Image"):
         ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
-        return f"{prefix}__{ts}{SAVE_EXT}"
+        idx_part = f"_{idx:02d}" if idx is not None else ""
+        return f"{prefix}{idx_part}__{ts}{SAVE_EXT}"
 
     def request_capture(self):
         """外部触发连拍，阻塞直到完成，返回结果 dict。"""
@@ -486,6 +556,45 @@ class CameraStreamer:
             self.cam.Close()
         except Exception:
             pass
+
+
+def run_selftest():
+    """自检模式：连相机 → 预热让环形缓冲铺满 → 触发一次 21 张 → 校验是否各不相同。
+
+    无需 PLC / 网页服务，~10 秒即可确认"每秒 3 张、21 张不同"是否已达成。
+    返回 0=通过, 1=失败。
+    """
+    if not HAS_PYPYLON:
+        print("[自检] 未安装 pypylon，请先: pip install pypylon"); return 1
+    print(f"[自检] VERSION={VERSION}")
+    hub = CameraHub()
+    try:
+        hub.connect_all()
+        hub.start_all()
+    except Exception as e:
+        print(f"[自检] 连接/启动失败: {e}"); return 1
+    print(f"[自检] 相机已启动，预热 {DURATION_SEC + 1}s 让环形缓冲铺满...")
+    time.sleep(DURATION_SEC + 1)
+    print(f"[自检] 触发连拍 {int(FPS * DURATION_SEC)} 张...")
+    r = hub.request_capture_primary()
+    try:
+        hub.stop_all()
+    except Exception:
+        pass
+    uniq = r.get("unique_frames")
+    saved = r.get("saved")
+    ident = r.get("identical")
+    print("=" * 44)
+    print(f"[自检] 结果: 保存={saved}  唯一帧={uniq}  全部相同={ident}")
+    print(f"[自检] 诊断: {r.get('mode')}")
+    if ident:
+        print("[自检] ❌ 失败: 21 张完全相同 → 相机未持续出图 或 旧代码未更新")
+        return 1
+    if uniq == saved == int(FPS * DURATION_SEC):
+        print("[自检] ✓ 通过: 21 张各不相同，3fps 预触发生效")
+        return 0
+    print(f"[自检] ⚠️ 部分通过: 唯一帧 {uniq}/{saved}")
+    return 0
 
 
 class CameraHub:
@@ -882,7 +991,14 @@ def main():
     parser.add_argument("--plc-auto", action="store_true",
                         help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→记录全部车→拍照→记录）")
     parser.add_argument("--no-browser-note", action="store_true")
+    parser.add_argument("--selftest", action="store_true",
+                        help="自检模式: 连相机拍21张并校验是否各不相同(无需PLC/网页)")
     args = parser.parse_args()
+
+    if args.selftest:
+        rc = run_selftest()
+        sys.exit(rc)
+
 
     if not HAS_PYPYLON or not HAS_FLASK:
         print("[错误] 缺少依赖，请在上位机执行：")
