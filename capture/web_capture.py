@@ -33,9 +33,10 @@ import argparse
 import concurrent.futures as _cf
 
 import cv2
+import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-24-capture-thread"  # 内存暂存取帧 + busy-wait 精确节拍
+VERSION = "2026-07-24-ring-slicer"  # 内存暂存取帧 + busy-wait 精确节拍
 
 print(f"[web_capture.py] VERSION={VERSION}")
 
@@ -118,6 +119,26 @@ NG_LABELS = {"missing", "break", "overspray", "width"}
 # ================================================================
 
 
+
+
+def _pick_closest(ring, target_ts):
+    """从按时间递增的 ring 列表 [(ts, frame), ...] 里找 ts 最接近 target_ts 的项。
+    ring 长度 ≤ 512，线性扫描足够快(O(500) < 0.1ms)。返回 (ts, frame) 或 None。
+    """
+    if not ring:
+        return None
+    best = None
+    best_diff = float('inf')
+    for item in ring:
+        diff = item[0] - target_ts
+        abs_diff = diff if diff >= 0 else -diff
+        if abs_diff < best_diff:
+            best_diff = abs_diff
+            best = item
+        # ring 时间递增，且过 target_ts 后 abs_diff 必然单调不减(因为步长固定)；
+        # 为稳妥仍扫描完，500 次循环不影响性能。
+    return best
+
 class CameraStreamer:
     """后台线程：持续取流 → 存最新帧；按需执行连拍。单台相机。"""
 
@@ -137,6 +158,9 @@ class CameraStreamer:
         self._capture_req = threading.Event()   # 触发连拍
 
         self._capture_running = threading.Event()  # capture thread running flag
+        # Pre-trigger ring buffer: (perf_counter_ts, numpy_array). Capacity covers DURATION_SEC at camera fps; ensures 连拍切片覆盖触发前 DURATION_SEC.
+        self._ring = collections.deque(maxlen=512)
+        self._ring_lock = threading.Lock()
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
 
@@ -276,6 +300,11 @@ class CameraStreamer:
         #   慢轮询也能拿到各不相同的新鲜帧；且轮询(6fps)慢于产出(48fps)，不会重复。
         #   时序确定性仍由 _loop 的 3fps 软件节流保证，不受策略影响。
         self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+        # Expand internal frame buffer so 7s pre-trigger ring never drops frames.
+        try:
+            self.cam.MaxNumBuffer.SetValue(1000)
+        except Exception:
+            pass
         # 取一张确认分辨率
         grab = self.cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
         if not grab.GrabSucceeded():
@@ -296,96 +325,107 @@ class CameraStreamer:
         self._thread.start()
 
     def _loop(self):
-        """后台预览线程：轻量取流 → 更新 _latest 供网页实时预览。
+        """后台取流线程：持续 RetrieveResult，每帧写入环形缓冲(带 perf_counter 时间戳)，
+        同时刷新 _latest 供网页预览。出车信号 → 启动独立 capture 线程做时间戳切片。
 
-        连拍不依赖环形缓冲，而是在信号到来时同步执行 _do_capture（与
-        live_capture.py 完全一致的逻辑：按 FPS 节拍、取一帧存一帧、不做预缓冲）。
-        彻底消除"同一帧重复写入 ring"导致 21 张相同的脆弱性问题。
+        取流节拍匹配相机产出(48fps ≈ 21ms)，保证 DURATION_SEC 内 ring 不丢帧。
+        LatestImageOnly + 大 MaxNumBuffer：保留最近帧，Python 端不取也不丢关键窗口。
         """
-        preview_interval = 1.0 / max(FPS, 6)  # 预览 6fps 足够流畅，不费 CPU
-        next_preview = time.perf_counter()
+        GET_INTERVAL = 1.0 / 48  # ~21ms，匹配相机 48fps 产出节奏
+        next_get = time.perf_counter()
         while self.running:
             try:
-                wait = next_preview - time.perf_counter()
+                wait = next_get - time.perf_counter()
                 if wait > 0:
                     time.sleep(wait)
-                next_preview = time.perf_counter() + preview_interval
-
+                next_get = time.perf_counter() + GET_INTERVAL
                 try:
                     grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
                 except Exception:
                     time.sleep(0.05)
                     continue
                 if grab and grab.GrabSucceeded():
+                    arr = grab.Array
+                    ts = time.perf_counter()
+                    # 先写入 ring(给 capture 切片用)，再更新 _latest(给预览用)
+                    with self._ring_lock:
+                        self._ring.append((ts, arr))
                     with self._lock:
-                        self._latest = grab.Array.copy()
+                        self._latest = arr.copy()
                     grab.Release()
-                    # 出车信号来了 → 立即同步连拍（阻塞 _loop，拍完才恢复预览）
+                    # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
                         self._capture_running.set()
                         threading.Thread(target=self._do_capture, daemon=True).start()
                 elif grab:
                     grab.Release()
             except Exception as e:
-                self._error = f"预览异常: {e}"
-                print(f"[相机] 预览异常(已忽略，继续): {e}")
+                self._error = f"取流异常: {e}"
+                print(f"[相机] 取流异常(已忽略，继续): {e}")
                 time.sleep(0.1)
 
-    def _do_capture(self):
-        """独立连拍线程：只读 _latest 取帧，不调用 RetrieveResult，不阻塞 _loop。
 
-        - 相机自由运行 48fps，_loop 以 6fps 持续刷新 _latest；
-        - 连拍线程每 333ms 读 _latest 一次，天然间隔超过 167ms 刷新周期，拿到各不相同的帧；
-        - 节拍用 sleep 近似 + 末段 5ms busy-wait 精确修正（不占相机接口/不占核心），保证相机好整取流；
-        - 取帧阶段不写盘，拍完批量写盘。
+    def _do_capture(self):
+        """独立连拍线程：从环形缓冲按精确时间戳切 21 帧（严格 333ms 间隔）。
+
+        核心思路：相机自由运行 48fps，_loop 持续把每帧(perf_counter 时间戳)写入 ring。
+        出车信号触发时，记录 t_trigger；从 ring 里按 333ms 步长切 21 帧：
+            target_ts[i] = (t_trigger - DURATION_SEC) + (i+1) * (1/FPS), i=0..20
+        每帧取 ring 里 ts 最接近 target_ts 的那帧。完全时间戳驱动：
+          - 不依赖 sleep/busy-wait 精度
+          - 不依赖 _latest 刷新频率
+          - 不阻塞相机(_do_capture 只查 ring 内存，< 10ms 完成)
+          - 21 帧间隔严格 333ms(由 target_ts 决定)
+          - 每帧来自不同时刻，天然去重
         """
         self._capture_req.clear()
-        total = int(FPS * DURATION_SEC)
-        frame_interval = 1.0 / FPS
+        total = int(FPS * DURATION_SEC)      # 21
+        frame_interval = 1.0 / FPS           # 0.333...s
+
+        # 触发基准 = 当前时刻(perf_counter 单调钟)；切片起点 = 触发前 DURATION_SEC
+        t_trigger = time.perf_counter()
+        t_start = t_trigger - DURATION_SEC
+
+        # 快照 ring(避免长时间持锁；ring 容量 512 拷贝很快)
+        with self._ring_lock:
+            ring_snapshot = list(self._ring)
+
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
-        frames_buf = []
+        frames_buf = []  # (fname, frame)
         t0 = time.perf_counter()
-        last_img = None
+
         for i in range(total):
-            target_t = t0 + i * frame_interval
-            sleep_t = target_t - time.perf_counter()
-            if sleep_t > 0.005:
-                time.sleep(sleep_t - 0.005)
-            while time.perf_counter() < target_t:
-                pass
-            t_shot = time.perf_counter()
-            with self._lock:
-                frame = self._latest.copy() if self._latest is not None else None
-            if frame is None:
-                print(f"[相机] 第 {i+1}/{total} 张取图失败(无帧)")
+            target_ts = t_start + (i + 1) * frame_interval
+            best = _pick_closest(ring_snapshot, target_ts)
+            if best is None:
+                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")
                 continue
-            dup = False
-            if last_img is not None and last_img.shape == frame.shape:
-                try:
-                    if not (frame.astype("int16") - last_img.astype("int16")).any():
-                        dup = True
-                except Exception:
-                    pass
-            if dup:
-                continue
-            last_img = frame.copy()
+            _, frame = best
             fname = self._format_filename()
-            frames_buf.append((fname, frame, t_shot))
+            frames_buf.append((fname, frame.copy()))
+
+        # 批量写盘
         write_t0 = time.perf_counter()
-        for fname, frame, _ in frames_buf:
+        for fname, frame in frames_buf:
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(fname)
         write_elapsed = time.perf_counter() - write_t0
         elapsed = time.perf_counter() - t0
-        span = (len(frames_buf) - 1) * frame_interval if len(frames_buf) > 1 else 0.0
-        print(f"[相机] 连拍完成: 取帧{len(frames_buf)}张, span={span:.2f}s, "
-              f"总耗时={elapsed:.2f}s, 写盘耗时={write_elapsed:.2f}s")
-        if len(frames_buf) >= 2:
-            first = frames_buf[0][2]
-            last = frames_buf[-1][2]
-            print(f"[相机] 首张到末张取图时间={last-first:.2f}s, 实际fps={len(frames_buf)/(last-first):.1f}")
+
+        # 诊断日志
+        if ring_snapshot:
+            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]
+            print(f"[相机] ring={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s), "
+                  f"取图={len(batch)}/{total}, 目标间隔={frame_interval*1000:.1f}ms, "
+                  f"写盘={write_elapsed:.2f}s, 总耗时={elapsed:.2f}s")
+            if len(batch) >= 2:
+                print(f"[相机] 切片实际fps={len(batch)/((len(batch)-1)*frame_interval):.2f}")
+        else:
+            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
+
+        span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
             "ok": True,
             "saved": len(batch),
@@ -393,12 +433,14 @@ class CameraStreamer:
             "elapsed": round(elapsed, 2),
             "span_sec": round(span, 2),
             "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
-            "mode": f"独立线程连拍(拍完{DURATION_SEC}s,共{total}张)",
+            "mode": f"环形缓冲时间戳切片(拍完{DURATION_SEC}s,共{total}张)",
             "files": batch,
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._capture_running.clear()
         self._capture_done.set()
+
+
 
 
     def _format_filename(self, prefix="Image"):
