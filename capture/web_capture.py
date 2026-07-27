@@ -38,7 +38,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-27-direct-sync-capture"  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+VERSION = "2026-07-27-cam-ts-verify"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
 VERSION_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")   # 文件名/诊断用的短版本号，如 2026-07-29
 print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
@@ -185,6 +185,7 @@ class CameraStreamer:
         # Pre-trigger ring buffer: (perf_counter_ts, numpy_array). Capacity covers DURATION_SEC at camera fps; ensures 连拍切片覆盖触发前 DURATION_SEC.
         self._ring = collections.deque(maxlen=512)
         self._ring_lock = threading.Lock()
+        self._last_cam_ts = None        # last camera hw-ts (plan A dedup on new exposures)
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
 
@@ -415,10 +416,20 @@ class CameraStreamer:
                     frame = _grab_to_frame(grab)   # 深拷贝，杜绝 21 张全同
                     ts = time.perf_counter()
                     # 先写入 ring(给 capture 切片用)，再更新 _latest(给预览用)
-                    with self._ring_lock:
-                        self._ring.append((ts, frame))
-                    with self._lock:
-                        self._latest = frame
+                    # read camera hardware timestamp (plan A: filter dup copies produced
+                    # when software reads faster than the camera outputs new frames)
+                    try:
+                        cam_ts = grab.GetTimeStamp()
+                    except Exception:
+                        cam_ts = None
+                    # only let genuinely new exposure frames enter ring/preview
+                    if self._last_cam_ts is None or cam_ts != self._last_cam_ts:
+                        self._last_cam_ts = cam_ts
+                        ts = time.perf_counter()
+                        with self._ring_lock:
+                            self._ring.append((ts, frame))
+                        with self._lock:
+                            self._latest = frame
                     grab.Release()
                     # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
@@ -477,11 +488,17 @@ class CameraStreamer:
                 next_at += frame_interval
                 continue
             frame = _grab_to_frame(grab)   # 独立深拷贝，杜绝 21 张全同
+            # camera hardware timestamp: iron proof of whether this is a new exposure.
+            # MUST be read before Release().
+            try:
+                cam_ts = grab.GetTimeStamp()
+            except Exception:
+                cam_ts = None
             grab.Release()
 
             target_ts = t_trigger + i * frame_interval
             delta_ms = (actual_ts - target_ts) * 1000.0
-            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame))
+            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame, cam_ts))
 
             # 边抓边存：每抓一张立即写盘，避免 21 张攒一起写超时丢帧
             frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
@@ -498,6 +515,9 @@ class CameraStreamer:
         # ========== 诊断日志 ==========
         unique_hashes = len(set(saved_hashes))
         identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
+        # camera hardware timestamp diagnostic: iron proof that 21 frames are new exposures
+        cam_ts_list = [m[5] for m in picked_meta]
+        distinct_cam_ts = len(set(cam_ts_list))
         print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=v{VERSION_TAG} =====")
         print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
               f"总耗时={elapsed:.2f}s")
@@ -510,7 +530,18 @@ class CameraStreamer:
             print(f"[相机] 逐帧去重: ✓ 各不相同")
         else:
             print(f"[相机] 逐帧去重: 部分重复")
-        for idx, target_ts, actual_ts, delta_ms, _f in picked_meta:
+        # ---- camera hardware timestamp verdict (the key iron proof) ----
+        if None not in cam_ts_list and distinct_cam_ts <= 1:
+            print(f'[cam] HARDWARE TS ALL EQUAL ({distinct_cam_ts}) -> camera produced NO new frames (frozen / no trigger / TriggerMode not Off)')
+        elif distinct_cam_ts == len(cam_ts_list):
+            print(f'[cam] HARDWARE TS: OK {distinct_cam_ts}/{len(cam_ts_list)} all distinct -> 21 frames are genuine new exposures')
+        else:
+            print(f'[cam] HARDWARE TS: partial repeats ({distinct_cam_ts}/{len(cam_ts_list)})')
+        # per-frame hw-ts
+        for idx, target_ts, actual_ts, delta_ms, _f, cam_ts in picked_meta:
+            offset_s = target_ts - t_trigger
+            print(f'[cam] frame {idx:02d}/{total} target_off={offset_s*1000:6.1f}ms delta={delta_ms:+6.1f}ms hw_ts={cam_ts}')
+
             offset_s = target_ts - t_trigger
             print(f"[相机] 第{idx:02d}/{total}张 目标偏移={offset_s*1000:6.1f}ms 实际偏差={delta_ms:+6.1f}ms")
         if len(picked_meta) >= 2:
@@ -524,6 +555,7 @@ class CameraStreamer:
             "ok": True,
             "saved": len(batch),
             "unique_frames": unique_hashes,
+            "distinct_cam_ts": distinct_cam_ts,
             "identical": identical,
             "total": total,
             "elapsed": round(elapsed, 2),
