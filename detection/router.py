@@ -3,7 +3,7 @@
 
 现场车型代码（DB230.DBD1208，ASCII）：
   - 以 "MM" 开头（如 "MM**"）→ 9X 车型 → 用现有 SealDetector
-  - "NM41" / "NM42" → 8X 车型（同一套检测程序）→ 算法尚未实现，预留
+  - 以 "NM" 开头（如 "NM41" / "NM42" / "NM**"）→ 8X 车型（同一套检测程序）→ 算法尚未实现，预留
   - 其他（如 "7P24"）→ 未知/未接入车型 → 暂不处理
 
 扩展新车型：在 ROUTING 里加一条 代码前缀→算法 key，并在 get_detector
@@ -15,8 +15,7 @@ from common.interfaces import DetectionResult, Defect
 # 车型代码（前缀）→ 算法 key
 ROUTING = {
     "MM": "9X",       # 9X 车型：现有胶条检测算法
-    "NM41": "8X",     # 8X 车型：算法未实现，预留（与 NM42 同一套程序）
-    "NM42": "8X",     # 8X 车型：同上
+    "NM": "8X",       # 8X 车型：NM41/NM42/NM** 等所有 NM 开头，算法未实现，预留
 }
 
 
