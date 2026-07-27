@@ -40,7 +40,7 @@ import collections
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
 VERSION = "2026-07-29-ver-in-filename"  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
-VERSION_TAG = "-".join(VERSION.split("-")[:3])   # 文件名/诊断用的短版本号，如 2026-07-29
+VERSION_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")   # 文件名/诊断用的短版本号，如 2026-07-29
 print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
 
 try:
@@ -576,6 +576,7 @@ class CameraStreamer:
         return {
             "running": self.running,
             "version": VERSION,
+            "version_tag": VERSION_TAG,
             "camera": self.camera_info,
             "resolution": f"{self.width}x{self.height}",
             "color": "彩色" if self.is_color else "黑白",
@@ -979,7 +980,7 @@ function refreshStatus(){{
       carbody.innerHTML='<tr><td colspan="7" class="meta">手动模式：PLC 自动触发未启用（加 --plc-auto 开启）</td></tr>';
     }}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
-    h+=`<b>程序版本</b>：v${{s.version}}（照片文件名含此短号，可确认是否最新）<br>`;
+    h+=`<b>程序版本</b>：v${{s.version_tag}}（照片文件名含此短号，可确认是否最新）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
     h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
     h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
@@ -1072,7 +1073,7 @@ def main():
 
     st = hub.status()
     print(f"[网页采集] 已连接：{st['camera']['model']}  IP={st['camera']['ip']}")
-    print(f"[网页采集] 程序版本 VERSION={VERSION}（照片文件名含 v{VERSION_TAG}，可确认是否最新）")
+    print(f"[网页采集] 程序版本 VERSION={VERSION}（照片文件名含唯一到秒标记 v{VERSION_TAG}，可确认是否最新程序/实例）")
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
