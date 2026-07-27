@@ -31,6 +31,7 @@ import datetime
 import threading
 import argparse
 import concurrent.futures as _cf
+import subprocess
 
 import cv2
 import numpy as np
@@ -38,10 +39,33 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-27-cam-ts-verify"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+VERSION = "2026-07-29-git-push-tag"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
-VERSION_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")   # 文件名/诊断用的短版本号，如 2026-07-29
-print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
+def _git_push_info():
+    """Return (short_commit_hash, commit_date) of the current repo, or (None, None).
+    Ties the version to the exact PUSHED code so the field can tell which push
+    is running and when it was pushed (commit time == push time here)."""
+    try:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        h = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=3)
+        d = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%cd",
+                            "--date=format:%Y-%m-%d-%H%M%S"],
+                           capture_output=True, text=True, timeout=3)
+        hs, ds = h.stdout.strip(), d.stdout.strip()
+        if hs and ds:
+            return hs, ds
+    except Exception:
+        pass
+    return None, None
+
+
+_GIT_HASH, _GIT_DATE = _git_push_info()
+RUN_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+# VERSION_TAG = PUSH identity "<hash>__<commit-date>"; falls back to run time
+# when git info is unavailable (e.g. a frozen copy without .git).
+VERSION_TAG = (_GIT_HASH + "__" + _GIT_DATE) if _GIT_HASH else RUN_TAG
+print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (run={RUN_TAG})")
 
 try:
     import pypylon.pylon as py
@@ -518,7 +542,7 @@ class CameraStreamer:
         # camera hardware timestamp diagnostic: iron proof that 21 frames are new exposures
         cam_ts_list = [m[5] for m in picked_meta]
         distinct_cam_ts = len(set(cam_ts_list))
-        print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=v{VERSION_TAG} =====")
+        print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=p{VERSION_TAG} =====")
         print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
               f"总耗时={elapsed:.2f}s")
         if identical:
@@ -575,8 +599,8 @@ class CameraStreamer:
             dt = datetime.datetime.now()
         ts = dt.strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
         idx_part = f"_{idx:02d}" if idx is not None else ""
-        # 文件名带版本短号 v{VERSION_TAG}，现场一眼即可确认是否跑了最新程序
-        return f"{prefix}{idx_part}__v{VERSION_TAG}__{ts}{SAVE_EXT}"
+        # 文件名带版本短号 p{VERSION_TAG}，现场一眼即可确认是否跑了最新程序
+        return f"{prefix}{idx_part}__p{VERSION_TAG}__{ts}{SAVE_EXT}"
 
     def request_capture(self):
         """外部触发连拍，阻塞直到完成，返回结果 dict。"""
@@ -1105,7 +1129,7 @@ def main():
 
     st = hub.status()
     print(f"[网页采集] 已连接：{st['camera']['model']}  IP={st['camera']['ip']}")
-    print(f"[网页采集] 程序版本 VERSION={VERSION}（照片文件名含唯一到秒标记 v{VERSION_TAG}，可确认是否最新程序/实例）")
+    print(f"[网页采集] 程序版本 VERSION={VERSION}（照片文件名含唯一到秒标记 p{VERSION_TAG}，可确认是否最新程序/实例）")
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
