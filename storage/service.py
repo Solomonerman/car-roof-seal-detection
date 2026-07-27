@@ -29,7 +29,7 @@ def _car_key(pin, skid):
     return "UNK"
 
 _STAMP_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})__(\d{2})-(\d{2})-(\d{2})-(\d{3})")
-_VER_RE = re.compile(r"p([0-9a-f]+__\d{4}-\d{2}-\d{2}-\d{6})")   # 原文件名里的版本运行时戳
+_VER_RE = re.compile(r"p([0-9a-fA-F]+__\d{4}-\d{2}-\d{2}-\d{6})")   # 原文件名里的版本运行时戳
 
 def _version_tag_from_name(fname):
     m = _VER_RE.search(os.path.basename(fname))

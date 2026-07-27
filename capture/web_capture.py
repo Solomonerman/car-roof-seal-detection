@@ -32,6 +32,7 @@ import threading
 import argparse
 import concurrent.futures as _cf
 import subprocess
+import re
 
 import cv2
 import numpy as np
@@ -39,33 +40,85 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-29-git-push-tag"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+VERSION = "2026-07-29-push-stamp-fallback"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+
+def _find_git_repo():
+    """Walk up from this file to locate the .git directory; return repo root or None."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return None
+
 
 def _git_push_info():
     """Return (short_commit_hash, commit_date) of the current repo, or (None, None).
-    Ties the version to the exact PUSHED code so the field can tell which push
-    is running and when it was pushed (commit time == push time here)."""
+    Ties the version to the exact PUSHED code. Prints a debug note if git is
+    unavailable so failures are never silent."""
+    repo = _find_git_repo()
+    if repo is None:
+        print("[web_capture.py] git: no .git found upward from script -> "
+              "push id will use stamp/run fallback")
+        return None, None
+    candidates = ["git"]
+    if os.name == "nt":
+        for base in (r"C:\Program Files\Git\cmd", r"C:\Program Files (x86)\Git\cmd",
+                     r"C:\Program Files\Git\bin", r"C:\Program Files (x86)\Git\bin"):
+            candidates.append(os.path.join(base, "git.exe"))
+    last_err = None
+    for g in candidates:
+        try:
+            h = subprocess.run([g, "-C", repo, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=3)
+            d = subprocess.run([g, "-C", repo, "log", "-1", "--format=%cd",
+                                "--date=format:%Y-%m-%d-%H%M%S"],
+                               capture_output=True, text=True, timeout=3)
+            hs, ds = h.stdout.strip(), d.stdout.strip()
+            if hs and ds:
+                return hs, ds
+        except Exception as e:
+            last_err = e
+    print(f"[web_capture.py] git: command unavailable ({last_err}) -> "
+          "push id will use stamp/run fallback")
+    return None, None
+
+
+def _load_stamp():
+    """Read the push id stamped at push time (capture/_push_info.py).
+    Reliable fallback when git is not usable at runtime (e.g. Git-Bash-only
+    install, or a deployed copy without .git)."""
     try:
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        h = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=3)
-        d = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%cd",
-                            "--date=format:%Y-%m-%d-%H%M%S"],
-                           capture_output=True, text=True, timeout=3)
-        hs, ds = h.stdout.strip(), d.stdout.strip()
-        if hs and ds:
-            return hs, ds
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_push_info.py")
+        if os.path.exists(p):
+            txt = open(p, encoding="utf-8").read()
+            mh = re.search(r'PUSH_HASH\s*=\s*"([0-9a-fA-F]+)"', txt)
+            md = re.search(r'PUSH_DATE\s*=\s*"([\d\-:]+)"', txt)
+            if mh and md:
+                return mh.group(1), md.group(1)
     except Exception:
         pass
     return None, None
 
 
 _GIT_HASH, _GIT_DATE = _git_push_info()
+_STAMP_HASH, _STAMP_DATE = _load_stamp()
 RUN_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
-# VERSION_TAG = PUSH identity "<hash>__<commit-date>"; falls back to run time
-# when git info is unavailable (e.g. a frozen copy without .git).
-VERSION_TAG = (_GIT_HASH + "__" + _GIT_DATE) if _GIT_HASH else RUN_TAG
-print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (run={RUN_TAG})")
+# VERSION_TAG = PUSH identity "<hash>__<commit-date>".
+# Priority: live git (if available) > pushed stamp file > run time.
+if _GIT_HASH:
+    VERSION_TAG = _GIT_HASH + "__" + _GIT_DATE
+    _VER_SRC = "git"
+elif _STAMP_HASH:
+    VERSION_TAG = _STAMP_HASH + "__" + _STAMP_DATE
+    _VER_SRC = "stamp"
+else:
+    VERSION_TAG = RUN_TAG
+    _VER_SRC = "run"
+print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (source={_VER_SRC}, run={RUN_TAG})")
 
 try:
     import pypylon.pylon as py
