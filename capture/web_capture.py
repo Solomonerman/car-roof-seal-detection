@@ -36,7 +36,7 @@ import cv2
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-24-ring-slicer"  # 内存暂存取帧 + busy-wait 精确节拍
+VERSION = "2026-07-27-ring-copy-fix"  # 内存暂存取帧 + busy-wait 精确节拍
 
 print(f"[web_capture.py] VERSION={VERSION}")
 
@@ -349,7 +349,7 @@ class CameraStreamer:
                     ts = time.perf_counter()
                     # 先写入 ring(给 capture 切片用)，再更新 _latest(给预览用)
                     with self._ring_lock:
-                        self._ring.append((ts, arr))
+                        self._ring.append((ts, arr.copy()))
                     with self._lock:
                         self._latest = arr.copy()
                     grab.Release()
