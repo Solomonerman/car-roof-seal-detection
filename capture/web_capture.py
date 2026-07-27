@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-29-push-stamp-fallback"  # direct-sync capture + camera hw-ts dedup/proof  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+VERSION = "2026-07-29-cam-rate-diag"  # 连接时读取并解除相机帧率限速(占位/UserSet/包大小)，自由运行+软件节流3fps  # 直接同步连拍(治本)+硬件时间戳铁证+入库文件名带版本+出图率自测
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -408,7 +408,61 @@ class CameraStreamer:
             conf_log.append(f"像素格式={PIXEL_FORMAT}")
         except Exception as e:
             conf_log.append(f"像素格式设置异常(沿用当前值): {e}")
+        self._camera_rate_check(nodemap, conf_log)
         self._conf_log = conf_log
+
+    def _camera_rate_check(self, nodemap, conf_log):
+        """Read rate-limiting camera params, print them, and lift any artificial
+        frame-rate cap so the camera runs free (software 3fps throttle takes over).
+        Called at connect time. Safe: never opens a frame-rate lock without a valid
+        value (that froze the camera before); only disables an existing cap."""
+        try:
+            def _gv(name, attr="Value"):
+                n = nodemap.GetNode(name)
+                if n is None:
+                    return None
+                try:
+                    if attr == "Max":
+                        return n.GetMax()
+                    if attr == "Min":
+                        return n.GetMin()
+                    return n.GetValue()
+                except Exception:
+                    return None
+            fr_en = _gv("AcquisitionFrameRateEnable")
+            fr_abs = _gv("AcquisitionFrameRateAbs")
+            fr_max = _gv("AcquisitionFrameRateAbs", "Max")
+            exp_us = _gv("ExposureTimeAbs")
+            pkt = _gv("GevSCPSPacketSize")
+            thr = _gv("DeviceLinkThroughputLimit")
+            conf_log.append(
+                f"cam-diag: FrameRateEnable={fr_en} FrameRateAbs={fr_abs}fps(max={fr_max}) "
+                f"Exposure={exp_us}us PacketSize={pkt} ThroughputLimit={thr}")
+            SAFE_FPS = 30.0
+            fixed = []
+            if fr_en is True and (fr_abs is None or fr_abs < SAFE_FPS):
+                try:
+                    nodemap.GetNode("AcquisitionFrameRateEnable").SetValue(False)
+                    fixed.append(f"FrameRateEnable True->False (was {fr_abs}fps)")
+                except Exception:
+                    if fr_max:
+                        try:
+                            nodemap.GetNode("AcquisitionFrameRateAbs").SetValue(fr_max)
+                            fixed.append(f"FrameRateAbs -> {fr_max}fps (max)")
+                        except Exception as e:
+                            fixed.append(f"unlock failed: {e}")
+            if pkt is not None and 0 < pkt < 8192:
+                try:
+                    nodemap.GetNode("GevSCPSPacketSize").SetValue(8192)
+                    fixed.append(f"GigE PacketSize {pkt}->8192")
+                except Exception:
+                    pass
+            if fixed:
+                conf_log.append("cam-diag FIX applied: " + "; ".join(fixed))
+            else:
+                conf_log.append("cam-diag: no change needed (camera not rate-limited)")
+        except Exception as e:
+            conf_log.append(f"cam-diag error (ignored): {e}")
 
     def start(self):
         # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
