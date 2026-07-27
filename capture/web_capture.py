@@ -386,6 +386,17 @@ class CameraStreamer:
             first = frames_buf[0][2]
             last = frames_buf[-1][2]
             print(f"[相机] 首张到末张取图时间={last-first:.2f}s, 实际fps={len(frames_buf)/(last-first):.1f}")
+        self._last_result = {
+            "ok": True,
+            "saved": len(batch),
+            "total": total,
+            "elapsed": round(elapsed, 2),
+            "span_sec": round(span, 2),
+            "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
+            "mode": f"独立线程连拍(拍完{DURATION_SEC}s,共{total}张)",
+            "files": batch,
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
         self._capture_running.clear()
         self._capture_done.set()
 
