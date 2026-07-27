@@ -40,7 +40,7 @@ import collections
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
 VERSION = "2026-07-29-ver-in-filename"  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
-VERSION_TAG = VERSION.split("-")[0]   # 文件名/诊断用的短版本号，如 2026-07-29
+VERSION_TAG = "-".join(VERSION.split("-")[:3])   # 文件名/诊断用的短版本号，如 2026-07-29
 print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
 
 try:
