@@ -38,7 +38,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-29-ver-in-filename"  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
+VERSION = "2026-07-27-direct-sync-capture"  # 直接同步连拍(治本)+入库文件名带版本  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
 VERSION_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")   # 文件名/诊断用的短版本号，如 2026-07-29
 print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
@@ -402,6 +402,10 @@ class CameraStreamer:
                 if wait > 0:
                     time.sleep(wait)
                 next_get = time.perf_counter() + GET_INTERVAL
+                # 连拍进行中：由 _do_capture 独占相机取流，_loop 短暂让位
+                if self._capture_running.is_set():
+                    time.sleep(0.02)
+                    continue
                 try:
                     grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
                 except Exception:
@@ -429,112 +433,108 @@ class CameraStreamer:
 
 
     def _do_capture(self):
-        """独立连拍线程：从环形缓冲按精确时间戳切 21 帧（严格 333ms 间隔）。
+        """直接同步连拍(治本版)：触发时立即从相机连抓 21 张、每张间隔 333ms。
 
-        核心思路：相机自由运行 48fps，_loop 持续把每帧(perf_counter 时间戳)写入 ring。
-        出车信号触发时，记录 t_trigger；从 ring 里按 333ms 步长切 21 帧：
-            target_ts[i] = (t_trigger - DURATION_SEC) + (i+1) * (1/FPS), i=0..20
-        每帧取 ring 里 ts 最接近 target_ts 的那帧。完全时间戳驱动：
-          - 不依赖 sleep/busy-wait 精度
-          - 不依赖 _latest 刷新频率
-          - 不阻塞相机(_do_capture 只查 ring 内存，< 10ms 完成)
-          - 21 帧间隔严格 333ms(由 target_ts 决定)
-          - 每帧来自不同时刻，天然去重
+        放弃环形缓冲方案——那条路在现场反复复现"21 张全同"，根因不在 Python 而在
+        GrabStrategy_LatestImageOnly + 后台 _loop + ring 这一组合对真实环境的脆弱性。
+        改为触发瞬间 _do_capture 独占相机同步抓 21 张：若相机在自由运行，必得 21 张
+        不同帧；若相机冻结/未出图，抓取失败被直接计入诊断，日志会明确写出。
+        21 帧覆盖触发时刻起共 7 秒，每张用真实拍摄时刻命名，文件名带版本号短戳。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)      # 21
         frame_interval = 1.0 / FPS           # 0.333...s
-        identical = False                    # 逐帧去重结论(诊断用)
+        identical = False
 
-        # 触发基准 = 当前时刻(perf_counter 单调钟)；切片起点 = 触发前 DURATION_SEC
         t_trigger = time.perf_counter()
-        t_start = t_trigger - DURATION_SEC
-
-        # 快照 ring(避免长时间持锁；ring 容量 512 拷贝很快)
-        with self._ring_lock:
-            ring_snapshot = list(self._ring)
+        t_trigger_dt = datetime.datetime.now()
+        t0 = t_trigger
 
         os.makedirs(SAVE_DIR, exist_ok=True)
         batch = []
-        frames_buf = []  # (idx, frame) —— 直接持有 ring 里的独立深拷贝，无需再 copy
-        t0 = time.perf_counter()
-        t_trigger_dt = datetime.datetime.now()   # 触发时刻(墙钟)，用于给每张照片打真实拍摄时间
-
+        saved_hashes = []
         picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
+        # 单张抓取超时：333ms 节拍 + 1500ms 余量（防 OS sleep 抖动/相机偶发延迟）
+        timeout_ms = int(frame_interval * 1000) + 1500
+
+        # 直接同步：第 i 张的目标时刻 = t_trigger + i*interval，第 0 张即触发瞬间
+        next_at = t_trigger
         for i in range(total):
-            target_ts = t_start + (i + 1) * frame_interval
-            best = _pick_closest(ring_snapshot, target_ts)
-            if best is None:
-                print(f"[相机] 第 {i+1}/{total} 张取图失败(ring为空)")
+            wait = next_at - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            actual_ts = time.perf_counter()
+            try:
+                grab = self.cam.RetrieveResult(timeout_ms, py.TimeoutHandling_Return)
+            except Exception as e:
+                print(f"[相机] 第{i+1}/{total}张取图异常: {e}")
+                next_at += frame_interval
                 continue
-            actual_ts, frame = best
+            if not grab or not grab.GrabSucceeded():
+                if grab:
+                    grab.Release()
+                print(f"[相机] 第{i+1}/{total}张取图失败(超时/相机未出图)")
+                next_at += frame_interval
+                continue
+            frame = _grab_to_frame(grab)   # 独立深拷贝，杜绝 21 张全同
+            grab.Release()
+
+            target_ts = t_trigger + i * frame_interval
             delta_ms = (actual_ts - target_ts) * 1000.0
             picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame))
 
-        # 批量写盘：文件名带帧序号(idx)，避免毫秒级同名覆盖；同时算逐帧指纹用于去重诊断
-        write_t0 = time.perf_counter()
-        batch = []
-        saved_hashes = []
-        for idx, target_ts, actual_ts, delta_ms, frame in picked_meta:
-            # 该帧真实拍摄时刻 = 触发墙钟 + (帧在ring里的时间 - 触发时刻)
+            # 边抓边存：每抓一张立即写盘，避免 21 张攒一起写超时丢帧
             frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
-            fname = self._format_filename(idx=idx, dt=frame_dt)
+            fname = self._format_filename(idx=i + 1, dt=frame_dt)
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(fname)
             saved_hashes.append(_frame_hash(frame))
-        write_elapsed = time.perf_counter() - write_t0
+
+            next_at += frame_interval
+
         elapsed = time.perf_counter() - t0
 
-        # ========== 诊断日志：每张照片时间 + 间隔 + 逐帧去重校验 ==========
-        if ring_snapshot:
-            ring_span = ring_snapshot[-1][0] - ring_snapshot[0][0]
-            unique_hashes = len(set(saved_hashes))
-            identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
-            print(f"[相机] ===== 连拍统计 =====")
-            print(f"[相机] ring缓存={len(ring_snapshot)}帧(覆盖{ring_span:.2f}s) | "
-                  f"目标张数={total} | 实际张数={len(batch)} | "
-                  f"写盘耗时={write_elapsed:.2f}s | 总耗时={elapsed:.2f}s")
-            tag = "⚠️ 全部相同!" if identical else ("✓ 各不相同" if unique_hashes == len(saved_hashes) else "部分重复")
-            print(f"[相机] 逐帧去重: 唯一帧={unique_hashes}/{len(saved_hashes)} → {tag}")
-            if identical:
-                print(f"[相机] ❌ 21张完全相同: 环形缓冲里拿到的帧内容一致。"
-                      f"说明相机未持续出图 或 旧代码未更新(VERSION={VERSION})。")
-            for idx, target_ts, actual_ts, delta_ms, _f in picked_meta:
-                offset_s = target_ts - t_start
-                print(f"[相机] 第{idx:02d}/{total}张 目标={offset_s*1000:6.1f}ms "
-                      f"实际偏差={delta_ms:+6.1f}ms")
-            if len(picked_meta) >= 2:
-                actual_intervals = []
-                for j in range(1, len(picked_meta)):
-                    iv = (picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0
-                    actual_intervals.append(iv)
-                avg_iv = sum(actual_intervals) / len(actual_intervals)
-                min_iv = min(actual_intervals)
-                max_iv = max(actual_intervals)
-                print(f"[相机] 间隔统计: 平均={avg_iv:.1f}ms 最小={min_iv:.1f}ms 最大={max_iv:.1f}ms "
-                      f"(目标={frame_interval*1000:.1f}ms)")
-            print(f"[相机] ===== 统计结束 =====")
+        # ========== 诊断日志 ==========
+        unique_hashes = len(set(saved_hashes))
+        identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
+        print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=v{VERSION_TAG} =====")
+        print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
+              f"总耗时={elapsed:.2f}s")
+        if identical:
+            print(f"[相机] 逐帧去重: ⚠️ 全部相同!  → 相机未持续出图 或 场景完全静止(无车经过)")
+            print(f"[相机] ❌ 请查看启动日志 [相机] 出图率自测 的唯一帧/fps 判断相机端状态。")
+        elif len(saved_hashes) == 0:
+            print(f"[相机] 逐帧去重: ❌ 0张取到 → 相机无响应/未出图，检查连接与 TriggerMode=Off")
+        elif unique_hashes == len(saved_hashes):
+            print(f"[相机] 逐帧去重: ✓ 各不相同")
         else:
-            print(f"[相机] ring为空，未取到任何帧(检查相机取流)")
+            print(f"[相机] 逐帧去重: 部分重复")
+        for idx, target_ts, actual_ts, delta_ms, _f in picked_meta:
+            offset_s = target_ts - t_trigger
+            print(f"[相机] 第{idx:02d}/{total}张 目标偏移={offset_s*1000:6.1f}ms 实际偏差={delta_ms:+6.1f}ms")
+        if len(picked_meta) >= 2:
+            ivs = [(picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0 for j in range(1, len(picked_meta))]
+            avg = sum(ivs)/len(ivs); mn = min(ivs); mx = max(ivs)
+            print(f"[相机] 间隔: 平均={avg:.1f}ms 最小={mn:.1f}ms 最大={mx:.1f}ms (目标={frame_interval*1000:.1f}ms)")
+        print(f"[相机] ===== 统计结束 =====")
 
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
         self._last_result = {
             "ok": True,
             "saved": len(batch),
-            "unique_frames": len(set(saved_hashes)),
+            "unique_frames": unique_hashes,
             "identical": identical,
             "total": total,
             "elapsed": round(elapsed, 2),
             "span_sec": round(span, 2),
             "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
-            "mode": f"环形缓冲时间戳切片(拍完{DURATION_SEC}s,共{total}张)",
+            "mode": f"直接同步连拍({DURATION_SEC}s/{total}张,不依赖ring)",
             "files": batch,
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._capture_running.clear()
         self._capture_done.set()
-
 
 
 

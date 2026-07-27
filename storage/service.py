@@ -29,6 +29,12 @@ def _car_key(pin, skid):
     return "UNK"
 
 _STAMP_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})__(\d{2})-(\d{2})-(\d{2})-(\d{3})")
+_VER_RE = re.compile(r"v(\d{4}-\d{2}-\d{2}-\d{6})")   # 原文件名里的版本运行时戳
+
+def _version_tag_from_name(fname):
+    m = _VER_RE.search(os.path.basename(fname))
+    return m.group(1) if m else ""
+
 def _stamp_from_name(fname):
     """从原文件名(含帧时间戳)提炼 YYYYMMDD_HHMMSS；失败则用当前时刻兜底。"""
     m = _STAMP_RE.search(os.path.basename(fname))
@@ -70,7 +76,9 @@ class StorageService:
         for i, p in enumerate(images, 1):
             ext = os.path.splitext(p)[1] or ".bmp"
             stamp = _stamp_from_name(p)
-            new_name = f"{i:02d}__{car_key}__cam{cam_idx}__{stamp}{ext}"
+            ver = _version_tag_from_name(p)
+            ver_part = f"__v{ver}" if ver else ""
+            new_name = f"{i:02d}__{car_key}__cam{cam_idx}__{stamp}{ver_part}{ext}"
             refs.append(self.store.upload(p, subdir=subdir, new_name=new_name))
         rec = InspectionRecord(
             car_model=model,
