@@ -38,9 +38,10 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-28-copy-hardened-selftest"  # 深拷贝加固 + 逐帧哈希去重诊断 + 自检模式
+VERSION = "2026-07-29-ver-in-filename"  # 版本写入文件名+真实拍摄时刻命名+启动出图率自测+强制自由运行
 
-print(f"[web_capture.py] VERSION={VERSION}")
+VERSION_TAG = VERSION.split("-")[0]   # 文件名/诊断用的短版本号，如 2026-07-29
+print(f"[web_capture.py] VERSION={VERSION}  (短号={VERSION_TAG})")
 
 try:
     import pypylon.pylon as py
@@ -282,6 +283,23 @@ class CameraStreamer:
                 conf_log.append(f"{name} 设置失败: {msg}")
         if not exp_ok:
             conf_log.append("曝光未写入，沿用相机当前曝光值")
+        # 触发/采集模式：强制自由运行(Continuous + TriggerMode=Off)。
+        # 若相机残留"外触发/软触发"配置而无触发源，会只出 1 帧后冻结 → ring 全是同一张
+        # （21 张全同的又一根源）。显式关触发 + 连续采集，保证 48fps 持续出图。
+        try:
+            tm = nodemap.GetNode("TriggerMode")
+            if tm is not None:
+                tm.SetValue("Off")
+                conf_log.append("触发模式=Off(自由运行)")
+        except Exception as e:
+            conf_log.append(f"触发模式设置异常: {e}")
+        try:
+            am = nodemap.GetNode("AcquisitionMode")
+            if am is not None:
+                am.SetValue("Continuous")
+                conf_log.append("采集模式=Continuous")
+        except Exception as e:
+            conf_log.append(f"采集模式设置异常: {e}")
         # 采集帧率：本意锁成 FPS 以保证时序确定。但 aca1920-48gm 上
         # AcquisitionFrameRate 是占位节点(not available)，相机端锁定会失败。
         # 【关键修复】仅当“成功写入帧率值”时才打开帧率限制开关。
@@ -342,6 +360,28 @@ class CameraStreamer:
         except Exception:
             self.actual_fmt = "未知"
         grab.Release()
+        # 出图率自测：连取若干张，统计"唯一帧"与实测 fps。
+        # 这是"21张全同"的终极诊断：若唯一帧<取到数，说明相机没在自由运行(外触发/冻结)。
+        try:
+            n_probe = 10
+            probe_hashes = []
+            t0p = time.perf_counter()
+            for _ in range(n_probe):
+                g = self.cam.RetrieveResult(600, py.TimeoutHandling_Return)
+                if g and g.GrabSucceeded():
+                    probe_hashes.append(_frame_hash(_grab_to_frame(g)))
+                elif g:
+                    g.Release()
+            dtp = time.perf_counter() - t0p
+            uniqp = len(set(probe_hashes))
+            fpsp = len(probe_hashes) / dtp if dtp > 0 else 0
+            print(f"[相机] 出图率自测: 取到{len(probe_hashes)}/{n_probe}张, "
+                  f"≈{fpsp:.1f}fps, 唯一帧={uniqp}/{len(probe_hashes)}")
+            if uniqp <= 1:
+                print("[相机] ⚠️ 出图率自测告警: 连续取的帧内容相同 → "
+                      "相机可能未自由运行(检查 TriggerMode/外触发线/曝光是否过大)")
+        except Exception as e:
+            print(f"[相机] 出图率自测异常(忽略): {e}")
 
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -418,6 +458,7 @@ class CameraStreamer:
         batch = []
         frames_buf = []  # (idx, frame) —— 直接持有 ring 里的独立深拷贝，无需再 copy
         t0 = time.perf_counter()
+        t_trigger_dt = datetime.datetime.now()   # 触发时刻(墙钟)，用于给每张照片打真实拍摄时间
 
         picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
         for i in range(total):
@@ -435,7 +476,9 @@ class CameraStreamer:
         batch = []
         saved_hashes = []
         for idx, target_ts, actual_ts, delta_ms, frame in picked_meta:
-            fname = self._format_filename(idx=idx)
+            # 该帧真实拍摄时刻 = 触发墙钟 + (帧在ring里的时间 - 触发时刻)
+            frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
+            fname = self._format_filename(idx=idx, dt=frame_dt)
             fpath = os.path.join(SAVE_DIR, fname)
             cv2.imwrite(fpath, frame)
             batch.append(fname)
@@ -495,10 +538,13 @@ class CameraStreamer:
 
 
 
-    def _format_filename(self, idx=None, prefix="Image"):
-        ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
+    def _format_filename(self, idx=None, dt=None, prefix="Image"):
+        if dt is None:
+            dt = datetime.datetime.now()
+        ts = dt.strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
         idx_part = f"_{idx:02d}" if idx is not None else ""
-        return f"{prefix}{idx_part}__{ts}{SAVE_EXT}"
+        # 文件名带版本短号 v{VERSION_TAG}，现场一眼即可确认是否跑了最新程序
+        return f"{prefix}{idx_part}__v{VERSION_TAG}__{ts}{SAVE_EXT}"
 
     def request_capture(self):
         """外部触发连拍，阻塞直到完成，返回结果 dict。"""
@@ -529,6 +575,7 @@ class CameraStreamer:
     def status(self):
         return {
             "running": self.running,
+            "version": VERSION,
             "camera": self.camera_info,
             "resolution": f"{self.width}x{self.height}",
             "color": "彩色" if self.is_color else "黑白",
@@ -932,6 +979,7 @@ function refreshStatus(){{
       carbody.innerHTML='<tr><td colspan="7" class="meta">手动模式：PLC 自动触发未启用（加 --plc-auto 开启）</td></tr>';
     }}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
+    h+=`<b>程序版本</b>：v${{s.version}}（照片文件名含此短号，可确认是否最新）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
     h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
     h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
@@ -1024,6 +1072,7 @@ def main():
 
     st = hub.status()
     print(f"[网页采集] 已连接：{st['camera']['model']}  IP={st['camera']['ip']}")
+    print(f"[网页采集] 程序版本 VERSION={VERSION}（照片文件名含 v{VERSION_TAG}，可确认是否最新）")
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
