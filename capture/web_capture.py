@@ -35,7 +35,7 @@ import concurrent.futures as _cf
 import cv2
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-24-3f4ca58"  # 内存暂存取帧 + busy-wait 精确节拍
+VERSION = "2026-07-24-capture-thread"  # 内存暂存取帧 + busy-wait 精确节拍
 
 print(f"[web_capture.py] VERSION={VERSION}")
 
@@ -135,6 +135,8 @@ class CameraStreamer:
         self._lock = threading.Lock()
 
         self._capture_req = threading.Event()   # 触发连拍
+
+        self._capture_running = threading.Event()  # capture thread running flag
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
 
@@ -319,8 +321,9 @@ class CameraStreamer:
                         self._latest = grab.Array.copy()
                     grab.Release()
                     # 出车信号来了 → 立即同步连拍（阻塞 _loop，拍完才恢复预览）
-                    if self._capture_req.is_set():
-                        self._do_capture()
+                    if self._capture_req.is_set() and not self._capture_running.is_set():
+                        self._capture_running.set()
+                        threading.Thread(target=self._do_capture, daemon=True).start()
                 elif grab:
                     grab.Release()
             except Exception as e:
@@ -329,11 +332,12 @@ class CameraStreamer:
                 time.sleep(0.1)
 
     def _do_capture(self):
-        """同步连拍：每次间隔自己刷新 _latest，不依赖 RetrieveResult 阻塞等帧。
+        """独立连拍线程：只读 _latest 取帧，不调用 RetrieveResult，不阻塞 _loop。
 
-        - 按 FPS(3) 节拍，每 333ms 取一帧，共 21 次 = 7 秒。
-        - busy-wait 精确等到目标时刻，然后用非阻塞 RetrieveResult 取最新帧。
-        - 取帧阶段不写盘，全部取完再批量写入。
+        - 相机自由运行 48fps，_loop 以 6fps 持续刷新 _latest；
+        - 连拍线程每 333ms 读 _latest 一次，天然间隔超过 167ms 刷新周期，拿到各不相同的帧；
+        - 节拍用 sleep 近似 + 末段 5ms busy-wait 精确修正（不占相机接口/不占核心），保证相机好整取流；
+        - 取帧阶段不写盘，拍完批量写盘。
         """
         self._capture_req.clear()
         total = int(FPS * DURATION_SEC)
@@ -342,43 +346,32 @@ class CameraStreamer:
         batch = []
         frames_buf = []
         t0 = time.perf_counter()
-        last_img = None  # 去重
+        last_img = None
         for i in range(total):
             target_t = t0 + i * frame_interval
+            sleep_t = target_t - time.perf_counter()
+            if sleep_t > 0.005:
+                time.sleep(sleep_t - 0.005)
             while time.perf_counter() < target_t:
                 pass
             t_shot = time.perf_counter()
-            # 非阻塞取最新帧（timeout=0, Return 立即返回当前缓冲）
-            frame = None
-            try:
-                grab = self.cam.RetrieveResult(0, py.TimeoutHandling_Return)
-                if grab and grab.GrabSucceeded():
-                    frame = grab.Array.copy()
-                if grab:
-                    grab.Release()
-            except Exception:
-                pass
-            if frame is None:
-                # 回退：从 _latest 取
-                with self._lock:
-                    frame = self._latest.copy() if self._latest is not None else None
-                if frame is None:
-                    print(f"[相机] 第 {i+1}/{total} 张取图失败")
-                    continue
-            # 同时更新 _latest（供预览用）
             with self._lock:
-                self._latest = frame.copy()
-            # 去重
+                frame = self._latest.copy() if self._latest is not None else None
+            if frame is None:
+                print(f"[相机] 第 {i+1}/{total} 张取图失败(无帧)")
+                continue
+            dup = False
             if last_img is not None and last_img.shape == frame.shape:
                 try:
                     if not (frame.astype("int16") - last_img.astype("int16")).any():
-                        continue
+                        dup = True
                 except Exception:
                     pass
+            if dup:
+                continue
             last_img = frame.copy()
             fname = self._format_filename()
             frames_buf.append((fname, frame, t_shot))
-        # 批量写盘
         write_t0 = time.perf_counter()
         for fname, frame, _ in frames_buf:
             fpath = os.path.join(SAVE_DIR, fname)
@@ -393,19 +386,9 @@ class CameraStreamer:
             first = frames_buf[0][2]
             last = frames_buf[-1][2]
             print(f"[相机] 首张到末张取图时间={last-first:.2f}s, 实际fps={len(frames_buf)/(last-first):.1f}")
-        span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
-        self._last_result = {
-            "ok": True,
-            "saved": len(batch),
-            "total": total,
-            "elapsed": round(elapsed, 2),
-            "span_sec": round(span, 2),
-            "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
-            "mode": f"同步连拍(拍完{DURATION_SEC}s,共{total}张)",
-            "files": batch,
-            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        self._capture_running.clear()
         self._capture_done.set()
+
 
     def _format_filename(self, prefix="Image"):
         ts = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S-%f")[:-3]
