@@ -20,8 +20,12 @@ ROUTING = {
 
 
 def route_algorithm(model_ascii: str) -> str:
-    """返回算法 key：'9X' / '8X' / 'future'（未匹配任何已知规则）。"""
-    m = (model_ascii or "").upper()
+    """返回算法 key：'9X' / '8X' / 'future'（未匹配任何已知规则）。
+
+    先 strip 前后空白（PLC ASCII 字段常为定长、可能带前导/尾随空格，
+    如 ' MM*'），否则 startswith 前缀匹配失败、把本应识别的车型误判为未接入。
+    """
+    m = (model_ascii or "").strip().upper()
     for prefix, key in ROUTING.items():
         if m.startswith(prefix):
             return key

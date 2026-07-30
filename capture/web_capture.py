@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-30-manual-trace"  # 手动拍照自证化:落盘写manifest+返回绝对路径+0张明确报错;连拍封顶相机6fps(不解锁48fps压垮链路)
+VERSION = "2026-07-30-auto-route-fix"  # 自动触发:车型路由去空白;区分拍照失败/车型未接入(根除误导日志);检测列标注未接入;连拍封顶相机6fps
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -958,16 +958,20 @@ def handle_car_signal(ctx):
     # 车型路由：决定是否需要拍照（9X/8X 且 NO_Paint=0）
     from detection.router import route_algorithm
     key = route_algorithm(model)
-    captured = (key in ("9X", "8X")) and (not no_paint)
+    should_capture = (key in ("9X", "8X")) and (not no_paint)
 
     # 仅需要拍照的车才占相机（统一用出车信号触发）
     files = []
-    if captured:
+    captured = False
+    capture_err = None
+    if should_capture:
         cap = hub.request_capture_all()
         files = cap.get("primary_files", [])
-        if not files:
-            print(f"[自动] 拍照失败：{cap.get('primary_result', cap)}")
-            captured = False   # 拍照失败则按未拍照记录
+        if files:
+            captured = True
+        else:
+            capture_err = cap.get("primary_result", cap)
+            print(f"[自动] 拍照失败（相机未出图/连接异常）: {capture_err}")
 
     # 当前所有车型仅拍照存档，不跑检测——等算法就绪后再接入。
     # 届时 9X(MM**)→SealDetector，8X(NM41/NM42)→对应检测器，替换此段即可。
@@ -1012,14 +1016,16 @@ def handle_car_signal(ctx):
     hub.last_auto = {"ts": ts, "skid": skid, "model": model,
                      "ok": True, "captured": captured}
 
-    # 打印
+    # 打印（action 必须区分三种情况，避免把"相机0帧"误显示为"车型未接入"）
     if captured:
         action = f"拍{len(files)}张"
+    elif capture_err is not None:
+        action = "拍照失败（相机未出图/连接异常）"
     elif no_paint:
         action = "免检跳过（不拍照）"
     else:
-        action = f"车型未接入({key})跳过"
-    print(f"[自动] 车 滑橇={skid} 车型={model}({key}) NO_Paint={no_paint} "
+        action = f"车型未接入({key})跳过（非9X/8X或PLC车型码未匹配route）"
+    print(f"[自动] 车 滑橇={skid} 车型={model!r}({key}) NO_Paint={no_paint} "
           f"→ {action} 库={'已写' if db_ok else '失败'}")
 
 
@@ -1158,7 +1164,7 @@ def index():
   <div class="meta" id="meta"></div>
   <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
   <table class="ctab"><thead><tr>
-    <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测</th>
+    <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测(未接入)</th>
   </tr></thead><tbody id="carbody">
     <tr><td colspan="7" class="meta">手动模式</td></tr>
   </tbody></table>
@@ -1183,7 +1189,7 @@ function refreshStatus(){{
       plcstate.textContent='● PLC自动';plcstate.style.background='#2d6cdf';
       let rows=(s.recent_cars||[]).map(c=>{{
         let ph=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
-        let dt=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
+        let dt='<span class="no">未接入</span>';
         return `<tr><td>${{c.ts}}</td><td>${{c.model}}</td><td>${{c.skid}}</td>`
           +`<td>${{c.pin}}</td><td>${{c.no_paint?'<span class="no">是</span>':'<span class="yes">否</span>'}}</td>`
           +`<td>${{ph}}</td><td>${{dt}}</td></tr>`;
