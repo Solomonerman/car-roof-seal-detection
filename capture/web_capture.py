@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-29-cam-rate-diag"  # 连接时读取并解除相机帧率限速(占位/UserSet/包大小)，自由运行+软件节流3fps  # 直接同步连拍(治本)+硬件时间戳铁证+入库文件名带版本+出图率自测
+VERSION = "2026-07-29-cam-rate-cap6"  # 连接时读取帧率/曝光/包大小;封顶相机产出6fps(不解锁48fps压垮链路),软件节流3fps  # 直接同步连拍(治本)+硬件时间戳铁证+入库文件名带版本+出图率自测
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -412,10 +412,17 @@ class CameraStreamer:
         self._conf_log = conf_log
 
     def _camera_rate_check(self, nodemap, conf_log):
-        """Read rate-limiting camera params, print them, and lift any artificial
-        frame-rate cap so the camera runs free (software 3fps throttle takes over).
-        Called at connect time. Safe: never opens a frame-rate lock without a valid
-        value (that froze the camera before); only disables an existing cap."""
+        """Read rate-limiting camera params and CAP the camera at a network-safe
+        production rate >= our 3fps target. Called at connect time.
+
+        关键教训（现场复现）：本机 aca1920-48gm 上单数 'AcquisitionFrameRate' 是占位
+        节点（not available），但 'AcquisitionFrameRateEnable' + 'AcquisitionFrameRateAbs'
+        可用。最初版本把 Enable 关掉 -> 相机解锁成原生 48fps 自由运行，现场 1Gbps 链路
+        在 48fps 的极高包速率下取图超时（RetrieveResult 失败）。所以这里**绝不解锁到
+        48fps**，而是用 Enable+Abs 把相机产出封顶到一个网络可承受的安全值（SAFE_FPS），
+        软件仍按 3fps 节流取图。这样既能 >=3fps，又不压垮网卡。
+
+        诊断行**立即 print**，即使后续 RetrieveResult 失败也能看到相机真实参数。"""
         try:
             def _gv(name, attr="Value"):
                 n = nodemap.GetNode(name)
@@ -435,34 +442,49 @@ class CameraStreamer:
             exp_us = _gv("ExposureTimeAbs")
             pkt = _gv("GevSCPSPacketSize")
             thr = _gv("DeviceLinkThroughputLimit")
-            conf_log.append(
-                f"cam-diag: FrameRateEnable={fr_en} FrameRateAbs={fr_abs}fps(max={fr_max}) "
-                f"Exposure={exp_us}us PacketSize={pkt} ThroughputLimit={thr}")
-            SAFE_FPS = 30.0
+            line = (f"cam-diag: FrameRateEnable={fr_en} FrameRateAbs={fr_abs}fps(max={fr_max}) "
+                    f"Exposure={exp_us}us PacketSize={pkt} ThroughputLimit={thr}")
+            conf_log.append(line)
+            print("[cam-diag]", line)  # 立即打印：即使取图失败也要能看到真实参数
+
+            # 安全封顶：相机产出 SAFE_FPS，软件按 3fps 取（留余量且不压垮网卡）。
+            # 现场 1Gbps 链路在 48fps 下取图失败，6fps 远在其可承受范围内且 >=3fps。
+            SAFE_FPS = 6.0
             fixed = []
-            if fr_en is True and (fr_abs is None or fr_abs < SAFE_FPS):
-                try:
-                    nodemap.GetNode("AcquisitionFrameRateEnable").SetValue(False)
-                    fixed.append(f"FrameRateEnable True->False (was {fr_abs}fps)")
-                except Exception:
-                    if fr_max:
-                        try:
-                            nodemap.GetNode("AcquisitionFrameRateAbs").SetValue(fr_max)
-                            fixed.append(f"FrameRateAbs -> {fr_max}fps (max)")
-                        except Exception as e:
-                            fixed.append(f"unlock failed: {e}")
-            if pkt is not None and 0 < pkt < 8192:
-                try:
-                    nodemap.GetNode("GevSCPSPacketSize").SetValue(8192)
-                    fixed.append(f"GigE PacketSize {pkt}->8192")
-                except Exception:
-                    pass
-            if fixed:
-                conf_log.append("cam-diag FIX applied: " + "; ".join(fixed))
+            n_abs = nodemap.GetNode("AcquisitionFrameRateAbs")
+            n_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+            if n_abs is None or n_en is None:
+                # 占位相机：帧率节点不可用，保持相机默认模式（不强行改）
+                conf_log.append("cam-diag: 帧率节点不可用(占位)，保持相机默认模式")
+                print("[cam-diag] 帧率节点不可用(占位)，保持相机默认模式")
+            elif fr_en is True:
+                # 已开帧率锁定：若当前低于安全值则抬高到 SAFE_FPS（保持 enable）
+                if fr_abs is None or fr_abs < SAFE_FPS:
+                    try:
+                        n_abs.SetValue(SAFE_FPS)
+                        fixed.append(f"FrameRateAbs {fr_abs}->{SAFE_FPS}fps (keep enabled)")
+                    except Exception as e:
+                        fixed.append(f"FrameRateAbs set failed: {e}")
             else:
-                conf_log.append("cam-diag: no change needed (camera not rate-limited)")
+                # 当前自由运行(≈48fps) -> 封顶到 SAFE_FPS，避免压垮链路
+                try:
+                    n_abs.SetValue(SAFE_FPS)
+                    n_en.SetValue(True)
+                    fixed.append(f"free-run capped -> {SAFE_FPS}fps (was free ~48fps)")
+                except Exception as e:
+                    fixed.append(f"cap failed: {e}")
+            # 注：GigE 包大小不再自动改成 8192——现场未确认开启巨帧(Jumbo Frame)，
+            # 8192 会直接压垮取图。保持相机原有包大小（默认即可用）。
+            if fixed:
+                msg = "cam-diag FIX applied: " + "; ".join(fixed)
+                conf_log.append(msg)
+                print("[cam-diag]", msg)
+            elif n_abs is not None:
+                conf_log.append("cam-diag: no change needed (rate already safe)")
+                print("[cam-diag] no change needed (rate already safe)")
         except Exception as e:
             conf_log.append(f"cam-diag error (ignored): {e}")
+            print("[cam-diag] error (ignored):", e)
 
     def start(self):
         # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
