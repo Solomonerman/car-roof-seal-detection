@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-30-exec-log"  # 新增持久执行日志data/capture_exec.log(手动按下/PLC上升沿/连拍21帧·相机是否出图);_do_capture改try/finally根除死锁
+VERSION = "2026-07-30-auto-route-fix"  # 自动触发:车型路由去空白;区分拍照失败/车型未接入(根除误导日志);检测列标注未接入;连拍封顶相机6fps
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -173,32 +173,6 @@ INSPECTION_ROOT = os.path.join(ROOT, "data", "inspection")  # 最终存储根(�
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
 RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON(非拍照车兜底)
 
-# ===================== 执行追溯日志（持久化到磁盘）=====================
-# 用途：PLC 监控软件本身不留存历史，现场无法确认“到底有没有收到信号/执行了没有/相机有没有出图”。
-# 本日志把【手动按钮按下 / PLC 上升沿收到车信号 / 连拍完成(21帧·相机是否出图·落盘路径)】全部按行写入磁盘，
-# 每行一个 JSON（含 summary 便于人眼扫读），可随时 cat/grep 回溯，不依赖易失的终端与网页 UI。
-CAPTURE_EXEC_LOG = os.path.join(ROOT, "data", "capture_exec.log")
-_exec_log_lock = threading.Lock()
-
-def log_capture_event(**fields):
-    """追加写入一条捕获执行事件到持久日志（append 模式，线程安全）。
-
-    每行一个 JSON 对象；额外带 summary 字段便于人眼直接扫读。
-    失败不影响主流程（仅告警），保证“执行记录”绝不因日志异常而丢失主任务。
-    """
-    try:
-        evt = {"ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
-        evt.update(fields)
-        line = json.dumps(evt, ensure_ascii=False)
-        with _exec_log_lock:
-            with open(CAPTURE_EXEC_LOG, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-        return line
-    except Exception as e:
-        print(f"[执行日志] 写盘失败(可忽略): {e}")
-        return None
-
 # ===================== 预览参数 =====================
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
 JPEG_QUALITY = 80            # 实时流 JPEG 质量（1-100，越小越流畅但越糊）
@@ -291,7 +265,6 @@ class CameraStreamer:
         self._last_cam_ts = None        # last camera hw-ts (plan A dedup on new exposures)
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
-        self._capture_source = "manual"         # 本次连拍来源: manual(网页手动) / auto(PLC自动)
 
         self._thread = None
         self._error = None
@@ -636,181 +609,146 @@ class CameraStreamer:
         total = int(FPS * DURATION_SEC)      # 21
         frame_interval = 1.0 / FPS           # 0.333...s
         identical = False
-        # 提前初始化，保证 finally 中无论是否异常都能落盘执行日志
-        batch = []              # 循环内填充
-        unique_hashes = 0
-        distinct_cam_ts = 0
-        elapsed = 0.0
-        try:
 
-            t_trigger = time.perf_counter()
-            t_trigger_dt = datetime.datetime.now()
-            t0 = t_trigger
-    
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            print(f"[拍照] 手动连拍目标目录(绝对路径): {os.path.abspath(SAVE_DIR)}")
-            batch = []
-            saved_hashes = []
-            picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
-            # 单张抓取超时：333ms 节拍 + 1500ms 余量（防 OS sleep 抖动/相机偶发延迟）
-            timeout_ms = int(frame_interval * 1000) + 1500
-    
-            # 直接同步：第 i 张的目标时刻 = t_trigger + i*interval，第 0 张即触发瞬间
-            next_at = t_trigger
-            for i in range(total):
-                wait = next_at - time.perf_counter()
-                if wait > 0:
-                    time.sleep(wait)
-                actual_ts = time.perf_counter()
-                try:
-                    grab = self.cam.RetrieveResult(timeout_ms, py.TimeoutHandling_Return)
-                except Exception as e:
-                    print(f"[相机] 第{i+1}/{total}张取图异常: {e}")
-                    next_at += frame_interval
-                    continue
-                if not grab or not grab.GrabSucceeded():
-                    if grab:
-                        grab.Release()
-                    print(f"[相机] 第{i+1}/{total}张取图失败(超时/相机未出图)")
-                    next_at += frame_interval
-                    continue
-                frame = _grab_to_frame(grab)   # 独立深拷贝，杜绝 21 张全同
-                # camera hardware timestamp: iron proof of whether this is a new exposure.
-                # MUST be read before Release().
-                try:
-                    cam_ts = grab.GetTimeStamp()
-                except Exception:
-                    cam_ts = None
-                grab.Release()
-    
-                target_ts = t_trigger + i * frame_interval
-                delta_ms = (actual_ts - target_ts) * 1000.0
-                picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame, cam_ts))
-    
-                # 边抓边存：每抓一张立即写盘，避免 21 张攒一起写超时丢帧
-                frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
-                fname = self._format_filename(idx=i + 1, dt=frame_dt)
-                fpath = os.path.join(SAVE_DIR, fname)
-                cv2.imwrite(fpath, frame)
-                batch.append(fname)
-                saved_hashes.append(_frame_hash(frame))
-    
+        t_trigger = time.perf_counter()
+        t_trigger_dt = datetime.datetime.now()
+        t0 = t_trigger
+
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        print(f"[拍照] 手动连拍目标目录(绝对路径): {os.path.abspath(SAVE_DIR)}")
+        batch = []
+        saved_hashes = []
+        picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
+        # 单张抓取超时：333ms 节拍 + 1500ms 余量（防 OS sleep 抖动/相机偶发延迟）
+        timeout_ms = int(frame_interval * 1000) + 1500
+
+        # 直接同步：第 i 张的目标时刻 = t_trigger + i*interval，第 0 张即触发瞬间
+        next_at = t_trigger
+        for i in range(total):
+            wait = next_at - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            actual_ts = time.perf_counter()
+            try:
+                grab = self.cam.RetrieveResult(timeout_ms, py.TimeoutHandling_Return)
+            except Exception as e:
+                print(f"[相机] 第{i+1}/{total}张取图异常: {e}")
                 next_at += frame_interval
-    
-            elapsed = time.perf_counter() - t0
-    
-            # ========== 诊断日志 ==========
-            unique_hashes = len(set(saved_hashes))
-            identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
-            # camera hardware timestamp diagnostic: iron proof that 21 frames are new exposures
-            cam_ts_list = [m[5] for m in picked_meta]
-            distinct_cam_ts = len(set(cam_ts_list))
-            print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=p{VERSION_TAG} =====")
-            print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
-                  f"总耗时={elapsed:.2f}s")
-            if identical:
-                print(f"[相机] 逐帧去重: ⚠️ 全部相同!  → 相机未持续出图 或 场景完全静止(无车经过)")
-                print(f"[相机] ❌ 请查看启动日志 [相机] 出图率自测 的唯一帧/fps 判断相机端状态。")
-            elif len(saved_hashes) == 0:
-                print(f"[相机] 逐帧去重: ❌ 0张取到 → 相机无响应/未出图，检查连接与 TriggerMode=Off")
-            elif unique_hashes == len(saved_hashes):
-                print(f"[相机] 逐帧去重: ✓ 各不相同")
-            else:
-                print(f"[相机] 逐帧去重: 部分重复")
-            # ---- camera hardware timestamp verdict (the key iron proof) ----
-            if None not in cam_ts_list and distinct_cam_ts <= 1:
-                print(f'[cam] HARDWARE TS ALL EQUAL ({distinct_cam_ts}) -> camera produced NO new frames (frozen / no trigger / TriggerMode not Off)')
-            elif distinct_cam_ts == len(cam_ts_list):
-                print(f'[cam] HARDWARE TS: OK {distinct_cam_ts}/{len(cam_ts_list)} all distinct -> 21 frames are genuine new exposures')
-            else:
-                print(f'[cam] HARDWARE TS: partial repeats ({distinct_cam_ts}/{len(cam_ts_list)})')
-            # per-frame hw-ts
-            for idx, target_ts, actual_ts, delta_ms, _f, cam_ts in picked_meta:
-                offset_s = target_ts - t_trigger
-                print(f'[cam] frame {idx:02d}/{total} target_off={offset_s*1000:6.1f}ms delta={delta_ms:+6.1f}ms hw_ts={cam_ts}')
-    
-                offset_s = target_ts - t_trigger
-                print(f"[相机] 第{idx:02d}/{total}张 目标偏移={offset_s*1000:6.1f}ms 实际偏差={delta_ms:+6.1f}ms")
-            if len(picked_meta) >= 2:
-                ivs = [(picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0 for j in range(1, len(picked_meta))]
-                avg = sum(ivs)/len(ivs); mn = min(ivs); mx = max(ivs)
-                print(f"[相机] 间隔: 平均={avg:.1f}ms 最小={mn:.1f}ms 最大={mx:.1f}ms (目标={frame_interval*1000:.1f}ms)")
-            print(f"[相机] ===== 统计结束 =====")
-    
-            span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
-            abs_files = [os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch]
-            cap_ok = (len(batch) > 0)
-            self._last_result = {
+                continue
+            if not grab or not grab.GrabSucceeded():
+                if grab:
+                    grab.Release()
+                print(f"[相机] 第{i+1}/{total}张取图失败(超时/相机未出图)")
+                next_at += frame_interval
+                continue
+            frame = _grab_to_frame(grab)   # 独立深拷贝，杜绝 21 张全同
+            # camera hardware timestamp: iron proof of whether this is a new exposure.
+            # MUST be read before Release().
+            try:
+                cam_ts = grab.GetTimeStamp()
+            except Exception:
+                cam_ts = None
+            grab.Release()
+
+            target_ts = t_trigger + i * frame_interval
+            delta_ms = (actual_ts - target_ts) * 1000.0
+            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame, cam_ts))
+
+            # 边抓边存：每抓一张立即写盘，避免 21 张攒一起写超时丢帧
+            frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
+            fname = self._format_filename(idx=i + 1, dt=frame_dt)
+            fpath = os.path.join(SAVE_DIR, fname)
+            cv2.imwrite(fpath, frame)
+            batch.append(fname)
+            saved_hashes.append(_frame_hash(frame))
+
+            next_at += frame_interval
+
+        elapsed = time.perf_counter() - t0
+
+        # ========== 诊断日志 ==========
+        unique_hashes = len(set(saved_hashes))
+        identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
+        # camera hardware timestamp diagnostic: iron proof that 21 frames are new exposures
+        cam_ts_list = [m[5] for m in picked_meta]
+        distinct_cam_ts = len(set(cam_ts_list))
+        print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=p{VERSION_TAG} =====")
+        print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
+              f"总耗时={elapsed:.2f}s")
+        if identical:
+            print(f"[相机] 逐帧去重: ⚠️ 全部相同!  → 相机未持续出图 或 场景完全静止(无车经过)")
+            print(f"[相机] ❌ 请查看启动日志 [相机] 出图率自测 的唯一帧/fps 判断相机端状态。")
+        elif len(saved_hashes) == 0:
+            print(f"[相机] 逐帧去重: ❌ 0张取到 → 相机无响应/未出图，检查连接与 TriggerMode=Off")
+        elif unique_hashes == len(saved_hashes):
+            print(f"[相机] 逐帧去重: ✓ 各不相同")
+        else:
+            print(f"[相机] 逐帧去重: 部分重复")
+        # ---- camera hardware timestamp verdict (the key iron proof) ----
+        if None not in cam_ts_list and distinct_cam_ts <= 1:
+            print(f'[cam] HARDWARE TS ALL EQUAL ({distinct_cam_ts}) -> camera produced NO new frames (frozen / no trigger / TriggerMode not Off)')
+        elif distinct_cam_ts == len(cam_ts_list):
+            print(f'[cam] HARDWARE TS: OK {distinct_cam_ts}/{len(cam_ts_list)} all distinct -> 21 frames are genuine new exposures')
+        else:
+            print(f'[cam] HARDWARE TS: partial repeats ({distinct_cam_ts}/{len(cam_ts_list)})')
+        # per-frame hw-ts
+        for idx, target_ts, actual_ts, delta_ms, _f, cam_ts in picked_meta:
+            offset_s = target_ts - t_trigger
+            print(f'[cam] frame {idx:02d}/{total} target_off={offset_s*1000:6.1f}ms delta={delta_ms:+6.1f}ms hw_ts={cam_ts}')
+
+            offset_s = target_ts - t_trigger
+            print(f"[相机] 第{idx:02d}/{total}张 目标偏移={offset_s*1000:6.1f}ms 实际偏差={delta_ms:+6.1f}ms")
+        if len(picked_meta) >= 2:
+            ivs = [(picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0 for j in range(1, len(picked_meta))]
+            avg = sum(ivs)/len(ivs); mn = min(ivs); mx = max(ivs)
+            print(f"[相机] 间隔: 平均={avg:.1f}ms 最小={mn:.1f}ms 最大={mx:.1f}ms (目标={frame_interval*1000:.1f}ms)")
+        print(f"[相机] ===== 统计结束 =====")
+
+        span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
+        abs_files = [os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch]
+        cap_ok = (len(batch) > 0)
+        self._last_result = {
+            "ok": cap_ok,
+            "saved": len(batch),
+            "unique_frames": unique_hashes,
+            "distinct_cam_ts": distinct_cam_ts,
+            "identical": identical,
+            "total": total,
+            "elapsed": round(elapsed, 2),
+            "span_sec": round(span, 2),
+            "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
+            "mode": f"直接同步连拍({DURATION_SEC}s/{total}张,不依赖ring)",
+            "files": batch,
+            "abs_files": abs_files,
+            "save_dir": os.path.abspath(SAVE_DIR),
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # 自证式落盘记录：即使 0 张也写，便于现场确认"是没抓到帧而非存错地方"
+        try:
+            manifest = {
                 "ok": cap_ok,
                 "saved": len(batch),
+                "total": total,
                 "unique_frames": unique_hashes,
                 "distinct_cam_ts": distinct_cam_ts,
                 "identical": identical,
-                "total": total,
-                "elapsed": round(elapsed, 2),
-                "span_sec": round(span, 2),
-                "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
-                "mode": f"直接同步连拍({DURATION_SEC}s/{total}张,不依赖ring)",
-                "files": batch,
-                "abs_files": abs_files,
                 "save_dir": os.path.abspath(SAVE_DIR),
-                "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "abs_files": abs_files,
+                "ts": self._last_result["ts"],
             }
-            # 自证式落盘记录：即使 0 张也写，便于现场确认"是没抓到帧而非存错地方"
-            try:
-                manifest = {
-                    "ok": cap_ok,
-                    "saved": len(batch),
-                    "total": total,
-                    "unique_frames": unique_hashes,
-                    "distinct_cam_ts": distinct_cam_ts,
-                    "identical": identical,
-                    "save_dir": os.path.abspath(SAVE_DIR),
-                    "abs_files": abs_files,
-                    "ts": self._last_result["ts"],
-                }
-                with open(os.path.join(SAVE_DIR, "_last_manual_capture.json"), "w", encoding="utf-8") as mf:
-                    json.dump(manifest, mf, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[拍照] 写 manifest 失败(可忽略): {e}")
-            if cap_ok:
-                print(f"[拍照] 已落盘 {len(batch)} 张 -> {os.path.abspath(SAVE_DIR)}")
-                print(f"[拍照] 首张: {abs_files[0]}")
-                print(f"[拍照] 末张: {abs_files[-1]}")
-            else:
-                print(f"[拍照] ❌ 本次连拍 0 张有效帧，未写入任何文件(相机未出图/连接已断)。")
-                print(f"[拍照]   排查: 看启动日志 [相机] 出图率自测 的 fps/唯一帧；确认网口未掉流。")
-            # ========== 持久执行日志（作答"到底执行了没有 / 相机有没有出图"）==========
-            # 写在 finally 中：无论连拍成功还是中途异常，都保证落盘 + 清除运行标志(根除死锁)。
+            with open(os.path.join(SAVE_DIR, "_last_manual_capture.json"), "w", encoding="utf-8") as mf:
+                json.dump(manifest, mf, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"[拍照] 连拍过程异常(已记日志并放行): {e}")
-            self._last_result = {
-                "ok": False, "error": str(e), "saved": len(batch),
-                "total": total, "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        finally:
-            try:
-                log_capture_event(
-                    type="capture_done",
-                    source=self._capture_source,          # manual(网页手动) / auto(PLC自动)
-                    ok=(len(batch) > 0),
-                    saved=len(batch),
-                    total=total,
-                    unique_frames=unique_hashes,
-                    distinct_cam_ts=distinct_cam_ts,
-                    identical=identical,
-                    camera_received_signal=(distinct_cam_ts > 1 or (len(batch) > 0 and distinct_cam_ts >= 1)),
-                    elapsed_sec=round(elapsed, 2),
-                    save_dir=os.path.abspath(SAVE_DIR),
-                    files=[os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch[:5]],
-                    summary=(f"连拍完成(source={self._capture_source}) 实存{len(batch)}/{total}张 "
-                             f"唯一帧{unique_hashes} 相机硬件TS不同帧={distinct_cam_ts} "
-                             f"{'相机已出图' if len(batch) > 0 else '相机未出图/未收到信号'}"),
-                )
-            except Exception:
-                pass
-            self._capture_running.clear()
-            self._capture_done.set()
+            print(f"[拍照] 写 manifest 失败(可忽略): {e}")
+        if cap_ok:
+            print(f"[拍照] 已落盘 {len(batch)} 张 -> {os.path.abspath(SAVE_DIR)}")
+            print(f"[拍照] 首张: {abs_files[0]}")
+            print(f"[拍照] 末张: {abs_files[-1]}")
+        else:
+            print(f"[拍照] ❌ 本次连拍 0 张有效帧，未写入任何文件(相机未出图/连接已断)。")
+            print(f"[拍照]   排查: 看启动日志 [相机] 出图率自测 的 fps/唯一帧；确认网口未掉流。")
+        self._capture_running.clear()
+        self._capture_done.set()
 
 
 
@@ -822,12 +760,8 @@ class CameraStreamer:
         # 文件名带版本短号 p{VERSION_TAG}，现场一眼即可确认是否跑了最新程序
         return f"{prefix}{idx_part}__p{VERSION_TAG}__{ts}{SAVE_EXT}"
 
-    def request_capture(self, source="manual"):
-        """外部触发连拍，阻塞直到完成，返回结果 dict。
-
-        source: "manual"(网页手动按钮) / "auto"(PLC 自动触发)，记录到执行日志。
-        """
-        self._capture_source = source
+    def request_capture(self):
+        """外部触发连拍，阻塞直到完成，返回结果 dict。"""
         if not self.running:
             return {"ok": False, "error": "相机未运行"}
         self._capture_done.clear()
@@ -965,7 +899,7 @@ class CameraHub:
         """手动按钮用：返回主相机连拍结果 dict（含 files/saved/...）。"""
         if not self.streamers:
             return {"ok": False, "error": "相机未运行"}
-        return self.streamers[0].request_capture(source="manual")
+        return self.streamers[0].request_capture()
 
     def request_capture_all(self):
         """自动触发用：触发全部相机，返回主相机文件列表 + 各相机结果。"""
@@ -973,7 +907,7 @@ class CameraHub:
         primary_files = []
         primary_result = None
         for ip, s in zip(self.ips, self.streamers):
-            r = s.request_capture(source="auto")
+            r = s.request_capture()
             by_camera[ip] = r
             if ip == self.primary_ip:
                 primary_files = r.get("files", [])
@@ -1025,20 +959,6 @@ def handle_car_signal(ctx):
     from detection.router import route_algorithm
     key = route_algorithm(model)
     should_capture = (key in ("9X", "8X")) and (not no_paint)
-
-    # 持久记录"PLC 出车信号上升沿已被收到"——PLC 监控软件不留存历史，
-    # 此条证明信号抵达程序、并记录车型/滑橇/PIN/免喷/路由决策，便于现场回溯"到底有没有收到"。
-    log_capture_event(
-        type="auto_rising_edge",
-        source="auto",
-        skid=skid, model=model, model_key=key, pin=pin,
-        no_paint=bool(no_paint),
-        should_capture=bool(should_capture),
-        decision=("触发拍照" if should_capture else
-                  ("免检跳过(不拍照)" if no_paint else f"车型未接入({key})跳过")),
-        summary=(f"PLC上升沿已收到 滑橇={skid} 车型={model!r}({key}) "
-                 f"NO_Paint={no_paint} → {'触发拍照' if should_capture else '不拍照'}"),
-    )
 
     # 仅需要拍照的车才占相机（统一用出车信号触发）
     files = []
@@ -1331,13 +1251,6 @@ def api_capture():
     if not hub.running:
         return jsonify({"ok": False, "error": "相机未运行"})
     # 手动按钮：纯拍照（不检测、不入库），用于远程盯屏调试/补拍
-    # 持久记录"网页手动按钮已按下"——PLC 监控不留存历史，此条证明手动触发已被程序收到
-    log_capture_event(
-        type="manual_trigger",
-        source="manual",
-        note="网页手动拍照按钮按下",
-        summary="网页手动拍照按钮已收到(开始连拍 21 张 / 7 秒)",
-    )
     result = hub.request_capture_primary()
     _prune_scratch()   # 手动调试图也兜底清理，防磁盘涨满
     if result.get("ok"):
