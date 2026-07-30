@@ -3,11 +3,13 @@
 
 设计要点：
   - 全程仅 read_area，绝不 write_area / db_write / plc_stop / download。
-  - 监测 DB130.DBX0.1（输送出车信号）上升沿；
-  - 因 PLC 在出车信号后清零 DB230，故采用【先锁存、后回调】：
-    后台线程持续采样 DB230，仅在非空时更新 self.latched；
-    上升沿优先再读一次（数据可能尚未清零），为空则回退已锁存值，
-    再把锁存的车号上下文通过 on_rising(ctx) 回调出去。
+  - 触发策略：以【新车上下文出现】为触发条件，而非依赖 DB130.DBX0.1 上升沿。
+    原因：相机连拍 21 张需约 7 秒，期间下一辆车会覆盖 DB230 的车型/滑橇/PIN；
+    若等上升沿再去读，读到的已是下一台车，导致本台车（如 MM**）漏拍或张冠李戴。
+  - 采用【首次采到即锁存、立即触发】：后台线程持续采样 DB230，仅在非空时更新
+    self.latched；一旦 self.latched 出现"与上次不同的新车"，立刻 dict 拷贝锁存并
+    通过 on_rising(ctx) 回调出去——此时上下文还是本台车，尚未被下一台覆盖。
+  - bit1 仍持续读取用于健康观测，但不再作为唯一触发条件。
 
 ctx 结构（dict）：
   {"no_paint": int(0/1), "skid": int, "model_int": int,
@@ -85,6 +87,7 @@ class PlcMonitor:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.latched = None          # 最近一次“非空”的 DB230 上下文
+        self._last_car_key = None    # 已触发过的车标识(skid,pin,model)，用于新车去重触发
         self._thread = None
         self.connected = False       # 健康态：供 UI/日志观测（断线重连期间为 False）
 
@@ -156,20 +159,21 @@ class PlcMonitor:
                     print(f"[PLC] 读上下文失败: {e}")
                     # 上下文采样失败不致命，继续轮询，下次再采
 
-            # 上升沿：优先再读一次（数据可能尚未清零），为空则回退锁存值
-            if bit == 1 and prev == 0:
-                try:
-                    a = bytes(self.client.read_area(S7AreaDB, *DB230_A))
-                    b = bytes(self.client.read_area(S7AreaDB, *DB230_B))
-                    self._maybe_latch(parse_context(a, b))
-                except Exception:
-                    pass
-                with self._lock:
-                    snap = dict(self.latched) if self.latched else None
-                try:
-                    on_rising(snap)
-                except Exception as e:
-                    print(f"[PLC] 回调异常: {e}")
+            # 触发策略（关键修复）：以"新车上下文出现"为准，而非依赖 bit1 上升沿。
+            # 相机拍 21 张需约 7 秒，期间下一台车会覆盖 DB230 的车型/滑橇/PIN；
+            # 若等上升沿再去读，读到的已是下一台车。故在【首次采到新车】即锁存(dict
+            # 拷贝)并触发，确保后续判断/拍照/落库都用本台车正确上下文，不被覆盖。
+            with self._lock:
+                lat = self.latched
+            if lat:
+                key = (lat["skid"], lat["pin"], lat["model"])
+                if key != self._last_car_key:
+                    self._last_car_key = key
+                    snap = dict(lat)      # 锁存于首次出现，先于被下一台车覆盖
+                    try:
+                        on_rising(snap)
+                    except Exception as e:
+                        print(f"[PLC] 回调异常: {e}")
 
             prev = bit
             time.sleep(poll_s)

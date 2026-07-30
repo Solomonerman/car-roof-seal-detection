@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-30-auto-route-fix"  # 自动触发:车型路由去空白;区分拍照失败/车型未接入(根除误导日志);检测列标注未接入;连拍封顶相机6fps
+VERSION = "2026-07-30-latch-trigger"  # 修复:自动触发改为"新车上下文出现即锁存触发"(不再等上升沿去读被覆盖的DB230);收到车信号写data/capture_exec.log追溯
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -172,6 +172,31 @@ SAVE_DIR = os.path.join(ROOT, "data", "raw_images")      # 预触发临时缓冲
 INSPECTION_ROOT = os.path.join(ROOT, "data", "inspection")  # 最终存储根(按 日期/PIN 分层)
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
 RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON(非拍照车兜底)
+
+# ===================== 收到车信号追溯日志（持久化到磁盘）=====================
+# 用途：PLC 上下文(DB230 车型/滑橇/PIN)在相机 7 秒连拍期间会被下一台车覆盖，
+# 本日志在【锁存收到车的瞬间】落盘，记录每台被程序收到的车(车型/滑橇/PIN/免喷/路由决策)，
+# 即便之后被覆盖，这里也有完整追溯——直接回答"MM** 信号到底收到没有、被谁覆盖"。
+CAPTURE_EXEC_LOG = os.path.join(ROOT, "data", "capture_exec.log")
+_exec_log_lock = threading.Lock()
+
+def log_capture_event(**fields):
+    """追加写入一条收到车/拍照事件到持久日志（append 模式，线程安全，每行一个 JSON）。
+
+    失败不影响主流程（仅告警），保证"收到车信号"的追溯绝不因日志异常而丢失。
+    """
+    try:
+        evt = {"ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+        evt.update(fields)
+        line = json.dumps(evt, ensure_ascii=False)
+        with _exec_log_lock:
+            with open(CAPTURE_EXEC_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+        return line
+    except Exception as e:
+        print(f"[执行日志] 写盘失败(可忽略): {e}")
+        return None
 
 # ===================== 预览参数 =====================
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
@@ -959,6 +984,20 @@ def handle_car_signal(ctx):
     from detection.router import route_algorithm
     key = route_algorithm(model)
     should_capture = (key in ("9X", "8X")) and (not no_paint)
+
+    # 持久记录"收到车信号"——PLC 上下文在 7 秒连拍期间会被下一台车覆盖，
+    # 此处在该车被锁存收到的瞬间落盘，确保 MM** 等信号有完整追溯(车型/滑橇/PIN/决策)。
+    log_capture_event(
+        type="car_received",
+        source="plc_auto",
+        skid=skid, model=model, model_key=key, pin=pin,
+        no_paint=bool(no_paint),
+        should_capture=bool(should_capture),
+        decision=("触发拍照" if should_capture else
+                  ("免检跳过(不拍照)" if no_paint else f"车型未接入({key})跳过")),
+        summary=(f"收到车信号 滑橇={skid} 车型={model!r}({key}) "
+                 f"NO_Paint={no_paint} → {'触发拍照' if should_capture else '不拍照'}"),
+    )
 
     # 仅需要拍照的车才占相机（统一用出车信号触发）
     files = []
