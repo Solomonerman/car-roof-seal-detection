@@ -40,7 +40,7 @@ import hashlib
 import collections
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-29-cam-rate-cap6"  # 连接时读取帧率/曝光/包大小;封顶相机产出6fps(不解锁48fps压垮链路),软件节流3fps  # 直接同步连拍(治本)+硬件时间戳铁证+入库文件名带版本+出图率自测
+VERSION = "2026-07-30-manual-trace"  # 手动拍照自证化:落盘写manifest+返回绝对路径+0张明确报错;连拍封顶相机6fps(不解锁48fps压垮链路)
 
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
@@ -615,6 +615,7 @@ class CameraStreamer:
         t0 = t_trigger
 
         os.makedirs(SAVE_DIR, exist_ok=True)
+        print(f"[拍照] 手动连拍目标目录(绝对路径): {os.path.abspath(SAVE_DIR)}")
         batch = []
         saved_hashes = []
         picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
@@ -704,8 +705,10 @@ class CameraStreamer:
         print(f"[相机] ===== 统计结束 =====")
 
         span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
+        abs_files = [os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch]
+        cap_ok = (len(batch) > 0)
         self._last_result = {
-            "ok": True,
+            "ok": cap_ok,
             "saved": len(batch),
             "unique_frames": unique_hashes,
             "distinct_cam_ts": distinct_cam_ts,
@@ -716,8 +719,34 @@ class CameraStreamer:
             "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
             "mode": f"直接同步连拍({DURATION_SEC}s/{total}张,不依赖ring)",
             "files": batch,
+            "abs_files": abs_files,
+            "save_dir": os.path.abspath(SAVE_DIR),
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 自证式落盘记录：即使 0 张也写，便于现场确认"是没抓到帧而非存错地方"
+        try:
+            manifest = {
+                "ok": cap_ok,
+                "saved": len(batch),
+                "total": total,
+                "unique_frames": unique_hashes,
+                "distinct_cam_ts": distinct_cam_ts,
+                "identical": identical,
+                "save_dir": os.path.abspath(SAVE_DIR),
+                "abs_files": abs_files,
+                "ts": self._last_result["ts"],
+            }
+            with open(os.path.join(SAVE_DIR, "_last_manual_capture.json"), "w", encoding="utf-8") as mf:
+                json.dump(manifest, mf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[拍照] 写 manifest 失败(可忽略): {e}")
+        if cap_ok:
+            print(f"[拍照] 已落盘 {len(batch)} 张 -> {os.path.abspath(SAVE_DIR)}")
+            print(f"[拍照] 首张: {abs_files[0]}")
+            print(f"[拍照] 末张: {abs_files[-1]}")
+        else:
+            print(f"[拍照] ❌ 本次连拍 0 张有效帧，未写入任何文件(相机未出图/连接已断)。")
+            print(f"[拍照]   排查: 看启动日志 [相机] 出图率自测 的 fps/唯一帧；确认网口未掉流。")
         self._capture_running.clear()
         self._capture_done.set()
 
@@ -1178,10 +1207,13 @@ function capture(){{
   capBtn.disabled=true; capState.textContent='拍摄中…';
   fetch('/api/capture',{{method:'POST'}}).then(r=>r.json()).then(res=>{{
     if(res.ok){{
-      let line=`[${{res.ts}}] 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+res.files.map(f=>'  '+f).join('\\n');
+      let line=`[${{res.ts}}] 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
+               `已存到：${{res.save_dir}}\\n`+
+               (res.abs_files||res.files).slice(0,3).map(f=>'  '+f).join('\\n')+
+               ((res.abs_files||res.files).length>3?`\\n  ... 共 ${{(res.abs_files||res.files).length}} 张`:'');
       log.textContent=line+'\\n\\n'+log.textContent;
     }}else{{
-      log.textContent='[错误] '+(res.error||'未知错误')+'\\n'+log.textContent;
+      log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
     }}
     capState.textContent='';
     capBtn.disabled=false;
@@ -1215,6 +1247,14 @@ def api_capture():
     # 手动按钮：纯拍照（不检测、不入库），用于远程盯屏调试/补拍
     result = hub.request_capture_primary()
     _prune_scratch()   # 手动调试图也兜底清理，防磁盘涨满
+    if result.get("ok"):
+        print(f"[网页] 手动拍照完成: {result.get('saved')} 张 -> {result.get('save_dir')}")
+        for p in result.get("abs_files", [])[:3]:
+            print(f"[网页]   落盘: {p}")
+        if len(result.get("abs_files", [])) > 3:
+            print(f"[网页]   ... 共 {len(result.get('abs_files', []))} 张")
+    else:
+        print(f"[网页] 手动拍照失败: {result.get('error')} (saved={result.get('saved')})")
     return jsonify(result)
 
 
