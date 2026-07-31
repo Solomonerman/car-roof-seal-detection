@@ -326,6 +326,33 @@ class CameraStreamer:
             self.cam = py.InstantCamera(factory.CreateDevice(devices[0]))
 
         self.cam.Open()
+        # 【GigE 心跳-Open 后兜底】某些固件在 Open 后仍允许写入心跳参数;
+        # 节点只读时会静默跳过(走 self-heal 兜底)。日志打印实际结果便于现场核对。
+        try:
+            tl = self.cam.GetTLParamsNode()
+            if tl is not None:
+                try:
+                    hb = tl.GetNode("GevHeartbeatDisable")
+                    if hb is not None:
+                        try:
+                            hb.SetValue(True)
+                            print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True (Open后)")
+                        except Exception as _e:
+                            print(f"[cam-diag] GigE心跳禁用(Open后): 节点只读, 走自愈兜底 ({_e})")
+                except Exception:
+                    pass
+                try:
+                    hbt = tl.GetNode("GevHeartbeatTimeout")
+                    if hbt is not None:
+                        try:
+                            hbt.SetValue(60000)
+                            print("[cam-diag] GigE心跳超时: 已写入 60000ms (Open后)")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.camera_info = {
             "model": self.cam.GetDeviceInfo().GetModelName(),
             "serial": self.cam.GetDeviceInfo().GetSerialNumber(),
@@ -450,6 +477,37 @@ class CameraStreamer:
         except Exception as e:
             conf_log.append(f"触发模式末次强制异常: {e}")
             print("[cam-diag] 触发模式末次强制异常:", e)
+
+        # 【GigE 心跳修复】现场复现:程序启动后 ~140s 预览冻结、LIVE #帧号卡在 1。
+        # 根因：相机 GigE 心跳(默认约 3s 心跳包)超时后,固件会主动停止出图(无异常抛出),
+        #       pypylon RetrieveResult 一直 Return 而 GrabSucceeded=False,_loop 看似活着实则空转,
+        #       预览/JPEG 自然停滞。pylon View 短测不复现,因它不会长时间挂占。
+        # 修复：在 TransportLayer 节点上 **禁用 GigE 心跳**(GevHeartbeatDisable=True)，
+        #       让相机不再因网络静默而停采;叠加 _loop 中的"长时间无新帧→自动 StopGrabbing+StartGrabbing"
+        #       自愈兜底,即便心跳绕过仍有问题也能自动恢复。
+        try:
+            tl = self.cam.GetTLParamsNode()
+            if tl is not None:
+                try:
+                    hb = tl.GetNode("GevHeartbeatDisable")
+                    if hb is not None:
+                        hb.SetValue(True)
+                        conf_log.append("GigE心跳=禁用(防止长时间运行后被相机主动停采)")
+                        print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True")
+                except Exception as e:
+                    conf_log.append(f"GigE心跳禁用失败(可忽略): {e}")
+                    print(f"[cam-diag] GigE心跳禁用失败(可忽略): {e}")
+                # 把心跳超时也调大,作为二级保险
+                try:
+                    hbt = tl.GetNode("GevHeartbeatTimeout")
+                    if hbt is not None:
+                        hbt.SetValue(60000)  # 60s
+                        conf_log.append("GigE心跳超时=60000ms")
+                except Exception:
+                    pass
+        except Exception as e:
+            conf_log.append(f"TransportLayer 配置异常: {e}")
+
         self._conf_log = conf_log
 
     def _camera_rate_check(self, nodemap, conf_log):
@@ -600,9 +658,19 @@ class CameraStreamer:
 
         取流节拍匹配相机产出(48fps ≈ 21ms)，保证 DURATION_SEC 内 ring 不丢帧。
         LatestImageOnly + 大 MaxNumBuffer：保留最近帧，Python 端不取也不丢关键窗口。
+
+        【自愈】连续 FREEZE_SEC(默认 3s) 无新帧 → 视作相机 GigE 心跳丢失/stale grab，
+        自动 StopGrabbing + StartGrabbing 重建取流；状态写入 self._error 和
+        self._recover_count,网页状态栏可读到。最多每 RECOVER_COOLDOWN_SEC(默认 10s) 重启一次,
+        避免抖动期间刷屏重启。
         """
         GET_INTERVAL = 1.0 / 48  # ~21ms，匹配相机 48fps 产出节奏
+        FREEZE_SEC = 3.0         # 多久没新帧算"冻住"
+        RECOVER_COOLDOWN_SEC = 10.0
         next_get = time.perf_counter()
+        last_frame_wall = time.perf_counter()  # 上一次拿到新帧的墙钟时间
+        last_recover_wall = 0.0
+        self._recover_count = 0
         while self.running:
             try:
                 wait = next_get - time.perf_counter()
@@ -615,7 +683,9 @@ class CameraStreamer:
                     continue
                 try:
                     grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
-                except Exception:
+                except Exception as e:
+                    self._error = f"RetrieveResult 异常: {e}"
+                    print(f"[相机] RetrieveResult 异常(忽略继续): {e}")
                     time.sleep(0.05)
                     continue
                 if grab and grab.GrabSucceeded():
@@ -632,6 +702,7 @@ class CameraStreamer:
                     if self._last_cam_ts is None or cam_ts != self._last_cam_ts:
                         self._last_cam_ts = cam_ts
                         ts = time.perf_counter()
+                        last_frame_wall = ts  # 记入自愈时间戳(只在新帧时更新)
                     with self._ring_lock:
                         self._ring.append((ts, frame))
                     with self._lock:
@@ -644,7 +715,51 @@ class CameraStreamer:
                         self._capture_running.set()
                         threading.Thread(target=self._do_capture, daemon=True).start()
                 elif grab:
+                    # grab 拿到了但失败(超时/丢包)，释放掉继续
                     grab.Release()
+                # 【自愈检查】长时间无新帧 → 自动重启 grab
+                now = time.perf_counter()
+                gap = now - last_frame_wall
+                if gap > FREEZE_SEC and (now - last_recover_wall) > RECOVER_COOLDOWN_SEC:
+                    last_recover_wall = now
+                    self._recover_count += 1
+                    msg = (f"[相机] 自愈: 连续 {gap:.1f}s 无新帧 (recover#{self._recover_count}), "
+                           f"StopGrabbing+StartGrabbing …")
+                    print(msg)
+                    self._error = msg
+                    try:
+                        try:
+                            self.cam.StopGrabbing()
+                        except Exception:
+                            pass
+                        time.sleep(0.2)
+                        self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+                        try:
+                            self.cam.MaxNumBuffer.SetValue(1000)
+                        except Exception:
+                            pass
+                        # 重启后立即拿一帧,更新 last_frame_wall
+                        g2 = self.cam.RetrieveResult(3000, py.TimeoutHandling_Return)
+                        if g2 and g2.GrabSucceeded():
+                            frame2 = _grab_to_frame(g2)
+                            with self._ring_lock:
+                                self._ring.append((time.perf_counter(), frame2))
+                            with self._lock:
+                                self._latest = frame2
+                                self._latest_ts = time.perf_counter()
+                                self._frame_no += 1
+                            g2.Release()
+                            last_frame_wall = time.perf_counter()
+                            print(f"[相机] 自愈: 重新出帧 frame_no={self._frame_no}")
+                        else:
+                            if g2:
+                                g2.Release()
+                            print("[相机] 自愈: 重启后仍未拿到帧,稍后重试")
+                            last_frame_wall = time.perf_counter()  # 重置,避免刷屏
+                    except Exception as e:
+                        print(f"[相机] 自愈失败: {e}")
+                        self._error = f"自愈失败: {e}"
+                        last_frame_wall = time.perf_counter()
             except Exception as e:
                 self._error = f"取流异常: {e}"
                 print(f"[相机] 取流异常(已忽略，继续): {e}")
@@ -892,6 +1007,7 @@ class CameraStreamer:
             "last_result": self._last_result,
             "preview_age_sec": round(time.perf_counter() - self._latest_ts, 1),
             "frame_no": self._frame_no,   # 预览帧累计计数：递增=在出帧；不动=相机冻结
+            "recover_count": getattr(self, "_recover_count", 0),  # 自愈重启 grab 次数
             "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
 
