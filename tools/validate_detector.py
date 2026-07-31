@@ -31,7 +31,8 @@ import cv2
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from detection.detector import SealDetector, ROI, PROCESS_DIR, NG_LABELS
+from detection.detector import (SealDetector, ROI, PROCESS_DIR, NG_LABELS,
+                                 suggest_roi, load_roi_overrides)
 from common.interfaces import Defect
 
 _COLOR_GREEN = (0, 200, 0)
@@ -139,10 +140,30 @@ def _copy_process_img(process_dir, base, suffix, out_dir):
     return None
 
 
+def _suggest_and_write_roi(paths, src_dir):
+    """对每张照片启发式估算 ROI，打印并写入 {src_dir}/roi_overrides.json。"""
+    suggestions = {}
+    print("=== 逐图估算 ROI（暗区外接框，斜胶条自动罩住整条斜度） ===")
+    for p in paths:
+        name = os.path.basename(p)
+        r = suggest_roi(p)
+        if r:
+            suggestions[name] = [r[0], r[1], r[2], r[3]]
+            print(f"  {name:24s} -> ROI=({r[0]},{r[1]},{r[2]},{r[3]})")
+        else:
+            print(f"  {name:24s} -> 未检出明显暗区，跳过")
+    json_path = os.path.join(src_dir, "roi_overrides.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(suggestions, f, ensure_ascii=False, indent=2)
+    print(f"=== 已写入 ROI 覆盖：{json_path}（可手工微调后重跑） ===")
+    return suggestions
+
+
 # ----------------------- 验证主流程 -----------------------
-def validate_paths(paths, out_dir, process_dir):
+def validate_paths(paths, out_dir, process_dir, roi_overrides=None,
+                   default_roi=None):
     os.makedirs(process_dir, exist_ok=True)
-    det = SealDetector()
+    det = SealDetector(roi_overrides=roi_overrides, default_roi=default_roi)
     rows = []
     for p in paths:
         res = det.detect("TEST", [p], process_dir=process_dir)
@@ -176,6 +197,12 @@ def main():
     ap.add_argument("--src", default=None, help="验证该目录下所有图片（默认用仿真图）")
     ap.add_argument("--w", type=int, default=1440, help="仿真图宽")
     ap.add_argument("--h", type=int, default=1080, help="仿真图高")
+    ap.add_argument("--roi", default=None,
+                    help="批量 ROI 覆盖，格式 x,y,w,h（对所有图生效）")
+    ap.add_argument("--roi-json", default=None,
+                    help="逐图 ROI 覆盖 JSON：{\"照片名.jpg\":[x,y,w,h], ...}")
+    ap.add_argument("--suggest-roi", action="store_true",
+                    help="对每张照片启发式估算 ROI 并写入 {src}/roi_overrides.json，再用其跑检测")
     args = ap.parse_args()
 
     out_dir = os.path.join(ROOT, "tools", "results")
@@ -187,9 +214,33 @@ def main():
         if not paths:
             print(f"[警告] {args.src} 下没有图片")
             return
+
+        # ROI 覆盖优先级：--roi-json > --suggest-roi(写并载入) > src 目录自带 roi_overrides.json > --roi
+        roi_overrides = None
+        if args.roi_json:
+            roi_overrides = load_roi_overrides(args.roi_json)
+        elif args.suggest_roi:
+            roi_overrides = _suggest_and_write_roi(paths, args.src)
+        else:
+            auto_json = os.path.join(args.src, "roi_overrides.json")
+            if os.path.isfile(auto_json):
+                roi_overrides = load_roi_overrides(auto_json)
+
+        batch_roi = None
+        if args.roi and not roi_overrides:
+            try:
+                batch_roi = tuple(int(v) for v in args.roi.split(","))
+                assert len(batch_roi) == 4
+            except Exception:
+                print(f"[警告] --roi 格式错误（应为 x,y,w,h）：{args.roi}，忽略")
+
+        # 用构造进 SealDetector 的 roi_overrides 生效；batch_roi 走 detect(roi=)
         print(f"=== 验证真图：{len(paths)} 张 ===")
+        print(f"=== 逐图 ROI 覆盖：{len(roi_overrides) if roi_overrides else 0} 张；"
+              f"批量 ROI：{batch_roi} ===")
         print(f"=== 过程数据将保存到: {PROCESS_DIR} ===")
-        rows = validate_paths(paths, out_dir, PROCESS_DIR)
+        rows = validate_paths(paths, out_dir, PROCESS_DIR,
+                              roi_overrides=roi_overrides, default_roi=batch_roi)
         html_path = _write_html(out_dir, rows,
                                 title=f"胶条检测结果（{len(paths)} 张真图）")
         print(f"=== 报告已生成: {html_path} ===")

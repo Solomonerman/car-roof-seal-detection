@@ -285,10 +285,79 @@ def _detect_holes(seg_mask: np.ndarray) -> list:
 
 
 # ===================== 单图检测 =====================
-def _detect_one(path: str, process_dir: str = None):
+def suggest_roi(path: str, pad: int = 24) -> tuple:
+    """启发式估算单张图的胶条 ROI，用于离线给现场照片快速标定检测区。
+
+    思路：胶条是画面里显著偏暗的水平/斜向条带。先算逐行平均灰度找出"暗行"，
+    再在暗行范围内算逐列平均灰度找出"暗列"，取暗区外接矩形并加 padding。
+    对斜向胶条，暗区外接矩形天然是一条能罩住整条斜度的加高带，正好当 ROI。
+
+    返回 (x, y, w, h)；若读图失败或无明显暗区返回 None。
+    注意：这只是"建议框"，若照片里还有别的暗物（阴影/焊缝/车顶边缘）可能偏大，
+    标定后请人工在叠加验证图里核对。
+    """
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (0, 0), 5)     # 轻度平滑抑噪
+    h, w = gray.shape
+
+    row_mean = gray.mean(axis=1)
+    rmin, rmax = float(row_mean.min()), float(row_mean.max())
+    if rmax - rmin < 1e-3:
+        return None
+    row_thr = rmin + (rmax - rmin) * 0.45
+    dark_rows = np.where(row_mean < row_thr)[0]
+    if dark_rows.size < 5:
+        return None
+    y0 = max(0, int(dark_rows.min()) - pad)
+    y1 = min(h, int(dark_rows.max()) + pad)
+
+    col_mean = gray[y0:y1, :].mean(axis=0)
+    cmin, cmax = float(col_mean.min()), float(col_mean.max())
+    if cmax - cmin < 1e-3:
+        return (0, y0, w, y1 - y0)
+    col_thr = cmin + (cmax - cmin) * 0.45
+    dark_cols = np.where(col_mean < col_thr)[0]
+    if dark_cols.size < 5:
+        x0, x1 = 0, w
+    else:
+        x0 = max(0, int(dark_cols.min()) - pad)
+        x1 = min(w, int(dark_cols.max()) + pad)
+    return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+
+
+def load_roi_overrides(json_path: str) -> dict:
+    """从 JSON 读取逐图 ROI 覆盖：{"照片名.jpg": [x, y, w, h], ...}。
+
+    返回 dict；文件不存在/解析失败返回空 dict 并打印告警。
+    """
+    if not os.path.isfile(json_path):
+        print(f"[ROI] 未找到覆盖文件 {json_path}，使用全局 ROI")
+        return {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out = {}
+        for k, v in data.items():
+            if isinstance(v, (list, tuple)) and len(v) == 4:
+                out[k] = (int(v[0]), int(v[1]), int(v[2]), int(v[3]))
+            else:
+                print(f"[ROI] 跳过非法条目 {k}={v}（应为 [x,y,w,h]）")
+        print(f"[ROI] 已加载 {len(out)} 条逐图覆盖：{json_path}")
+        return out
+    except Exception as e:
+        print(f"[ROI] 解析 {json_path} 失败：{e}，使用全局 ROI")
+        return {}
+
+
+def _detect_one(path: str, process_dir: str = None, roi: tuple = None):
     """检测单张图，返回 Defect 列表（含 meta: width_mm 等）。
 
     过程数据：若 process_dir 给定，保存 mask 验证图与纯 mask 到该目录。
+    roi: 可选 (x,y,w,h) 覆盖全局 ROI；用于现场照片（每图取景不同）
+         逐个标定检测区域。缺省用全局常量 ROI。
     """
     img = cv2.imread(path)
     if img is None:
@@ -298,7 +367,8 @@ def _detect_one(path: str, process_dir: str = None):
     gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Step2 ROI 裁剪（clamp 到图像边界，防止尺寸不符越界）
-    x0, y0, rw, rh = ROI
+    # 优先用逐图覆盖 roi，否则用全局 ROI
+    x0, y0, rw, rh = roi if roi else ROI
     x1 = min(x0 + rw, gray_full.shape[1])
     y1 = min(y0 + rh, gray_full.shape[0])
     if x1 <= x0 or y1 <= y0:
@@ -482,11 +552,25 @@ def _save_process(img, roi_box, mask, defects, src_path, process_dir,
 
 
 class SealDetector:
-    def detect(self, car_model: str, images: list, process_dir: str = None) \
-            -> DetectionResult:
+    def __init__(self, roi_overrides: dict = None, default_roi: tuple = None):
+        """roi_overrides: {文件名(含扩展名): (x,y,w,h)} 逐图 ROI 覆盖。
+        default_roi: 批量兜底 ROI（覆盖全局常量 ROI），None 则用全局 ROI。"""
+        self._roi_overrides = roi_overrides or {}
+        self._default_roi = default_roi
+
+    def _resolve_roi(self, path: str):
+        """逐图优先：先查 roi_overrides（按文件名），否则用批量 default_roi。"""
+        name = os.path.basename(path)
+        return self._roi_overrides.get(name, self._default_roi)
+
+    def detect(self, car_model: str, images: list, process_dir: str = None,
+               roi: tuple = None) -> DetectionResult:
         all_defects = []
         for path in images:
-            all_defects.extend(_detect_one(path, process_dir))
+            # 优先级：detect(roi=) > 逐图 roi_overrides > 批量 default_roi > 全局
+            per = self._resolve_roi(path)
+            used = roi if roi else per
+            all_defects.extend(_detect_one(path, process_dir, roi=used))
 
         ng = [d for d in all_defects if d.label in NG_LABELS]
         ok = len(ng) == 0
