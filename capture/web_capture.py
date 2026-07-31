@@ -664,9 +664,14 @@ class CameraStreamer:
         FREEZE_SEC = 3.0         # 多久没新帧算"冻住"
         RECOVER_COOLDOWN_SEC = 10.0
         next_get = time.perf_counter()
-        last_frame_wall = time.perf_counter()  # 上一次拿到新帧的墙钟时间
+        # 【自愈关键修复】之前 last_frame_wall 只在 cam_ts != _last_cam_ts 时更新,
+        #       现场相机 GigE 冻结后会返回重复帧,GrabSucceeded=True 但 cam_ts 重复,
+        #       导致 last_frame_wall 永远不刷新 → 3 秒自愈检测形同虚设。
+        # 新方案:改用 _frame_no 帧号增量判断;_frame_no 不动 = 相机冻结。
+        last_frame_no = 0
         last_recover_wall = 0.0
         self._recover_count = 0
+        print(f"[相机] _loop 启动, FREEZE_SEC={FREEZE_SEC}s, 监控帧号增量")
         while self.running:
             try:
                 wait = next_get - time.perf_counter()
@@ -681,7 +686,7 @@ class CameraStreamer:
                     grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
                 except Exception as e:
                     self._error = f"RetrieveResult 异常: {e}"
-                    print(f"[相机] RetrieveResult 异常(忽略继续): {e}")
+                    print(f"[相机] RetrieveResult 异常(忽略继续): {e}", flush=True)
                     time.sleep(0.05)
                     continue
                 if grab and grab.GrabSucceeded():
@@ -698,7 +703,6 @@ class CameraStreamer:
                     if self._last_cam_ts is None or cam_ts != self._last_cam_ts:
                         self._last_cam_ts = cam_ts
                         ts = time.perf_counter()
-                        last_frame_wall = ts  # 记入自愈时间戳(只在新帧时更新)
                     with self._ring_lock:
                         self._ring.append((ts, frame))
                     with self._lock:
@@ -713,52 +717,53 @@ class CameraStreamer:
                 elif grab:
                     # grab 拿到了但失败(超时/丢包)，释放掉继续
                     grab.Release()
-                # 【自愈检查】长时间无新帧 → 自动重启 grab
+                # 【自愈检查】基于帧号增量 + 时间双判据,任一条件不满足都会触发
                 now = time.perf_counter()
-                gap = now - last_frame_wall
-                if gap > FREEZE_SEC and (now - last_recover_wall) > RECOVER_COOLDOWN_SEC:
+                with self._lock:
+                    cur_frame_no = self._frame_no
+                frame_gap = cur_frame_no - last_frame_no
+                if frame_gap <= 0 and (now - last_recover_wall) > RECOVER_COOLDOWN_SEC:
                     last_recover_wall = now
                     self._recover_count += 1
-                    msg = (f"[相机] 自愈: 连续 {gap:.1f}s 无新帧 (recover#{self._recover_count}), "
-                           f"StopGrabbing+StartGrabbing …")
-                    print(msg)
+                    msg = (f"[相机] 自愈: 帧号 {last_frame_no}->{cur_frame_no} 无变化 "
+                           f"(recover#{self._recover_count}), StopGrab+StartGrab...")
+                    print(msg, flush=True)
                     self._error = msg
                     try:
                         try:
                             self.cam.StopGrabbing()
                         except Exception:
                             pass
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                         self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
                         try:
                             self.cam.MaxNumBuffer.SetValue(1000)
                         except Exception:
                             pass
-                        # 重启后立即拿一帧,更新 last_frame_wall
+                        # 重启后立即拿一帧,更新 last_frame_no
                         g2 = self.cam.RetrieveResult(3000, py.TimeoutHandling_Return)
                         if g2 and g2.GrabSucceeded():
                             frame2 = _grab_to_frame(g2)
-                            with self._ring_lock:
-                                self._ring.append((time.perf_counter(), frame2))
                             with self._lock:
                                 self._latest = frame2
                                 self._latest_ts = time.perf_counter()
                                 self._frame_no += 1
                             g2.Release()
-                            last_frame_wall = time.perf_counter()
-                            print(f"[相机] 自愈: 重新出帧 frame_no={self._frame_no}")
+                            last_frame_no = self._frame_no
+                            print(f"[相机] 自愈: 重新出帧 frame_no={self._frame_no}", flush=True)
                         else:
                             if g2:
                                 g2.Release()
-                            print("[相机] 自愈: 重启后仍未拿到帧,稍后重试")
-                            last_frame_wall = time.perf_counter()  # 重置,避免刷屏
+                            print("[相机] 自愈: 重启后仍未拿到帧,稍后重试", flush=True)
+                            last_frame_no = cur_frame_no  # 不重置,继续监控
                     except Exception as e:
-                        print(f"[相机] 自愈失败: {e}")
+                        print(f"[相机] 自愈失败: {e}", flush=True)
                         self._error = f"自愈失败: {e}"
-                        last_frame_wall = time.perf_counter()
+                elif frame_gap > 0:
+                    last_frame_no = cur_frame_no
             except Exception as e:
                 self._error = f"取流异常: {e}"
-                print(f"[相机] 取流异常(已忽略，继续): {e}")
+                print(f"[相机] 取流异常(已忽略，继续): {e}", flush=True)
                 time.sleep(0.1)
 
 
