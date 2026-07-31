@@ -403,30 +403,13 @@ class CameraStreamer:
                 conf_log.append("采集模式=Continuous")
         except Exception as e:
             conf_log.append(f"采集模式设置异常: {e}")
-        # 采集帧率：本意锁成 FPS 以保证时序确定。但 aca1920-48gm 上
-        # AcquisitionFrameRate 是占位节点(not available)，相机端锁定会失败。
-        # 【关键修复】仅当“成功写入帧率值”时才打开帧率限制开关。
-        #   若只打开 AcquisitionFrameRateEnable 却没写进有效帧率值，相机会进入
-        #   异常节流/冻结状态——预触发环形缓冲在 7s 内采到的 21 帧全是同一张
-        #   （现场复现：21 张同一照片）。时序确定性完全由 _loop 的软件节流保证，
-        #   因此相机保持自由运行即可，绝不强行打开锁定开关。
-        try:
-            fr = nodemap.GetNode("AcquisitionFrameRate")
-            if fr is not None:
-                fr.SetValue(FPS)
-                fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
-                if fr_en is not None:
-                    fr_en.SetValue(True)
-                conf_log.append(f"采集帧率=相机锁定 {FPS}fps")
-            else:
-                conf_log.append(f"采集帧率=相机未开放锁定(占位)，改由软件节流 {FPS}fps")
-        except Exception as e:
-            msg = str(e)
-            if "not available" in msg.lower() or "placeholder" in msg.lower():
-                # 相机未开放帧率锁定节点：预期内，由软件节流兜底（绝不打开锁定开关）
-                conf_log.append(f"采集帧率=相机未开放锁定(占位)，改由软件节流 {FPS}fps")
-            else:
-                conf_log.append(f"采集帧率设置异常(已忽略): {msg}")
+        # 采集帧率：aca1920-48gm 上单数 'AcquisitionFrameRate' 是占位节点(not available)，
+        # 不控制实际输出，碰它无效还可能误导。曾经的"大坑"：在【此处】打开
+        # AcquisitionFrameRateEnable 却没同时写入有效的 AcquisitionFrameRateAbs →
+        # 相机冻结(21 张全同/0 张)。故本处【完全不碰帧率限制开关】，所有 Enable+Abs 的
+        # 设定统一交给 _camera_rate_check，并保证"先写 Abs 安全值、再开 Enable"成对出现。
+        # 时序确定性由 _do_capture 的软件 3fps 节流保证，与相机端锁不锁无关。
+        conf_log.append(f"采集帧率=帧率限制交由 _camera_rate_check 安全封顶(软件节流 {FPS}fps)")
         # 像素格式放最后
         try:
             nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
@@ -465,51 +448,63 @@ class CameraStreamer:
             fr_abs = _gv("AcquisitionFrameRateAbs")
             fr_max = _gv("AcquisitionFrameRateAbs", "Max")
             exp_us = _gv("ExposureTimeAbs")
+            trig = _gv("TriggerMode")
             pkt = _gv("GevSCPSPacketSize")
             thr = _gv("DeviceLinkThroughputLimit")
-            line = (f"cam-diag: FrameRateEnable={fr_en} FrameRateAbs={fr_abs}fps(max={fr_max}) "
-                    f"Exposure={exp_us}us PacketSize={pkt} ThroughputLimit={thr}")
+            line = (f"cam-diag: TriggerMode={trig} FrameRateEnable={fr_en} "
+                    f"FrameRateAbs={fr_abs}fps(max={fr_max}) Exposure={exp_us}us "
+                    f"PacketSize={pkt} ThroughputLimit={thr}")
             conf_log.append(line)
             print("[cam-diag]", line)  # 立即打印：即使取图失败也要能看到真实参数
 
-            # 安全封顶：相机产出 SAFE_FPS，软件按 3fps 取（留余量且不压垮网卡）。
-            # 现场 1Gbps 链路在 48fps 下取图失败，6fps 远在其可承受范围内且 >=3fps。
+            # 安全封顶（【唯一权威路径】）：先写【已知安全值】AcquisitionFrameRateAbs=SAFE_FPS，
+            # 再开 AcquisitionFrameRateEnable=True。二者必须成对出现——曾因"单开 Enable 而
+            # Abs 未写有效值"导致相机冻结(21 张全同/0 张)。此处保证：只要 Enable=True，Abs
+            # 一定是安全的 6fps（>=软件 3fps 节流，且远低于 48fps 压垮 1Gbps 链路的阈值）。
+            # 注：GigE 包大小不再自动改成 8192——现场未确认开启巨帧(Jumbo Frame)，保持默认。
             SAFE_FPS = 6.0
-            fixed = []
             n_abs = nodemap.GetNode("AcquisitionFrameRateAbs")
             n_en = nodemap.GetNode("AcquisitionFrameRateEnable")
             if n_abs is None or n_en is None:
-                # 占位相机：帧率节点不可用，保持相机默认模式（不强行改）
+                # 占位相机：帧率节点不可用，保持相机默认模式（不强行改，软件节流兜底）
                 conf_log.append("cam-diag: 帧率节点不可用(占位)，保持相机默认模式")
                 print("[cam-diag] 帧率节点不可用(占位)，保持相机默认模式")
-            elif fr_en is True:
-                # 已开帧率锁定：若当前低于安全值则抬高到 SAFE_FPS（保持 enable）
-                if fr_abs is None or fr_abs < SAFE_FPS:
-                    try:
-                        n_abs.SetValue(SAFE_FPS)
-                        fixed.append(f"FrameRateAbs {fr_abs}->{SAFE_FPS}fps (keep enabled)")
-                    except Exception as e:
-                        fixed.append(f"FrameRateAbs set failed: {e}")
             else:
-                # 当前自由运行(≈48fps) -> 封顶到 SAFE_FPS，避免压垮链路
                 try:
-                    n_abs.SetValue(SAFE_FPS)
-                    n_en.SetValue(True)
-                    fixed.append(f"free-run capped -> {SAFE_FPS}fps (was free ~48fps)")
+                    n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
+                    n_en.SetValue(True)        # ② 再开限制——成对，绝不留"Enable 无有效 Abs"
+                    conf_log.append(f"cam-diag FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True(成对写入)")
+                    print(f"[cam-diag] FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True")
                 except Exception as e:
-                    fixed.append(f"cap failed: {e}")
-            # 注：GigE 包大小不再自动改成 8192——现场未确认开启巨帧(Jumbo Frame)，
-            # 8192 会直接压垮取图。保持相机原有包大小（默认即可用）。
-            if fixed:
-                msg = "cam-diag FIX applied: " + "; ".join(fixed)
-                conf_log.append(msg)
-                print("[cam-diag]", msg)
-            elif n_abs is not None:
-                conf_log.append("cam-diag: no change needed (rate already safe)")
-                print("[cam-diag] no change needed (rate already safe)")
+                    conf_log.append(f"cam-diag: 封顶失败(已忽略，软件节流兜底): {e}")
+                    print("[cam-diag] 封顶失败(已忽略):", e)
         except Exception as e:
             conf_log.append(f"cam-diag error (ignored): {e}")
             print("[cam-diag] error (ignored):", e)
+        # 落盘启动诊断：即使上面异常也尽量持久化已有信息，便于远程上位机(无终端)排查。
+        try:
+            self._persist_startup_log(conf_log)
+        except Exception:
+            pass
+
+    def _persist_startup_log(self, conf_log):
+        """把相机启动诊断追加落盘到 data/records/camera_startup.log。
+
+        用途：现场上位机常无终端/SSH，且取图失败往往只在启动瞬间暴露真实参数。
+        一旦"连拍照都拍不了了"，用户无需连终端，直接打开该文件即可看到
+        TriggerMode / FrameRateEnable / FrameRateAbs / 是否应用 FIX，定位冻结根因。"""
+        try:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+            path = os.path.join(RECORD_DIR, "camera_startup.log")
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"===== 相机启动诊断 {ts} (version p{VERSION_TAG}) =====\n")
+                for ln in conf_log:
+                    f.write(ln + "\n")
+                f.write("\n")
+                f.flush()
+        except Exception as e:
+            print(f"[cam-diag] 落盘失败(可忽略): {e}")
 
     def start(self):
         # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
