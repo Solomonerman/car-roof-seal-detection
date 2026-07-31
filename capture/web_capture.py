@@ -210,6 +210,8 @@ JPEG_QUALITY = 80            # 实时流 JPEG 质量（1-100，越小越流畅�
 # 三项叠加，相比"48fps 裸取 + 不限速编码"，CPU 与 GigE 带宽下降一个数量级。
 GRAB_FPS = 6
 STREAM_FPS = 12
+# 预览帧"卡住"判定阈值(秒)：_latest 超过该时间未刷新，视为相机/取流异常 → 画面叠加告警。
+STALE_SEC = 2.0
 
 # ===================== PLC 自动触发参数（--plc-auto 启用）=====================
 PLC_IP = "172.30.173.6"
@@ -279,6 +281,7 @@ class CameraStreamer:
         self.camera_info = {}
 
         self._latest = None
+        self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)，用于"预览是否卡住"判定
         self._lock = threading.Lock()
 
         self._capture_req = threading.Event()   # 触发连拍
@@ -599,10 +602,11 @@ class CameraStreamer:
                     if self._last_cam_ts is None or cam_ts != self._last_cam_ts:
                         self._last_cam_ts = cam_ts
                         ts = time.perf_counter()
-                        with self._ring_lock:
-                            self._ring.append((ts, frame))
-                        with self._lock:
-                            self._latest = frame
+                    with self._ring_lock:
+                        self._ring.append((ts, frame))
+                    with self._lock:
+                        self._latest = frame
+                        self._latest_ts = time.perf_counter()
                     grab.Release()
                     # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
@@ -669,6 +673,10 @@ class CameraStreamer:
             except Exception:
                 cam_ts = None
             grab.Release()
+            # 连拍期间也实时刷新预览帧：否则 _loop 让位 7s，网页实时界面会"卡死"。
+            with self._lock:
+                self._latest = frame
+                self._latest_ts = time.perf_counter()
 
             target_ts = t_trigger + i * frame_interval
             delta_ms = (actual_ts - target_ts) * 1000.0
@@ -793,18 +801,35 @@ class CameraStreamer:
         return {"ok": False, "error": "连拍超时"}
 
     def get_latest_jpeg(self):
-        """返回最新帧的 JPEG 字节，或 None。"""
-        with self._lock:
-            frame = self._latest
-        if frame is None:
+        """返回最新帧的 JPEG 字节，或 None。
+
+        防御性：任何异常都返回 None（让 MJPEG 流继续存活，而不是整条流被异常打死→界面卡死）。
+        若 _latest 超过 STALE_SEC 未刷新（相机冻结/取流异常），在画面上叠加红色告警，
+        让操作员直接看到"预览卡住/信号丢失"，而不是静默定格还以为正常。
+        """
+        try:
+            with self._lock:
+                frame = self._latest
+                age = time.perf_counter() - self._latest_ts
+            if frame is None:
+                return None
+            scale = STREAM_WIDTH / self.width if self.width else 1.0
+            disp = cv2.resize(frame, (STREAM_WIDTH, int(self.height * scale)))
+            if not self.is_color:
+                disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+            if len(disp.shape) == 2:  # 兜底：确保 3 通道再叠加文字
+                disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+            if age > STALE_SEC:
+                # 画面卡住告警：红底白字，固定位置，明确提示而非静默定格
+                txt = f"!! 预览卡住/信号丢失 ({age:.0f}s)"
+                cv2.rectangle(disp, (0, 0), (disp.shape[1], 34), (0, 0, 180), -1)
+                cv2.putText(disp, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            return buf.tobytes() if ok else None
+        except Exception as e:
+            print(f"[预览] 取最新帧异常(已忽略，流继续): {e}")
             return None
-        # 缩放
-        scale = STREAM_WIDTH / self.width if self.width else 1.0
-        disp = cv2.resize(frame, (STREAM_WIDTH, int(self.height * scale)))
-        if not self.is_color:
-            disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
-        ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        return buf.tobytes() if ok else None
 
     def status(self):
         return {
@@ -826,6 +851,7 @@ class CameraStreamer:
             },
             "save_dir": INSPECTION_ROOT,
             "last_result": self._last_result,
+            "preview_age_sec": round(time.perf_counter() - self._latest_ts, 1),
             "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
 
@@ -1134,22 +1160,30 @@ def _prune_scratch(max_age_days=7, max_files=2000):
 
 
 def _gen_mjpeg():
-    """MJPEG 流生成器（推送节拍上限 STREAM_FPS，避免无谓的 JPEG 编码拖 CPU）。"""
+    """MJPEG 流生成器（推送节拍上限 STREAM_FPS，避免无谓的 JPEG 编码拖 CPU）。
+
+    防御性：单帧异常被吞掉并短暂让步，绝不让整条流被打死——否则网页实时界面
+    会"卡死"（曾经的根因之一：get_latest_jpeg 抛错 → 生成器异常退出 → <img> 定格）。
+    """
     last = 0.0
     interval = 1.0 / STREAM_FPS
     while hub.running:
-        jpg = hub.get_primary_jpeg()
-        if jpg:
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            # 限速推送：让出 CPU 给机器人站
-            now = time.perf_counter()
-            wait = interval - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-            last = time.perf_counter()
-        else:
-            time.sleep(0.05)
+        try:
+            jpg = hub.get_primary_jpeg()
+            if jpg:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+                # 限速推送：让出 CPU 给机器人站
+                now = time.perf_counter()
+                wait = interval - (now - last)
+                if wait > 0:
+                    time.sleep(wait)
+                last = time.perf_counter()
+            else:
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"[预览] MJPEG 单帧异常(已忽略，流继续): {e}")
+            time.sleep(0.1)
 
 
 @app.route("/")
