@@ -1,14 +1,26 @@
 __pycache__/
 *.pyc
 *.db
+
+# ---- 运行时生成的数据目录（不入库）----
 data/raw_images/
 data/stored_images/
-data/inspection/      # 预触发照片按 日期/PIN 分层(运行时生成,不入库)
-data/records/         # 免检车 sidecar JSON 兜底目录(运行时生成,不入库)
+# 预触发照片按 日期/PIN 分层
+data/inspection/
+# 免检车 sidecar JSON 兜底目录
+data/records/
 data/calibration/
 data/process_data/
+
+# ---- 现场实拍样张（体积大，走网盘共享，仅保留说明文件）----
+data/field_samples/*
+!data/field_samples/README.md
+
 tools/results/
-.idea/                # PyCharm 项目配置(每人一份,不入库)
+
+# ---- IDE / 虚拟环境 ----
+# PyCharm 项目配置，每人一份
+.idea/
 .venv/
 venv/
 .DS_Store
