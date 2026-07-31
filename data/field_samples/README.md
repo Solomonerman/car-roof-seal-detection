@@ -54,6 +54,40 @@ python tools/validate_detector.py --src data/field_samples/20260731_产线A
 
 > 如果这批照片是手机/其他相机拍的，先跑一次 `validate_detector.py` 看结果，大概率要重新调 ROI 和 `OTSU_THRESHOLD_DELTA`。把结果发出来一起看。
 
+## 斜胶条 / 取景不同的照片：逐图 ROI 覆盖
+
+现场照片常因**取景不同**（每张胶条在画面里的 y 位置不一样）或**胶条不水平（随车身前进而上抬）**，单个全局横带罩不住。
+检测器支持**逐张照片单独标 ROI**，且能自动估算：
+
+```bash
+# 1) 自动估算每张照片的 ROI，写入 {src}/roi_overrides.json，并直接用它跑检测
+python tools/validate_detector.py --src data/field_samples/20260727 --suggest-roi
+
+# 2) 之后直接重跑（会自动读取同目录下的 roi_overrides.json，无需再带参数）
+python tools/validate_detector.py --src data/field_samples/20260727
+
+# 3) 也可手工指定（对所有图生效）
+python tools/validate_detector.py --src <目录> --roi x,y,w,h
+
+# 4) 或指定一份逐图 JSON：{"照片名.jpg":[x,y,w,h], ...}
+python tools/validate_detector.py --src <目录> --roi-json roi_overrides.json
+```
+
+`roi_overrides.json` 形如：
+
+```json
+{
+  "DSC_0001.jpg": [0, 150, 1600, 300],
+  "DSC_0002.jpg": [0, 220, 1600, 320]
+}
+```
+
+要点：
+- `--suggest-roi` 的估框逻辑是"整图找最暗的水平/斜向条带外接框"，对斜胶条会自动罩住整条斜度。
+  若照片里另有明显暗物（阴影、焊缝、车顶边缘），估框可能偏大——看 `tools/results/` 里的叠加验证图核对，手工在 JSON 里收一下即可。
+- 全局 `ROI` 常量不受影响，相机固定机位的场景仍用一条加高带即可。
+
+
 ## 版本管理
 
 本目录**不入 git**（照片体积大，且属于现场数据）。见根目录 `.gitignore`。
