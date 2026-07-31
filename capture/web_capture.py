@@ -421,6 +421,35 @@ class CameraStreamer:
         except Exception as e:
             conf_log.append(f"像素格式设置异常(沿用当前值): {e}")
         self._camera_rate_check(nodemap, conf_log)
+        # 【关键修复：网页预览冻结根因】触发/采集模式必须在 PixelFormat 与帧率封顶【之后】
+        # 再强制一次。背景：现场曾把相机在 pylon 里配成硬件触发(等 PLC 信号)，该配置存入相机
+        # UserSet。前面改 PixelFormat 会触发相机重载用户配置，把 TriggerMode 重新设回 On；若只在前
+        # 置步骤设过一次 Off，会被这次重载覆盖 → 网页预览一直等触发信号 → 只出 1 帧就冻结(frame #1)。
+        # 故在所有配置(含 PixelFormat/帧率)写完后，最后再强制 TriggerMode=Off + Continuous，并复位
+        # TriggerSource=Software 解除对外部信号线的依赖，且读回校验，确保相机真正自由运行。
+        try:
+            tm = nodemap.GetNode("TriggerMode")
+            if tm is not None:
+                tm.SetValue("Off")
+            am = nodemap.GetNode("AcquisitionMode")
+            if am is not None:
+                am.SetValue("Continuous")
+            try:
+                ts = nodemap.GetNode("TriggerSource")
+                if ts is not None:
+                    ts.SetValue("Software")
+            except Exception:
+                pass
+            # 读回校验：若仍是 On（被 UserSet 重载），重试一次并明确记录
+            tm_now = tm.GetValue() if (tm is not None) else None
+            if tm_now != "Off" and tm is not None:
+                tm.SetValue("Off")
+                tm_now = tm.GetValue()
+            conf_log.append(f"触发模式=Off(自由运行, 末次强制) 实际={tm_now}")
+            print(f"[cam-diag] 触发模式末次强制: 实际={tm_now}")
+        except Exception as e:
+            conf_log.append(f"触发模式末次强制异常: {e}")
+            print("[cam-diag] 触发模式末次强制异常:", e)
         self._conf_log = conf_log
 
     def _camera_rate_check(self, nodemap, conf_log):
