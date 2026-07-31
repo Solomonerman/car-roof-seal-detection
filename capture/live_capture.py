@@ -166,17 +166,53 @@ def _configure_camera(cam):
             print(f"[采集] {name} 设置失败: {msg}")
     if not exp_ok:
         print("[采集] 曝光未写入，沿用相机当前曝光值")
-    # 采集帧率：锁成 FPS，保证连拍时序确定（避免 RetrieveResult 阻塞导致时长漂移）
+    # 触发/采集模式：强制自由运行(Continuous + TriggerMode=Off)。
+    # 若相机残留"外触发/软触发"配置而无触发源，会只出 1 帧后冻结 → 0 张有效帧。
+    # 显式关触发 + 连续采集，保证相机持续出图。
     try:
-        fr_en = nodemap.GetNode("AcquisitionFrameRateEnable")
-        if fr_en is not None:
-            fr_en.SetValue(True)
-        fr = nodemap.GetNode("AcquisitionFrameRate")
-        if fr is not None:
-            fr.SetValue(FPS)
-            print(f"[采集] 采集帧率已设为 {FPS}fps")
+        tm = nodemap.GetNode("TriggerMode")
+        if tm is not None:
+            tm.SetValue("Off")
+            print("[采集] 触发模式=Off(自由运行)")
     except Exception as e:
-        print(f"[采集] 采集帧率设置异常: {e}")
+        print(f"[采集] 触发模式设置异常: {e}")
+    try:
+        am = nodemap.GetNode("AcquisitionMode")
+        if am is not None:
+            am.SetValue("Continuous")
+            print("[采集] 采集模式=Continuous")
+    except Exception as e:
+        print(f"[采集] 采集模式设置异常: {e}")
+    # 采集帧率：aca1920-48gm 上单数 'AcquisitionFrameRate' 是占位节点(not available)，
+    # 不控制实际输出。曾因"单开 AcquisitionFrameRateEnable 却没写有效 Abs"导致相机冻结
+    # (0 张/全同)。故【绝不碰占位节点】，且 Enable 与 Abs 必须成对：先写 Abs=SAFE_FPS
+    # 再开 Enable，保证 Enable=True 时 Abs 一定是安全值（>=软件 3fps 节流、远低于 48fps 压垮链路）。
+    SAFE_FPS = 6.0
+    try:
+        n_abs = nodemap.GetNode("AcquisitionFrameRateAbs")
+        n_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+        # 诊断：打印真实参数，便于现场排查"连拍照都拍不了了"
+        def _gv(name):
+            n = nodemap.GetNode(name)
+            if n is None:
+                return None
+            try:
+                return n.GetValue()
+            except Exception:
+                return None
+        trig = _gv("TriggerMode")
+        fr_en_v = _gv("AcquisitionFrameRateEnable")
+        fr_abs_v = _gv("AcquisitionFrameRateAbs")
+        print(f"[采集] cam-diag: TriggerMode={trig} FrameRateEnable={fr_en_v} "
+              f"FrameRateAbs={fr_abs_v}fps")
+        if n_abs is None or n_en is None:
+            print("[采集] 帧率节点不可用(占位)，保持相机默认模式（软件节流兜底）")
+        else:
+            n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
+            n_en.SetValue(True)        # ② 再开限制——成对，绝不留"Enable 无有效 Abs"
+            print(f"[采集] 帧率限制已封顶 Abs={SAFE_FPS}fps Enable=True(成对写入)")
+    except Exception as e:
+        print(f"[采集] 采集帧率设置异常(已忽略，软件节流兜底): {e}")
     # 像素格式放最后
     try:
         fmt_node = nodemap.GetNode("PixelFormat")
