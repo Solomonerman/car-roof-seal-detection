@@ -282,6 +282,7 @@ class CameraStreamer:
 
         self._latest = None
         self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)，用于"预览是否卡住"判定
+        self._frame_no = 0           # 预览帧累计计数(常驻心跳，用于直观判断"是否在出帧")
         self._lock = threading.Lock()
 
         self._capture_req = threading.Event()   # 触发连拍
@@ -607,6 +608,7 @@ class CameraStreamer:
                     with self._lock:
                         self._latest = frame
                         self._latest_ts = time.perf_counter()
+                        self._frame_no += 1   # 每出一帧 +1，预览常驻心跳
                     grab.Release()
                     # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
@@ -811,6 +813,7 @@ class CameraStreamer:
             with self._lock:
                 frame = self._latest
                 age = time.perf_counter() - self._latest_ts
+                fno = self._frame_no
             if frame is None:
                 return None
             scale = STREAM_WIDTH / self.width if self.width else 1.0
@@ -819,6 +822,13 @@ class CameraStreamer:
                 disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
             if len(disp.shape) == 2:  # 兜底：确保 3 通道再叠加文字
                 disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+            # 常驻心跳：帧号 + 当前时钟 + 卡顿秒数，绿色小字固定在左下角。
+            # 操作员一眼可判断"画面到底在不在出帧"，不再靠猜"车身动没动"；
+            # 帧号递增=实时出帧；帧号不动+下方红字=相机冻结/信号丢失。
+            clk = time.strftime("%H:%M:%S")
+            hb = f"LIVE #{fno}  {clk}  卡顿{age:.1f}s"
+            cv2.putText(disp, hb, (8, disp.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 0), 1, cv2.LINE_AA)
             if age > STALE_SEC:
                 # 画面卡住告警：红底白字，固定位置，明确提示而非静默定格
                 txt = f"!! 预览卡住/信号丢失 ({age:.0f}s)"
@@ -852,6 +862,7 @@ class CameraStreamer:
             "save_dir": INSPECTION_ROOT,
             "last_result": self._last_result,
             "preview_age_sec": round(time.perf_counter() - self._latest_ts, 1),
+            "frame_no": self._frame_no,   # 预览帧累计计数：递增=在出帧；不动=相机冻结
             "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
 
@@ -1305,8 +1316,14 @@ setInterval(refreshStatus, 5000);
 def video_feed():
     if not hub.running:
         return Response("相机未运行", status=503)
-    return Response(_gen_mjpeg(),
+    # no-cache 头：避免浏览器/代理把 MJPEG 流缓存住，导致网页画面"冻在首帧"
+    # （即车身明明在动、但预览画面不动的另一条独立根因）。
+    resp = Response(_gen_mjpeg(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/status")
