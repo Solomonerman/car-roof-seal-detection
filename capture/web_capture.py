@@ -118,7 +118,17 @@ elif _STAMP_HASH:
 else:
     VERSION_TAG = RUN_TAG
     _VER_SRC = "run"
+# 【视觉自检】自愈代码是否启用。本版本(_selfheal_edition>=1)启用 _loop 自愈机制;
+# 老版本这个变量不存在,启动横幅会显示"未启用"——这是覆盖是否成功的最直接判据。
+_SELFHEAL_ENABLED = True
+_SELFHEAL_EDITION = 1
 print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (source={_VER_SRC}, run={RUN_TAG})")
+
+# 【视觉自检】启动时显眼打印,操作员一眼可判断是不是新版。
+print("=" * 60)
+print(f"[自愈] 摄像机心跳丢失自愈功能: {'已启用' if _SELFHEAL_ENABLED else '未启用'}")
+print(f"[自愈] FREEZE_SEC=3.0  RECOVER_COOLDOWN_SEC=10.0  edition={_SELFHEAL_EDITION}")
+print("=" * 60)
 
 try:
     import pypylon.pylon as py
@@ -326,33 +336,27 @@ class CameraStreamer:
             self.cam = py.InstantCamera(factory.CreateDevice(devices[0]))
 
         self.cam.Open()
-        # 【GigE 心跳-Open 后兜底】某些固件在 Open 后仍允许写入心跳参数;
-        # 节点只读时会静默跳过(走 self-heal 兜底)。日志打印实际结果便于现场核对。
+        # 【GigE 心跳-Open 后兜底】pypylon 的 GetNode 对不存在节点会返回
+        # PlaceholderParameter 对象(非 None,但 .SetValue 抛 'not callable')。
+        # 节点只读/占位时静默跳过,完全依赖 _loop 自愈兜底。
         try:
             tl = self.cam.GetTLParamsNode()
             if tl is not None:
+                # 用 hasattr/try 双重防御,任何失败都吞掉
                 try:
                     hb = tl.GetNode("GevHeartbeatDisable")
-                    if hb is not None:
-                        try:
-                            hb.SetValue(True)
-                            print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True (Open后)")
-                        except Exception as _e:
-                            print(f"[cam-diag] GigE心跳禁用(Open后): 节点只读, 走自愈兜底 ({_e})")
+                    hb.SetValue(True)
+                    print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True")
                 except Exception:
-                    pass
+                    pass  # 占位/只读/不存在,静默
                 try:
                     hbt = tl.GetNode("GevHeartbeatTimeout")
-                    if hbt is not None:
-                        try:
-                            hbt.SetValue(60000)
-                            print("[cam-diag] GigE心跳超时: 已写入 60000ms (Open后)")
-                        except Exception:
-                            pass
+                    hbt.SetValue(60000)
+                    print("[cam-diag] GigE心跳超时: 已写入 60000ms")
                 except Exception:
                     pass
         except Exception:
-            pass
+            pass  # 整个 TransportLayer 不可用也无所谓,自愈兜底
         self.camera_info = {
             "model": self.cam.GetDeviceInfo().GetModelName(),
             "serial": self.cam.GetDeviceInfo().GetSerialNumber(),
@@ -482,31 +486,23 @@ class CameraStreamer:
         # 根因：相机 GigE 心跳(默认约 3s 心跳包)超时后,固件会主动停止出图(无异常抛出),
         #       pypylon RetrieveResult 一直 Return 而 GrabSucceeded=False,_loop 看似活着实则空转,
         #       预览/JPEG 自然停滞。pylon View 短测不复现,因它不会长时间挂占。
-        # 修复：在 TransportLayer 节点上 **禁用 GigE 心跳**(GevHeartbeatDisable=True)，
-        #       让相机不再因网络静默而停采;叠加 _loop 中的"长时间无新帧→自动 StopGrabbing+StartGrabbing"
-        #       自愈兜底,即便心跳绕过仍有问题也能自动恢复。
+        # 修复：心跳参数的具体禁用尝试已在 connect() 中 Open() 之后做过,这里只补一个静默尝试
+        #       作为第二保险,占位节点/只读直接吞掉,不污染 conf_log。
         try:
             tl = self.cam.GetTLParamsNode()
             if tl is not None:
                 try:
-                    hb = tl.GetNode("GevHeartbeatDisable")
-                    if hb is not None:
-                        hb.SetValue(True)
-                        conf_log.append("GigE心跳=禁用(防止长时间运行后被相机主动停采)")
-                        print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True")
-                except Exception as e:
-                    conf_log.append(f"GigE心跳禁用失败(可忽略): {e}")
-                    print(f"[cam-diag] GigE心跳禁用失败(可忽略): {e}")
-                # 把心跳超时也调大,作为二级保险
-                try:
-                    hbt = tl.GetNode("GevHeartbeatTimeout")
-                    if hbt is not None:
-                        hbt.SetValue(60000)  # 60s
-                        conf_log.append("GigE心跳超时=60000ms")
+                    tl.GetNode("GevHeartbeatDisable").SetValue(True)
                 except Exception:
                     pass
-        except Exception as e:
-            conf_log.append(f"TransportLayer 配置异常: {e}")
+                try:
+                    tl.GetNode("GevHeartbeatTimeout").SetValue(60000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 注意：心跳禁用大概率无效（pypylon TLParams 节点 Open 后只读），
+        #       真正保命的兜底是 _loop 的"3秒无新帧自动 StopGrab+StartGrab"自愈。
 
         self._conf_log = conf_log
 
