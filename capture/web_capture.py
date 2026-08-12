@@ -33,6 +33,7 @@ import argparse
 import concurrent.futures as _cf
 import subprocess
 import re
+import shutil
 
 import cv2
 import numpy as np
@@ -302,6 +303,7 @@ class CameraStreamer:
         self._ring = collections.deque(maxlen=512)
         self._ring_lock = threading.Lock()
         self._last_cam_ts = None        # last camera hw-ts (plan A dedup on new exposures)
+        self._ts_none_logged = False     # GetTimeStamp 不可用仅告警一次的标记
         self._capture_done = threading.Event()  # 连拍完成信号
         self._last_result = None                # 最近一次连拍结果
 
@@ -691,29 +693,38 @@ class CameraStreamer:
                     continue
                 if grab and grab.GrabSucceeded():
                     frame = _grab_to_frame(grab)   # 深拷贝，杜绝 21 张全同
-                    ts = time.perf_counter()
-                    # 先写入 ring(给 capture 切片用)，再更新 _latest(给预览用)
-                    # read camera hardware timestamp (plan A: filter dup copies produced
-                    # when software reads faster than the camera outputs new frames)
+                    # 相机硬件时间戳：仅用于诊断，绝不能用来"拦截非新帧"。
+                    # 坑：aca1920-48gm 默认未开启时间戳(chunk)时，GetTimeStamp() 会抛
+                    # 异常→cam_ts=None；若用 cam_ts 相等来判定新帧，则除首帧外全部被
+                    # 拦截→预览永久冻在首帧+立即红字+自愈也只能补 1 帧又立刻被拦截。
+                    # 故预览/心跳在【每次成功取图】时都刷新，cam_ts 仅供诊断记录。
                     try:
                         cam_ts = grab.GetTimeStamp()
                     except Exception:
                         cam_ts = None
-                    # only let genuinely new exposure frames enter ring/preview
-                    if self._last_cam_ts is None or cam_ts != self._last_cam_ts:
+                        if not self._ts_none_logged:
+                            self._ts_none_logged = True
+                            print("[cam-diag] GetTimeStamp() 不可用(相机未开启时间戳/chunk)"
+                                  "→预览去重改为按取图刷新，避免冻在首帧", flush=True)
+                    now = time.perf_counter()
+                    is_new = (cam_ts is None) or (self._last_cam_ts is None) or (cam_ts != self._last_cam_ts)
+                    if is_new:
                         self._last_cam_ts = cam_ts
-                        ts = time.perf_counter()
-                    with self._ring_lock:
-                        self._ring.append((ts, frame))
+                    # 仅"真实新曝光"写入 ring（保留慢轮询节流优化）；cam_ts 不可用时不拦截。
+                    if is_new:
+                        with self._ring_lock:
+                            self._ring.append((now, frame))
                     with self._lock:
-                        self._latest = frame
-                        self._latest_ts = time.perf_counter()
-                        self._frame_no += 1   # 每出一帧 +1，预览常驻心跳
+                        self._latest = frame          # 始终刷新→预览不冻结
+                        self._latest_ts = now         # 始终刷新→age 不超阈值→不弹红字
+                        self._frame_no += 1           # 每次成功取图 +1：相机停出图时
+                                                      # RetrieveResult 失败→此处不执行→
+                                                      # 帧号停滞→age 超阈值→自愈触发
                     grab.Release()
                     # 出车信号：启动独立 capture 线程(不阻塞 _loop)
                     if self._capture_req.is_set() and not self._capture_running.is_set():
                         self._capture_running.set()
-                        threading.Thread(target=self._do_capture, daemon=True).start()
+                        threading.Thread(target=self._run_capture_safe, daemon=True).start()
                 elif grab:
                     # grab 拿到了但失败(超时/丢包)，释放掉继续
                     grab.Release()
@@ -787,6 +798,16 @@ class CameraStreamer:
 
         os.makedirs(SAVE_DIR, exist_ok=True)
         print(f"[拍照] 手动连拍目标目录(绝对路径): {os.path.abspath(SAVE_DIR)}")
+        # 磁盘空间预检：写到一半磁盘满会让 cv2.imwrite 抛异常（曾导致 _capture_running
+        # 卡死、预览永久冻结）。提前告警，配合下方 imwrite 的 try 保护与外层
+        # _run_capture_safe 的 finally 兜底，三重保险。
+        try:
+            free_mb = shutil.disk_usage(SAVE_DIR).free // (1024 * 1024)
+            if free_mb < 200:
+                print(f"[拍照] ⚠️ 磁盘剩余仅 {free_mb}MB，写盘可能失败，请清理 data/")
+                self._error = f"磁盘剩余不足 {free_mb}MB"
+        except Exception:
+            pass
         batch = []
         saved_hashes = []
         picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
@@ -833,7 +854,15 @@ class CameraStreamer:
             frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
             fname = self._format_filename(idx=i + 1, dt=frame_dt)
             fpath = os.path.join(SAVE_DIR, fname)
-            cv2.imwrite(fpath, frame)
+            # 写盘保护：磁盘满/权限异常只跳过当前张，不炸整批、不炸线程
+            # （线程炸掉会让 _capture_running 卡死 → 预览永久冻结，见 _run_capture_safe）。
+            try:
+                cv2.imwrite(fpath, frame)
+            except Exception as e:
+                print(f"[拍照] 写盘失败(跳过该张): {fpath}: {e}")
+                self._error = f"写盘失败: {e}"
+                next_at += frame_interval
+                continue
             batch.append(fname)
             saved_hashes.append(_frame_hash(frame))
 
@@ -927,6 +956,24 @@ class CameraStreamer:
 
 
 
+    def _run_capture_safe(self):
+        """连拍安全包装：无论 _do_capture 是否抛异常，都保证复位 _capture_running/_capture_done。
+
+        根因修复：原 _do_capture 仅靠函数末尾 clear()，若连拍中抛异常（最典型磁盘写满致
+        cv2.imwrite 失败），线程会带着 _capture_running=True 死掉 → 后台 _loop 永久让位 →
+        网页预览永久冻帧 + 红字，直到重启。此处用 try/finally 兜底，彻底消除该类永久冻结。
+        """
+        try:
+            self._do_capture()
+        except Exception as e:
+            self._error = f"连拍线程异常(已兜底恢复预览): {e}"
+            import traceback
+            traceback.print_exc()
+            print(f"[拍照] ❌ 连拍线程异常(已兜底，预览恢复): {e}", flush=True)
+        finally:
+            self._capture_running.clear()
+            self._capture_done.set()
+
     def _format_filename(self, idx=None, dt=None, prefix="Image"):
         if dt is None:
             dt = datetime.datetime.now()
@@ -1008,6 +1055,7 @@ class CameraStreamer:
             "last_result": self._last_result,
             "preview_age_sec": round(time.perf_counter() - self._latest_ts, 1),
             "frame_no": self._frame_no,   # 预览帧累计计数：递增=在出帧；不动=相机冻结
+            "capture_running": self._capture_running.is_set(),  # 连拍是否进行中（True 且 frame_no 不动=拍照线程卡死/异常）
             "recover_count": getattr(self, "_recover_count", 0),  # 自愈重启 grab 次数
             "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
         }
