@@ -43,6 +43,14 @@ import collections
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
 VERSION = "2026-07-30-latch-trigger"  # 修复:自动触发改为"新车上下文出现即锁存触发"(不再等上升沿去读被覆盖的DB230);收到车信号写data/capture_exec.log追溯
 
+# 相机配置模式开关（对照实验用，默认关闭=标准模式）。
+#   设环境变量 MINIMAL_CAM=1 启动程序时，回到"2026-07-21 初版最小干预"配置：
+#     - 不强制帧率封顶（相机自由运行，与初版一致）
+#     - 不强制 MaxNumBuffer=1000
+#   用途：定位"2026-07-31 大改(66ab82d)后工控机取流不稳"的根因。若开启后稳定，
+#   说明是那次大改引入的强制参数所致；若仍卡，则元凶在取流架构/网卡驱动。
+MINIMAL_CAM = os.environ.get("MINIMAL_CAM", "").strip().lower() in ("1", "true", "yes", "on")
+
 def _find_git_repo():
     """Walk up from this file to locate the .git directory; return repo root or None."""
     d = os.path.dirname(os.path.abspath(__file__))
@@ -559,14 +567,20 @@ class CameraStreamer:
                 conf_log.append("cam-diag: 帧率节点不可用(占位)，保持相机默认模式")
                 print("[cam-diag] 帧率节点不可用(占位)，保持相机默认模式")
             else:
-                try:
-                    n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
-                    n_en.SetValue(True)        # ② 再开限制——成对，绝不留"Enable 无有效 Abs"
-                    conf_log.append(f"cam-diag FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True(成对写入)")
-                    print(f"[cam-diag] FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True")
-                except Exception as e:
-                    conf_log.append(f"cam-diag: 封顶失败(已忽略，软件节流兜底): {e}")
-                    print("[cam-diag] 封顶失败(已忽略):", e)
+                if MINIMAL_CAM:
+                    # 【对照实验】最小干预模式：不强制帧率封顶，相机自由运行（与 7/21 初版一致）。
+                    # 用于验证"7/31 大改强制 6fps 封顶"是否导致工控机取流不稳。
+                    conf_log.append("cam-diag: [最小干预模式] 不强制帧率封顶，相机自由运行(与7/21初版一致)")
+                    print("[cam-diag] [最小干预模式] 不强制帧率封顶，相机自由运行")
+                else:
+                    try:
+                        n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
+                        n_en.SetValue(True)        # ② 再开限制——成对，绝不留"Enable 无有效 Abs"
+                        conf_log.append(f"cam-diag FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True(成对写入)")
+                        print(f"[cam-diag] FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True")
+                    except Exception as e:
+                        conf_log.append(f"cam-diag: 封顶失败(已忽略，软件节流兜底): {e}")
+                        print("[cam-diag] 封顶失败(已忽略):", e)
         except Exception as e:
             conf_log.append(f"cam-diag error (ignored): {e}")
             print("[cam-diag] error (ignored):", e)
@@ -596,6 +610,8 @@ class CameraStreamer:
             print(f"[cam-diag] 落盘失败(可忽略): {e}")
 
     def start(self):
+        print(f"[相机配置] 模式={'最小干预(MINIMAL_CAM=1)' if MINIMAL_CAM else '标准'}"
+              f"  (对照实验：最小干预=与7/21初版一致，不强制帧率/MaxNumBuffer)")
         # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
         # 关键：后台取流线程轮询仅 GRAB_FPS=6，远慢于相机产出 48fps。
         #   OneByOne 会把帧按顺序塞进有限缓冲池，慢轮询下缓冲池耗尽 → 相机触发
@@ -604,11 +620,15 @@ class CameraStreamer:
         #   慢轮询也能拿到各不相同的新鲜帧；且轮询(6fps)慢于产出(48fps)，不会重复。
         #   时序确定性仍由 _loop 的 3fps 软件节流保证，不受策略影响。
         self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
-        # Expand internal frame buffer so 7s pre-trigger ring never drops frames.
-        try:
-            self.cam.MaxNumBuffer.SetValue(1000)
-        except Exception:
-            pass
+        if MINIMAL_CAM:
+            # 【对照实验】最小干预模式：不强制 MaxNumBuffer（与 7/21 初版一致）。
+            print("[cam-diag] [最小干预模式] 不强制 MaxNumBuffer=1000(与7/21初版一致)")
+        else:
+            # Expand internal frame buffer so 7s pre-trigger ring never drops frames.
+            try:
+                self.cam.MaxNumBuffer.SetValue(1000)
+            except Exception:
+                pass
         # 取一张确认分辨率
         grab = self.cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
         if not grab.GrabSucceeded():
