@@ -4,24 +4,30 @@
 为什么用这个：
   你在工位远程操作上位机，看不到现场车子。pylon Viewer 的实时窗口在
   上位机本地，你隔着远程桌面才能看到，且它独占相机、会和本脚本冲突。
-  这个工具把相机的实时画面通过浏览器（局域网/公网）推给你，你在网页上
+  这个工具把相机的实时画面通过浏览器（局域网）推给你，你在网页上
   就能看到车有没有到位，点一下按钮就触发连拍，无需远程桌面、无需 pylon Viewer。
 
 自动触发（--plc-auto）：
-  后台启一个【只读】PLC 监控线程，监测 DB130.DBX0.1（出车信号）上升沿；
-  上升沿时按"先锁存后打印"取到车号上下文（滑橇/PIN/车型/NO_Paint），
-  记录全部车（含免检），并对(9X/8X 且 NO_Paint=0)的车触发预触发拍照；
-  全程仅 read_area，绝不写 PLC（结果回写按现场要求暂未实现）。
+  后台启一个【只读】PLC 监控线程：持续采样 DB230 并提前锁存车身上下文；
+  监测 DB130.DBX0.1（出车信号）上升沿，上升沿时用此前锁存的 DB230 去
+  记录（全部车）→ 仅对 (9X/8X 且 NO_Paint=0) 的车触发拍照 → 落库 + 写追溯。
+  全程仅 read_area，绝不写 PLC。
 
 用法：
-  1) 上位机安装依赖： pip install pypylon opencv-python flask
+  1) 上位机安装依赖： pip install pypylon opencv-python flask python-snap7
   2) 关闭 pylon Viewer（避免相机被占用）
   3) 手动模式： python capture/web_capture.py
      自动模式： python capture/web_capture.py --plc-auto
   4) 浏览器打开 http://<上位机IP>:5000 看实时画面、点按钮或看自动记录
 
+取流架构（2026-08-15 重写）：
+  全程序只有 CameraStreamer 后台 _loop 一个线程调用 RetrieveResult。预览与拍照
+  都来自这个单循环的产出，绝不在第二个线程里并发取流——这正是上一版在工控机
+  约 10 秒冻屏的根因。拍照收到请求后进入 capturing 状态，_loop 按程序固定 3fps
+  节奏收集"当时最新帧"写盘，共 7s×3fps=21 张；拍照节奏由软件控制、与相机实际
+  帧率解耦，相机自由运行多少 fps 都不会把拍照锁死（历史曾锁到 2 张/秒）。
+
 连拍 / 相机参数 / PLC 参数都集中在顶部，按现场情况调整。
-依赖：Flask（网页服务） + pypylon（相机） + opencv（图像） + python-snap7（仅自动模式）
 """
 import os
 import sys
@@ -30,7 +36,6 @@ import json
 import datetime
 import threading
 import argparse
-import concurrent.futures as _cf
 import subprocess
 import re
 import shutil
@@ -38,21 +43,15 @@ import shutil
 import cv2
 import numpy as np
 import hashlib
-import collections
+import concurrent.futures as _cf
 
 # 版本戳：每次修改后更新，方便现场确认是不是最新代码
-VERSION = "2026-07-30-latch-trigger"  # 修复:自动触发改为"新车上下文出现即锁存触发"(不再等上升沿去读被覆盖的DB230);收到车信号写data/capture_exec.log追溯
+VERSION = "2026-08-15-single-loop"  # 重写:单循环取流根治冻屏;保留双触发/PLC锁存/存储/网页
 
-# 相机配置模式开关（对照实验用，默认关闭=标准模式）。
-#   设环境变量 MINIMAL_CAM=1 启动程序时，回到"2026-07-21 初版最小干预"配置：
-#     - 不强制帧率封顶（相机自由运行，与初版一致）
-#     - 不强制 MaxNumBuffer=1000
-#   用途：定位"2026-07-31 大改(66ab82d)后工控机取流不稳"的根因。若开启后稳定，
-#   说明是那次大改引入的强制参数所致；若仍卡，则元凶在取流架构/网卡驱动。
-MINIMAL_CAM = os.environ.get("MINIMAL_CAM", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ------------------------- 版本戳（现场确认是否最新程序）-------------------------
 def _find_git_repo():
-    """Walk up from this file to locate the .git directory; return repo root or None."""
+    """从本文件向上查找 .git 目录，返回仓库根或 None。"""
     d = os.path.dirname(os.path.abspath(__file__))
     for _ in range(6):
         if os.path.isdir(os.path.join(d, ".git")):
@@ -65,13 +64,9 @@ def _find_git_repo():
 
 
 def _git_push_info():
-    """Return (short_commit_hash, commit_date) of the current repo, or (None, None).
-    Ties the version to the exact PUSHED code. Prints a debug note if git is
-    unavailable so failures are never silent."""
+    """返回 (短提交号, 提交日期)；git 不可用时返回 (None, None)。"""
     repo = _find_git_repo()
     if repo is None:
-        print("[web_capture.py] git: no .git found upward from script -> "
-              "push id will use stamp/run fallback")
         return None, None
     candidates = ["git"]
     if os.name == "nt":
@@ -91,15 +86,11 @@ def _git_push_info():
                 return hs, ds
         except Exception as e:
             last_err = e
-    print(f"[web_capture.py] git: command unavailable ({last_err}) -> "
-          "push id will use stamp/run fallback")
     return None, None
 
 
 def _load_stamp():
-    """Read the push id stamped at push time (capture/_push_info.py).
-    Reliable fallback when git is not usable at runtime (e.g. Git-Bash-only
-    install, or a deployed copy without .git)."""
+    """读取推送时写死的版本戳(capture/_push_info.py)，git 不可用时兜底。"""
     try:
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_push_info.py")
         if os.path.exists(p):
@@ -116,8 +107,6 @@ def _load_stamp():
 _GIT_HASH, _GIT_DATE = _git_push_info()
 _STAMP_HASH, _STAMP_DATE = _load_stamp()
 RUN_TAG = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
-# VERSION_TAG = PUSH identity "<hash>__<commit-date>".
-# Priority: live git (if available) > pushed stamp file > run time.
 if _GIT_HASH:
     VERSION_TAG = _GIT_HASH + "__" + _GIT_DATE
     _VER_SRC = "git"
@@ -127,17 +116,8 @@ elif _STAMP_HASH:
 else:
     VERSION_TAG = RUN_TAG
     _VER_SRC = "run"
-# 【视觉自检】自愈代码是否启用。本版本(_selfheal_edition>=1)启用 _loop 自愈机制;
-# 老版本这个变量不存在,启动横幅会显示"未启用"——这是覆盖是否成功的最直接判据。
-_SELFHEAL_ENABLED = True
-_SELFHEAL_EDITION = 1
 print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (source={_VER_SRC}, run={RUN_TAG})")
 
-# 【视觉自检】启动时显眼打印,操作员一眼可判断是不是新版。
-print("=" * 60)
-print(f"[自愈] 摄像机心跳丢失自愈功能: {'已启用' if _SELFHEAL_ENABLED else '未启用'}")
-print(f"[自愈] FREEZE_SEC=3.0  RECOVER_COOLDOWN_SEC=10.0  edition={_SELFHEAL_EDITION}")
-print("=" * 60)
 
 try:
     import pypylon.pylon as py
@@ -159,18 +139,12 @@ WEB_HOST = "0.0.0.0"     # 0.0.0.0 = 允许任意网卡访问（远程可见）�
 WEB_PORT = 5000          # 浏览器访问端口（上位机防火墙需放行此端口）
 
 # ===================== 连拍参数（现场可按需修改） =====================
-FPS = 3                # 连拍帧率（张/秒）
+FPS = 3                # 连拍帧率（张/秒），程序侧固定节奏，与相机帧率解耦
 DURATION_SEC = 7       # 连拍持续时长（秒）
-# 总张数 = FPS × DURATION_SEC，当前 3×7 = 21 张
-# 触发方式：
-#   "pre"  = 预触发环形缓冲（推荐）：后台一直缓存最近 DURATION_SEC 秒的帧，
-#            点按钮/出车信号立即把缓冲里已有的帧存盘 → 拍的是信号那一刻及之前的画面，
-#            对运动物体无延迟（解决"点的时候是车头、拍到的是车身"问题）。
-#   "post" = 点击/信号后才开始连拍 DURATION_SEC 秒（旧逻辑，运动物体会有明显延迟）。
-CAPTURE_MODE = "pre"
+TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
 # ===================== 相机连接参数 =====================
-# 现场相机 IP 列表（多相机就绪：左右相机共用同一出车信号，分别把 IP 追加进来即可，
+# 现场相机 IP 列表（多相机就绪：左右相机共用同一出车信号，把 IP 追加进来即可，
 # 其余代码无需改动；当前仅左相机一台）。第二台接入后，自动模式会同时触发全部相机。
 CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
 CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
@@ -178,7 +152,7 @@ CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序�
 # ===================== 相机采集参数 =====================
 EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
 # 增益：设为 None = 沿用相机【当前值】、不修改。
-#   你在 pylon Viewer 里已设 Gain Raw 136（现场暗光、曝光锁 2000µs 的可用档），
+#   你在 pylon Viewer 里已设过增益（现场暗光、曝光锁 2000µs 的可用档），
 #   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
 #   若想强制指定固定值，填 dB 数字，例如 6.0。
 #   ⚠️ 注意：相机断电/复位后会恢复默认（通常 0 dB），届时需要重设或在此填固定值。
@@ -187,17 +161,18 @@ GAMMA = 1.0                  # Gamma，默认 1.0（保持线性，利于检测�
 PIXEL_FORMAT = "Mono8"       # 黑白相机 8bit 灰度
 
 # ===================== 存储参数 =====================
-SAVE_DIR = os.path.join(ROOT, "data", "raw_images")      # 预触发临时缓冲(拍完即被移走)
+SAVE_DIR = os.path.join(ROOT, "data", "raw_images")      # 临时缓冲(拍完即被移走)
 INSPECTION_ROOT = os.path.join(ROOT, "data", "inspection")  # 最终存储根(按 日期/PIN 分层)
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
 RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON(非拍照车兜底)
 
 # ===================== 收到车信号追溯日志（持久化到磁盘）=====================
 # 用途：PLC 上下文(DB230 车型/滑橇/PIN)在相机 7 秒连拍期间会被下一台车覆盖，
-# 本日志在【锁存收到车的瞬间】落盘，记录每台被程序收到的车(车型/滑橇/PIN/免喷/路由决策)，
+# 本日志在【收到出车信号的瞬间】落盘，记录每台被程序收到的车(车型/滑橇/PIN/免喷/路由决策)，
 # 即便之后被覆盖，这里也有完整追溯——直接回答"MM** 信号到底收到没有、被谁覆盖"。
 CAPTURE_EXEC_LOG = os.path.join(ROOT, "data", "capture_exec.log")
 _exec_log_lock = threading.Lock()
+
 
 def log_capture_event(**fields):
     """追加写入一条收到车/拍照事件到持久日志（append 模式，线程安全，每行一个 JSON）。
@@ -217,17 +192,13 @@ def log_capture_event(**fields):
         print(f"[执行日志] 写盘失败(可忽略): {e}")
         return None
 
+
 # ===================== 预览参数 =====================
 STREAM_WIDTH = 960           # 网页实时流宽度（等比缩放，不改原始采集分辨率）
 JPEG_QUALITY = 80            # 实时流 JPEG 质量（1-100，越小越流畅但越糊）
 
 # ===================== CPU 占用控制（与机器人站共用上位机，必须省）=====================
-# 相机自由运行在 ~48fps，但本程序不上满：预览 + 预触发只要几 fps 就够。
-#  - GRAB_FPS  ：后台取流节拍上限（默认 6）。超出部分由相机/驱动直接丢弃，不进 Python。
-#  - STREAM_FPS：网页 MJPEG 推送上限（默认 12），避免无谓的 JPEG 编码拖 CPU。
-#  - 预触发环形缓冲仍按 FPS(3) 节流写入，保证 21 张铺满 7 秒（见 CameraStreamer._loop）。
-# 三项叠加，相比"48fps 裸取 + 不限速编码"，CPU 与 GigE 带宽下降一个数量级。
-GRAB_FPS = 6
+# 相机自由运行（Mono8 1920x1200 通常几十 fps），MJPEG 推送限速 STREAM_FPS 避免无谓编码拖 CPU。
 STREAM_FPS = 12
 # 预览帧"卡住"判定阈值(秒)：_latest 超过该时间未刷新，视为相机/取流异常 → 画面叠加告警。
 STALE_SEC = 2.0
@@ -236,35 +207,13 @@ STALE_SEC = 2.0
 PLC_IP = "172.30.173.6"
 PLC_RACK = 0
 PLC_SLOT = 2
-PLC_POLL_MS = 20             # 出车信号轮询间隔（毫秒，原10；共用上位机降到20省CPU，仍足够抓车）
-PLC_CTX_MS = 200             # DB230 上下文采样间隔（毫秒）
+PLC_POLL_MS = 20             # 出车信号轮询间隔（毫秒）
+PLC_CTX_MS = 200             # DB230 上下文采样间隔（毫秒）——提前锁存
 
 # 缺陷标签集合（出现 → 整体 NG）；与 detection.detector.NG_LABELS 保持一致
 NG_LABELS = {"missing", "break", "overspray", "width"}
 
 # ================================================================
-
-
-
-
-def _pick_closest(ring, target_ts):
-    """从按时间递增的 ring 列表 [(ts, frame), ...] 里找 ts 最接近 target_ts 的项。
-    ring 长度 ≤ 512，线性扫描足够快(O(500) < 0.1ms)。返回 (ts, frame) 或 None。
-    """
-    if not ring:
-        return None
-    best = None
-    best_diff = float('inf')
-    for item in ring:
-        diff = item[0] - target_ts
-        abs_diff = diff if diff >= 0 else -diff
-        if abs_diff < best_diff:
-            best_diff = abs_diff
-            best = item
-        # ring 时间递增，且过 target_ts 后 abs_diff 必然单调不减(因为步长固定)；
-        # 为稳妥仍扫描完，500 次循环不影响性能。
-    return best
-
 
 
 def _frame_hash(frame):
@@ -279,15 +228,24 @@ def _grab_to_frame(grab):
     """pylon grab 结果 → 完全独立的 numpy 数组(真·深拷贝)。
 
     pypylon 的 grab.Array 返回相机内部缓冲区的【视图】，不同 grab 之间该缓冲区
-    可能被驱动复用。必须在 grab.Release() 之前做一次深拷贝，否则环形缓冲里 21 帧
-    会指向同一块被反复刷新的内存 → 全部相同(现场多次复现)。
-    np.array(..., copy=True) 强制独立拷贝并锁定 dtype=uint8，对任意 pypylon 实现都安全。
+    可能被驱动复用。必须在 grab.Release() 之前做一次深拷贝，否则连续帧会指向
+    同一块被反复刷新的内存 → 全部相同。np.array(..., copy=True) 强制独立拷贝并
+    锁定 dtype=uint8，对任意 pypylon 实现都安全。
     """
     return np.array(grab.Array, copy=True, dtype=np.uint8)
 
 
 class CameraStreamer:
-    """后台线程：持续取流 → 存最新帧；按需执行连拍。单台相机。"""
+    """单循环取流相机封装（单台相机）。
+
+    架构（根治冻屏）：全程序只有本类的后台 _loop 一个线程调用 RetrieveResult。
+    预览与拍照都从同一个循环取到的帧获得，绝不在第二个线程里并发取流
+    （原架构"后台线程 + ring + 拍照线程并发取流"是工控机约 10 秒冻屏的根因）。
+
+    拍照：收到 request_capture 后进入 capturing 状态，_loop 按程序固定 3fps 节奏
+    收集"当时最新帧"写盘，共 21 张。拍照节奏由软件控制，与相机实际帧率解耦，
+    相机自由运行多少 fps 都不会把拍照锁死（历史曾锁到 2 张/秒）。
+    """
 
     def __init__(self, camera_ip=None):
         self.camera_ip = camera_ip
@@ -300,20 +258,21 @@ class CameraStreamer:
         self.camera_info = {}
 
         self._latest = None
-        self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)，用于"预览是否卡住"判定
-        self._frame_no = 0           # 预览帧累计计数(常驻心跳，用于直观判断"是否在出帧")
+        self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)
+        self._frame_no = 0           # 预览帧累计计数(常驻心跳)
         self._lock = threading.Lock()
 
-        self._capture_req = threading.Event()   # 触发连拍
-
-        self._capture_running = threading.Event()  # capture thread running flag
-        # Pre-trigger ring buffer: (perf_counter_ts, numpy_array). Capacity covers DURATION_SEC at camera fps; ensures 连拍切片覆盖触发前 DURATION_SEC.
-        self._ring = collections.deque(maxlen=512)
-        self._ring_lock = threading.Lock()
-        self._last_cam_ts = None        # last camera hw-ts (plan A dedup on new exposures)
-        self._ts_none_logged = False     # GetTimeStamp 不可用仅告警一次的标记
-        self._capture_done = threading.Event()  # 连拍完成信号
-        self._last_result = None                # 最近一次连拍结果
+        # 拍照状态机
+        self._cap_state = "idle"     # idle / capturing
+        self._cap_running = False
+        self._cap_idx = 0
+        self._cap_start = 0.0
+        self._cap_next = 0.0
+        self._cap_frames = []
+        self._cap_hashes = []
+        self._cap_t0_dt = None
+        self._capture_done = threading.Event()
+        self._last_result = None
 
         self._thread = None
         self._error = None
@@ -346,27 +305,6 @@ class CameraStreamer:
             self.cam = py.InstantCamera(factory.CreateDevice(devices[0]))
 
         self.cam.Open()
-        # 【GigE 心跳-Open 后兜底】pypylon 的 GetNode 对不存在节点会返回
-        # PlaceholderParameter 对象(非 None,但 .SetValue 抛 'not callable')。
-        # 节点只读/占位时静默跳过,完全依赖 _loop 自愈兜底。
-        try:
-            tl = self.cam.GetTLParamsNode()
-            if tl is not None:
-                # 用 hasattr/try 双重防御,任何失败都吞掉
-                try:
-                    hb = tl.GetNode("GevHeartbeatDisable")
-                    hb.SetValue(True)
-                    print("[cam-diag] GigE心跳禁用: 已写入 GevHeartbeatDisable=True")
-                except Exception:
-                    pass  # 占位/只读/不存在,静默
-                try:
-                    hbt = tl.GetNode("GevHeartbeatTimeout")
-                    hbt.SetValue(60000)
-                    print("[cam-diag] GigE心跳超时: 已写入 60000ms")
-                except Exception:
-                    pass
-        except Exception:
-            pass  # 整个 TransportLayer 不可用也无所谓,自愈兜底
         self.camera_info = {
             "model": self.cam.GetDeviceInfo().GetModelName(),
             "serial": self.cam.GetDeviceInfo().GetSerialNumber(),
@@ -377,97 +315,74 @@ class CameraStreamer:
 
     def _configure(self):
         nodemap = self.cam.GetNodeMap()
-        conf_log = []
-        # 顺序注意：先配增益/Gamma/曝光，最后再改像素格式。
-        # 改 PixelFormat 会触发相机重配置，可能让曝光节点暂时不可写。
+        conf = []
         # 增益（None = 沿用相机当前值，不修改）
         if GAIN_DB is None:
-            conf_log.append("增益=沿用相机当前值(不修改)")
+            conf.append("增益=沿用相机当前值(不修改)")
         else:
             try:
                 nodemap.GetNode("Gain").SetValue(GAIN_DB)
-                conf_log.append(f"增益={GAIN_DB}dB")
+                conf.append(f"增益={GAIN_DB}dB")
             except Exception as e:
-                conf_log.append(f"增益设置异常: {e}")
+                conf.append(f"增益设置异常: {e}")
         # Gamma
         try:
             nodemap.GetNode("Gamma").SetValue(GAMMA)
-            conf_log.append(f"Gamma={GAMMA}")
+            conf.append(f"Gamma={GAMMA}")
         except Exception as e:
-            conf_log.append(f"Gamma设置异常: {e}")
+            conf.append(f"Gamma设置异常: {e}")
         # 曝光：自动模式必须先关掉，否则手动曝光值写不进去
         try:
-            auto_node = nodemap.GetNode("ExposureAuto")
-            if auto_node:
-                auto_node.SetValue("Off")
-                conf_log.append("曝光自动=Off")
-        except Exception as e:
-            conf_log.append(f"曝光自动设置异常: {e}")
-        # 曝光模式设为 Timed（部分相机默认非 Timed，手动曝光会写不进）
+            auto = nodemap.GetNode("ExposureAuto")
+            if auto:
+                auto.SetValue("Off")
+        except Exception:
+            pass
         try:
-            mode_node = nodemap.GetNode("ExposureMode")
-            if mode_node:
-                mode_node.SetValue("Timed")
-                conf_log.append("曝光模式=Timed")
-        except Exception as e:
-            conf_log.append(f"曝光模式设置异常: {e}")
+            m = nodemap.GetNode("ExposureMode")
+            if m:
+                m.SetValue("Timed")
+        except Exception:
+            pass
         # 曝光：依次尝试 ExposureTime / ExposureTimeAbs
-        # 注：aca1920-48gm 上 ExposureTime 是占位节点(not available)，
-        #     真正可写的是 ExposureTimeAbs；占位失败属预期，静默跳过避免误报。
-        exp_ok = False
+        ok = False
         for name in ("ExposureTime", "ExposureTimeAbs"):
             try:
-                node = nodemap.GetNode(name)
-                if node is None:
+                n = nodemap.GetNode(name)
+                if n is None:
                     continue
-                node.SetValue(EXPOSURE_TIME_US)
-                conf_log.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
-                exp_ok = True
+                n.SetValue(EXPOSURE_TIME_US)
+                conf.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
+                ok = True
                 break
             except Exception as e:
                 msg = str(e)
                 if "not available" in msg.lower() or "placeholder" in msg.lower():
                     continue
-                conf_log.append(f"{name} 设置失败: {msg}")
-        if not exp_ok:
-            conf_log.append("曝光未写入，沿用相机当前曝光值")
+                conf.append(f"{name} 设置失败: {msg}")
+        if not ok:
+            conf.append("曝光未写入，沿用相机当前曝光值")
         # 触发/采集模式：强制自由运行(Continuous + TriggerMode=Off)。
-        # 若相机残留"外触发/软触发"配置而无触发源，会只出 1 帧后冻结 → ring 全是同一张
-        # （21 张全同的又一根源）。显式关触发 + 连续采集，保证 48fps 持续出图。
+        # 若相机残留"外触发/软触发"配置而无触发源，会只出 1 帧后冻结。
         try:
             tm = nodemap.GetNode("TriggerMode")
             if tm is not None:
                 tm.SetValue("Off")
-                conf_log.append("触发模式=Off(自由运行)")
         except Exception as e:
-            conf_log.append(f"触发模式设置异常: {e}")
+            conf.append(f"触发模式设置异常: {e}")
         try:
             am = nodemap.GetNode("AcquisitionMode")
             if am is not None:
                 am.SetValue("Continuous")
-                conf_log.append("采集模式=Continuous")
         except Exception as e:
-            conf_log.append(f"采集模式设置异常: {e}")
-        # 采集帧率：aca1920-48gm 上单数 'AcquisitionFrameRate' 是占位节点(not available)，
-        # 不控制实际输出，碰它无效还可能误导。曾经的"大坑"：在【此处】打开
-        # AcquisitionFrameRateEnable 却没同时写入有效的 AcquisitionFrameRateAbs →
-        # 相机冻结(21 张全同/0 张)。故本处【完全不碰帧率限制开关】，所有 Enable+Abs 的
-        # 设定统一交给 _camera_rate_check，并保证"先写 Abs 安全值、再开 Enable"成对出现。
-        # 时序确定性由 _do_capture 的软件 3fps 节流保证，与相机端锁不锁无关。
-        conf_log.append(f"采集帧率=帧率限制交由 _camera_rate_check 安全封顶(软件节流 {FPS}fps)")
-        # 像素格式放最后
+            conf.append(f"采集模式设置异常: {e}")
+        # 像素格式
         try:
             nodemap.GetNode("PixelFormat").SetValue(PIXEL_FORMAT)
-            conf_log.append(f"像素格式={PIXEL_FORMAT}")
+            conf.append(f"像素格式={PIXEL_FORMAT}")
         except Exception as e:
-            conf_log.append(f"像素格式设置异常(沿用当前值): {e}")
-        self._camera_rate_check(nodemap, conf_log)
-        # 【关键修复：网页预览冻结根因】触发/采集模式必须在 PixelFormat 与帧率封顶【之后】
-        # 再强制一次。背景：现场曾把相机在 pylon 里配成硬件触发(等 PLC 信号)，该配置存入相机
-        # UserSet。前面改 PixelFormat 会触发相机重载用户配置，把 TriggerMode 重新设回 On；若只在前
-        # 置步骤设过一次 Off，会被这次重载覆盖 → 网页预览一直等触发信号 → 只出 1 帧就冻结(frame #1)。
-        # 故在所有配置(含 PixelFormat/帧率)写完后，最后再强制 TriggerMode=Off + Continuous，并复位
-        # TriggerSource=Software 解除对外部信号线的依赖，且读回校验，确保相机真正自由运行。
+            conf.append(f"像素格式设置异常(沿用当前值): {e}")
+        # 末次强制 TriggerMode=Off（防相机 UserSet 重载把触发重新打开，导致只出 1 帧冻结）。
         try:
             tm = nodemap.GetNode("TriggerMode")
             if tm is not None:
@@ -481,154 +396,24 @@ class CameraStreamer:
                     ts.SetValue("Software")
             except Exception:
                 pass
-            # 读回校验：若仍是 On（被 UserSet 重载），重试一次并明确记录
-            tm_now = tm.GetValue() if (tm is not None) else None
-            if tm_now != "Off" and tm is not None:
-                tm.SetValue("Off")
-                tm_now = tm.GetValue()
-            conf_log.append(f"触发模式=Off(自由运行, 末次强制) 实际={tm_now}")
-            print(f"[cam-diag] 触发模式末次强制: 实际={tm_now}")
+            conf.append("触发模式=Off(自由运行,末次强制)")
         except Exception as e:
-            conf_log.append(f"触发模式末次强制异常: {e}")
-            print("[cam-diag] 触发模式末次强制异常:", e)
-
-        # 【GigE 心跳修复】现场复现:程序启动后 ~140s 预览冻结、LIVE #帧号卡在 1。
-        # 根因：相机 GigE 心跳(默认约 3s 心跳包)超时后,固件会主动停止出图(无异常抛出),
-        #       pypylon RetrieveResult 一直 Return 而 GrabSucceeded=False,_loop 看似活着实则空转,
-        #       预览/JPEG 自然停滞。pylon View 短测不复现,因它不会长时间挂占。
-        # 修复：心跳参数的具体禁用尝试已在 connect() 中 Open() 之后做过,这里只补一个静默尝试
-        #       作为第二保险,占位节点/只读直接吞掉,不污染 conf_log。
-        try:
-            tl = self.cam.GetTLParamsNode()
-            if tl is not None:
-                try:
-                    tl.GetNode("GevHeartbeatDisable").SetValue(True)
-                except Exception:
-                    pass
-                try:
-                    tl.GetNode("GevHeartbeatTimeout").SetValue(60000)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # 注意：心跳禁用大概率无效（pypylon TLParams 节点 Open 后只读），
-        #       真正保命的兜底是 _loop 的"3秒无新帧自动 StopGrab+StartGrab"自愈。
-
-        self._conf_log = conf_log
-
-    def _camera_rate_check(self, nodemap, conf_log):
-        """Read rate-limiting camera params and CAP the camera at a network-safe
-        production rate >= our 3fps target. Called at connect time.
-
-        关键教训（现场复现）：本机 aca1920-48gm 上单数 'AcquisitionFrameRate' 是占位
-        节点（not available），但 'AcquisitionFrameRateEnable' + 'AcquisitionFrameRateAbs'
-        可用。最初版本把 Enable 关掉 -> 相机解锁成原生 48fps 自由运行，现场 1Gbps 链路
-        在 48fps 的极高包速率下取图超时（RetrieveResult 失败）。所以这里**绝不解锁到
-        48fps**，而是用 Enable+Abs 把相机产出封顶到一个网络可承受的安全值（SAFE_FPS），
-        软件仍按 3fps 节流取图。这样既能 >=3fps，又不压垮网卡。
-
-        诊断行**立即 print**，即使后续 RetrieveResult 失败也能看到相机真实参数。"""
-        try:
-            def _gv(name, attr="Value"):
-                n = nodemap.GetNode(name)
-                if n is None:
-                    return None
-                try:
-                    if attr == "Max":
-                        return n.GetMax()
-                    if attr == "Min":
-                        return n.GetMin()
-                    return n.GetValue()
-                except Exception:
-                    return None
-            fr_en = _gv("AcquisitionFrameRateEnable")
-            fr_abs = _gv("AcquisitionFrameRateAbs")
-            fr_max = _gv("AcquisitionFrameRateAbs", "Max")
-            exp_us = _gv("ExposureTimeAbs")
-            trig = _gv("TriggerMode")
-            pkt = _gv("GevSCPSPacketSize")
-            thr = _gv("DeviceLinkThroughputLimit")
-            line = (f"cam-diag: TriggerMode={trig} FrameRateEnable={fr_en} "
-                    f"FrameRateAbs={fr_abs}fps(max={fr_max}) Exposure={exp_us}us "
-                    f"PacketSize={pkt} ThroughputLimit={thr}")
-            conf_log.append(line)
-            print("[cam-diag]", line)  # 立即打印：即使取图失败也要能看到真实参数
-
-            # 安全封顶（【唯一权威路径】）：先写【已知安全值】AcquisitionFrameRateAbs=SAFE_FPS，
-            # 再开 AcquisitionFrameRateEnable=True。二者必须成对出现——曾因"单开 Enable 而
-            # Abs 未写有效值"导致相机冻结(21 张全同/0 张)。此处保证：只要 Enable=True，Abs
-            # 一定是安全的 6fps（>=软件 3fps 节流，且远低于 48fps 压垮 1Gbps 链路的阈值）。
-            # 注：GigE 包大小不再自动改成 8192——现场未确认开启巨帧(Jumbo Frame)，保持默认。
-            SAFE_FPS = 6.0
-            n_abs = nodemap.GetNode("AcquisitionFrameRateAbs")
-            n_en = nodemap.GetNode("AcquisitionFrameRateEnable")
-            if n_abs is None or n_en is None:
-                # 占位相机：帧率节点不可用，保持相机默认模式（不强行改，软件节流兜底）
-                conf_log.append("cam-diag: 帧率节点不可用(占位)，保持相机默认模式")
-                print("[cam-diag] 帧率节点不可用(占位)，保持相机默认模式")
-            else:
-                if MINIMAL_CAM:
-                    # 【对照实验】最小干预模式：不强制帧率封顶，相机自由运行（与 7/21 初版一致）。
-                    # 用于验证"7/31 大改强制 6fps 封顶"是否导致工控机取流不稳。
-                    conf_log.append("cam-diag: [最小干预模式] 不强制帧率封顶，相机自由运行(与7/21初版一致)")
-                    print("[cam-diag] [最小干预模式] 不强制帧率封顶，相机自由运行")
-                else:
-                    try:
-                        n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
-                        n_en.SetValue(True)        # ② 再开限制——成对，绝不留"Enable 无有效 Abs"
-                        conf_log.append(f"cam-diag FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True(成对写入)")
-                        print(f"[cam-diag] FIX: 帧率限制 Abs={SAFE_FPS}fps Enable=True")
-                    except Exception as e:
-                        conf_log.append(f"cam-diag: 封顶失败(已忽略，软件节流兜底): {e}")
-                        print("[cam-diag] 封顶失败(已忽略):", e)
-        except Exception as e:
-            conf_log.append(f"cam-diag error (ignored): {e}")
-            print("[cam-diag] error (ignored):", e)
-        # 落盘启动诊断：即使上面异常也尽量持久化已有信息，便于远程上位机(无终端)排查。
-        try:
-            self._persist_startup_log(conf_log)
-        except Exception:
-            pass
-
-    def _persist_startup_log(self, conf_log):
-        """把相机启动诊断追加落盘到 data/records/camera_startup.log。
-
-        用途：现场上位机常无终端/SSH，且取图失败往往只在启动瞬间暴露真实参数。
-        一旦"连拍照都拍不了了"，用户无需连终端，直接打开该文件即可看到
-        TriggerMode / FrameRateEnable / FrameRateAbs / 是否应用 FIX，定位冻结根因。"""
-        try:
-            os.makedirs(RECORD_DIR, exist_ok=True)
-            path = os.path.join(RECORD_DIR, "camera_startup.log")
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"===== 相机启动诊断 {ts} (version p{VERSION_TAG}) =====\n")
-                for ln in conf_log:
-                    f.write(ln + "\n")
-                f.write("\n")
-                f.flush()
-        except Exception as e:
-            print(f"[cam-diag] 落盘失败(可忽略): {e}")
+            conf.append(f"触发模式末次强制异常: {e}")
+        # 注意：不碰 AcquisitionFrameRate*（帧率节点），相机自由运行。
+        # 拍照 3fps 由程序控制，与相机帧率解耦，根治 fps 锁死（历史曾锁到 2 张/秒）。
+        conf.append(f"采集帧率=相机自由运行(拍照由程序按 {FPS}fps 节流)")
+        self._conf_log = conf
+        for c in conf:
+            print(f"  - {c}")
 
     def start(self):
-        print(f"[相机配置] 模式={'最小干预(MINIMAL_CAM=1)' if MINIMAL_CAM else '标准'}"
-              f"  (对照实验：最小干预=与7/21初版一致，不强制帧率/MaxNumBuffer)")
-        # 抓取策略：用 LatestImageOnly（与现场验证可用的 live_capture.py 一致）。
-        # 关键：后台取流线程轮询仅 GRAB_FPS=6，远慢于相机产出 48fps。
-        #   OneByOne 会把帧按顺序塞进有限缓冲池，慢轮询下缓冲池耗尽 → 相机触发
-        #   背压、停采 → RetrieveResult 反复返回同一冻结帧 → 预触发 21 帧全相同
-        #   （现场复现：同一张照片）。LatestImageOnly 始终返回最新帧、自动丢弃旧帧，
-        #   慢轮询也能拿到各不相同的新鲜帧；且轮询(6fps)慢于产出(48fps)，不会重复。
-        #   时序确定性仍由 _loop 的 3fps 软件节流保证，不受策略影响。
+        # 抓取策略：LatestImageOnly。单循环下 loop 连续消费，始终拿最新帧、自动丢弃旧帧，
+        # 既保证预览流畅，又保证拍照收集到的都是不同时间点的新鲜帧。
         self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
-        if MINIMAL_CAM:
-            # 【对照实验】最小干预模式：不强制 MaxNumBuffer（与 7/21 初版一致）。
-            print("[cam-diag] [最小干预模式] 不强制 MaxNumBuffer=1000(与7/21初版一致)")
-        else:
-            # Expand internal frame buffer so 7s pre-trigger ring never drops frames.
-            try:
-                self.cam.MaxNumBuffer.SetValue(1000)
-            except Exception:
-                pass
+        try:
+            self.cam.MaxNumBuffer.SetValue(1000)
+        except Exception:
+            pass
         # 取一张确认分辨率
         grab = self.cam.RetrieveResult(5000, py.TimeoutHandling_ThrowException)
         if not grab.GrabSucceeded():
@@ -643,356 +428,137 @@ class CameraStreamer:
         except Exception:
             self.actual_fmt = "未知"
         grab.Release()
-        # 出图率自测：连取若干张，统计"唯一帧"与实测 fps。
-        # 这是"21张全同"的终极诊断：若唯一帧<取到数，说明相机没在自由运行(外触发/冻结)。
-        try:
-            n_probe = 10
-            probe_hashes = []
-            t0p = time.perf_counter()
-            for _ in range(n_probe):
-                g = self.cam.RetrieveResult(600, py.TimeoutHandling_Return)
-                if g and g.GrabSucceeded():
-                    probe_hashes.append(_frame_hash(_grab_to_frame(g)))
-                elif g:
-                    g.Release()
-            dtp = time.perf_counter() - t0p
-            uniqp = len(set(probe_hashes))
-            fpsp = len(probe_hashes) / dtp if dtp > 0 else 0
-            print(f"[相机] 出图率自测: 取到{len(probe_hashes)}/{n_probe}张, "
-                  f"≈{fpsp:.1f}fps, 唯一帧={uniqp}/{len(probe_hashes)}")
-            if uniqp <= 1:
-                print("[相机] ⚠️ 出图率自测告警: 连续取的帧内容相同 → "
-                      "相机可能未自由运行(检查 TriggerMode/外触发线/曝光是否过大)")
-        except Exception as e:
-            print(f"[相机] 出图率自测异常(忽略): {e}")
 
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def _loop(self):
-        """后台取流线程：持续 RetrieveResult，每帧写入环形缓冲(带 perf_counter 时间戳)，
-        同时刷新 _latest 供网页预览。出车信号 → 启动独立 capture 线程做时间戳切片。
+        """唯一取流线程：持续取帧更新预览；拍照进行中按 3fps 收集帧写盘。
 
-        取流节拍匹配相机产出(48fps ≈ 21ms)，保证 DURATION_SEC 内 ring 不丢帧。
-        LatestImageOnly + 大 MaxNumBuffer：保留最近帧，Python 端不取也不丢关键窗口。
-
-        【自愈】连续 FREEZE_SEC(默认 3s) 无新帧 → 视作相机 GigE 心跳丢失/stale grab，
-        自动 StopGrabbing + StartGrabbing 重建取流；状态写入 self._error 和
-        self._recover_count,网页状态栏可读到。最多每 RECOVER_COOLDOWN_SEC(默认 10s) 重启一次,
-        避免抖动期间刷屏重启。
+        全程只有这里调用 RetrieveResult，彻底规避"双线程并发取流"的冻屏根因。
         """
-        GET_INTERVAL = 1.0 / 48  # ~21ms，匹配相机 48fps 产出节奏
-        FREEZE_SEC = 3.0         # 多久没新帧算"冻住"
-        RECOVER_COOLDOWN_SEC = 10.0
-        next_get = time.perf_counter()
-        # 【自愈关键修复】之前 last_frame_wall 只在 cam_ts != _last_cam_ts 时更新,
-        #       现场相机 GigE 冻结后会返回重复帧,GrabSucceeded=True 但 cam_ts 重复,
-        #       导致 last_frame_wall 永远不刷新 → 3 秒自愈检测形同虚设。
-        # 新方案:改用 _frame_no 帧号增量判断;_frame_no 不动 = 相机冻结。
-        last_frame_no = 0
-        last_recover_wall = 0.0
-        self._recover_count = 0
-        print(f"[相机] _loop 启动, FREEZE_SEC={FREEZE_SEC}s, 监控帧号增量")
         while self.running:
             try:
-                wait = next_get - time.perf_counter()
-                if wait > 0:
-                    time.sleep(wait)
-                next_get = time.perf_counter() + GET_INTERVAL
-                # 连拍进行中：由 _do_capture 独占相机取流，_loop 短暂让位
-                if self._capture_running.is_set():
-                    time.sleep(0.02)
+                grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
+                if not grab or not grab.GrabSucceeded():
+                    if grab:
+                        grab.Release()
                     continue
-                try:
-                    grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
-                except Exception as e:
-                    self._error = f"RetrieveResult 异常: {e}"
-                    print(f"[相机] RetrieveResult 异常(忽略继续): {e}", flush=True)
-                    time.sleep(0.05)
-                    continue
-                if grab and grab.GrabSucceeded():
-                    frame = _grab_to_frame(grab)   # 深拷贝，杜绝 21 张全同
-                    # 相机硬件时间戳：仅用于诊断，绝不能用来"拦截非新帧"。
-                    # 坑：aca1920-48gm 默认未开启时间戳(chunk)时，GetTimeStamp() 会抛
-                    # 异常→cam_ts=None；若用 cam_ts 相等来判定新帧，则除首帧外全部被
-                    # 拦截→预览永久冻在首帧+立即红字+自愈也只能补 1 帧又立刻被拦截。
-                    # 故预览/心跳在【每次成功取图】时都刷新，cam_ts 仅供诊断记录。
-                    try:
-                        cam_ts = grab.GetTimeStamp()
-                    except Exception:
-                        cam_ts = None
-                        if not self._ts_none_logged:
-                            self._ts_none_logged = True
-                            print("[cam-diag] GetTimeStamp() 不可用(相机未开启时间戳/chunk)"
-                                  "→预览去重改为按取图刷新，避免冻在首帧", flush=True)
-                    now = time.perf_counter()
-                    is_new = (cam_ts is None) or (self._last_cam_ts is None) or (cam_ts != self._last_cam_ts)
-                    if is_new:
-                        self._last_cam_ts = cam_ts
-                    # 仅"真实新曝光"写入 ring（保留慢轮询节流优化）；cam_ts 不可用时不拦截。
-                    if is_new:
-                        with self._ring_lock:
-                            self._ring.append((now, frame))
-                    with self._lock:
-                        self._latest = frame          # 始终刷新→预览不冻结
-                        self._latest_ts = now         # 始终刷新→age 不超阈值→不弹红字
-                        self._frame_no += 1           # 每次成功取图 +1：相机停出图时
-                                                      # RetrieveResult 失败→此处不执行→
-                                                      # 帧号停滞→age 超阈值→自愈触发
-                    grab.Release()
-                    # 出车信号：启动独立 capture 线程(不阻塞 _loop)
-                    if self._capture_req.is_set() and not self._capture_running.is_set():
-                        self._capture_running.set()
-                        threading.Thread(target=self._run_capture_safe, daemon=True).start()
-                elif grab:
-                    # grab 拿到了但失败(超时/丢包)，释放掉继续
-                    grab.Release()
-                # 【自愈检查】基于帧号增量 + 时间双判据,任一条件不满足都会触发
+                frame = _grab_to_frame(grab)   # 深拷贝，杜绝连续帧指向同一缓冲
+                grab.Release()
                 now = time.perf_counter()
                 with self._lock:
-                    cur_frame_no = self._frame_no
-                frame_gap = cur_frame_no - last_frame_no
-                if frame_gap <= 0 and (now - last_recover_wall) > RECOVER_COOLDOWN_SEC:
-                    last_recover_wall = now
-                    self._recover_count += 1
-                    msg = (f"[相机] 自愈: 帧号 {last_frame_no}->{cur_frame_no} 无变化 "
-                           f"(recover#{self._recover_count}), StopGrab+StartGrab...")
-                    print(msg, flush=True)
-                    self._error = msg
-                    try:
-                        try:
-                            self.cam.StopGrabbing()
-                        except Exception:
-                            pass
-                        time.sleep(0.3)
-                        self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
-                        try:
-                            self.cam.MaxNumBuffer.SetValue(1000)
-                        except Exception:
-                            pass
-                        # 重启后立即拿一帧,更新 last_frame_no
-                        g2 = self.cam.RetrieveResult(3000, py.TimeoutHandling_Return)
-                        if g2 and g2.GrabSucceeded():
-                            frame2 = _grab_to_frame(g2)
-                            with self._lock:
-                                self._latest = frame2
-                                self._latest_ts = time.perf_counter()
-                                self._frame_no += 1
-                            g2.Release()
-                            last_frame_no = self._frame_no
-                            print(f"[相机] 自愈: 重新出帧 frame_no={self._frame_no}", flush=True)
-                        else:
-                            if g2:
-                                g2.Release()
-                            print("[相机] 自愈: 重启后仍未拿到帧,稍后重试", flush=True)
-                            last_frame_no = cur_frame_no  # 不重置,继续监控
-                    except Exception as e:
-                        print(f"[相机] 自愈失败: {e}", flush=True)
-                        self._error = f"自愈失败: {e}"
-                elif frame_gap > 0:
-                    last_frame_no = cur_frame_no
+                    self._latest = frame          # 始终刷新 → 预览不冻结
+                    self._latest_ts = now
+                    self._frame_no += 1           # 每次成功取图 +1：停出图时帧号停滞
+                if self._cap_state == "capturing":
+                    self._collect(frame, now)
             except Exception as e:
                 self._error = f"取流异常: {e}"
-                print(f"[相机] 取流异常(已忽略，继续): {e}", flush=True)
+                print(f"[相机] 取流异常(继续): {e}")
                 time.sleep(0.1)
 
+    def _collect(self, frame, now):
+        """拍照状态机：仅当到下一目标时间(每 1/FPS 秒)才收集一帧，节奏由程序控制。
 
-    def _do_capture(self):
-        """直接同步连拍(治本版)：触发时立即从相机连抓 21 张、每张间隔 333ms。
-
-        放弃环形缓冲方案——那条路在现场反复复现"21 张全同"，根因不在 Python 而在
-        GrabStrategy_LatestImageOnly + 后台 _loop + ring 这一组合对真实环境的脆弱性。
-        改为触发瞬间 _do_capture 独占相机同步抓 21 张：若相机在自由运行，必得 21 张
-        不同帧；若相机冻结/未出图，抓取失败被直接计入诊断，日志会明确写出。
-        21 帧覆盖触发时刻起共 7 秒，每张用真实拍摄时刻命名，文件名带版本号短戳。
+        若相机帧率远高于 3fps，多余帧在 `now < self._cap_next` 时直接丢弃；
+        若相机帧率低于 3fps，则每帧都收集（间隔变长），但仍不会因"软件节流逻辑"
+        而把拍照锁死——拍照只取决于本状态机，不依赖相机帧率配置。
         """
-        self._capture_req.clear()
-        total = int(FPS * DURATION_SEC)      # 21
-        frame_interval = 1.0 / FPS           # 0.333...s
-        identical = False
-
-        t_trigger = time.perf_counter()
-        t_trigger_dt = datetime.datetime.now()
-        t0 = t_trigger
-
-        os.makedirs(SAVE_DIR, exist_ok=True)
-        print(f"[拍照] 手动连拍目标目录(绝对路径): {os.path.abspath(SAVE_DIR)}")
-        # 磁盘空间预检：写到一半磁盘满会让 cv2.imwrite 抛异常（曾导致 _capture_running
-        # 卡死、预览永久冻结）。提前告警，配合下方 imwrite 的 try 保护与外层
-        # _run_capture_safe 的 finally 兜底，三重保险。
+        with self._lock:
+            if self._cap_state != "capturing":
+                return
+            if self._cap_idx >= TOTAL:
+                return
+            if now < self._cap_next:
+                return
+            idx = self._cap_idx + 1
+            self._cap_idx = idx
+            self._cap_next += 1.0 / FPS
+            cap_start = self._cap_start
+            cap_t0_dt = self._cap_t0_dt
+            done = (self._cap_idx >= TOTAL)
+        # 锁外写盘：单个写盘异常只跳过当前张，不炸整批、不炸取流
+        frame_dt = cap_t0_dt + datetime.timedelta(seconds=(now - cap_start))
+        fname = self._format_filename(idx=idx, dt=frame_dt)
+        fpath = os.path.join(SAVE_DIR, fname)
         try:
-            free_mb = shutil.disk_usage(SAVE_DIR).free // (1024 * 1024)
-            if free_mb < 200:
-                print(f"[拍照] ⚠️ 磁盘剩余仅 {free_mb}MB，写盘可能失败，请清理 data/")
-                self._error = f"磁盘剩余不足 {free_mb}MB"
-        except Exception:
-            pass
-        batch = []
-        saved_hashes = []
-        picked_meta = []  # (idx, target_ts, actual_ts, delta_ms, frame)
-        # 单张抓取超时：333ms 节拍 + 1500ms 余量（防 OS sleep 抖动/相机偶发延迟）
-        timeout_ms = int(frame_interval * 1000) + 1500
-
-        # 直接同步：第 i 张的目标时刻 = t_trigger + i*interval，第 0 张即触发瞬间
-        next_at = t_trigger
-        for i in range(total):
-            wait = next_at - time.perf_counter()
-            if wait > 0:
-                time.sleep(wait)
-            actual_ts = time.perf_counter()
-            try:
-                grab = self.cam.RetrieveResult(timeout_ms, py.TimeoutHandling_Return)
-            except Exception as e:
-                print(f"[相机] 第{i+1}/{total}张取图异常: {e}")
-                next_at += frame_interval
-                continue
-            if not grab or not grab.GrabSucceeded():
-                if grab:
-                    grab.Release()
-                print(f"[相机] 第{i+1}/{total}张取图失败(超时/相机未出图)")
-                next_at += frame_interval
-                continue
-            frame = _grab_to_frame(grab)   # 独立深拷贝，杜绝 21 张全同
-            # camera hardware timestamp: iron proof of whether this is a new exposure.
-            # MUST be read before Release().
-            try:
-                cam_ts = grab.GetTimeStamp()
-            except Exception:
-                cam_ts = None
-            grab.Release()
-            # 连拍期间也实时刷新预览帧：否则 _loop 让位 7s，网页实时界面会"卡死"。
+            cv2.imwrite(fpath, frame)
+            h = _frame_hash(frame)
             with self._lock:
-                self._latest = frame
-                self._latest_ts = time.perf_counter()
-
-            target_ts = t_trigger + i * frame_interval
-            delta_ms = (actual_ts - target_ts) * 1000.0
-            picked_meta.append((i + 1, target_ts, actual_ts, delta_ms, frame, cam_ts))
-
-            # 边抓边存：每抓一张立即写盘，避免 21 张攒一起写超时丢帧
-            frame_dt = t_trigger_dt + datetime.timedelta(seconds=(actual_ts - t_trigger))
-            fname = self._format_filename(idx=i + 1, dt=frame_dt)
-            fpath = os.path.join(SAVE_DIR, fname)
-            # 写盘保护：磁盘满/权限异常只跳过当前张，不炸整批、不炸线程
-            # （线程炸掉会让 _capture_running 卡死 → 预览永久冻结，见 _run_capture_safe）。
-            try:
-                cv2.imwrite(fpath, frame)
-            except Exception as e:
-                print(f"[拍照] 写盘失败(跳过该张): {fpath}: {e}")
+                self._cap_frames.append(fname)
+                self._cap_hashes.append(h)
+        except Exception as e:
+            print(f"[拍照] 写盘失败(跳过该张): {fpath}: {e}")
+            with self._lock:
                 self._error = f"写盘失败: {e}"
-                next_at += frame_interval
-                continue
-            batch.append(fname)
-            saved_hashes.append(_frame_hash(frame))
+        if done:
+            with self._lock:
+                if self._cap_state == "capturing":
+                    self._finish()
 
-            next_at += frame_interval
-
-        elapsed = time.perf_counter() - t0
-
-        # ========== 诊断日志 ==========
-        unique_hashes = len(set(saved_hashes))
-        identical = (len(saved_hashes) > 1 and unique_hashes <= 1)
-        # camera hardware timestamp diagnostic: iron proof that 21 frames are new exposures
-        cam_ts_list = [m[5] for m in picked_meta]
-        distinct_cam_ts = len(set(cam_ts_list))
-        print(f"[相机] ===== 直接连拍统计 VERSION={VERSION} 启动戳=p{VERSION_TAG} =====")
-        print(f"[相机] 目标={total}张 实际={len(batch)}张 唯一帧={unique_hashes}/{len(saved_hashes)} "
-              f"总耗时={elapsed:.2f}s")
-        if identical:
-            print(f"[相机] 逐帧去重: ⚠️ 全部相同!  → 相机未持续出图 或 场景完全静止(无车经过)")
-            print(f"[相机] ❌ 请查看启动日志 [相机] 出图率自测 的唯一帧/fps 判断相机端状态。")
-        elif len(saved_hashes) == 0:
-            print(f"[相机] 逐帧去重: ❌ 0张取到 → 相机无响应/未出图，检查连接与 TriggerMode=Off")
-        elif unique_hashes == len(saved_hashes):
-            print(f"[相机] 逐帧去重: ✓ 各不相同")
-        else:
-            print(f"[相机] 逐帧去重: 部分重复")
-        # ---- camera hardware timestamp verdict (the key iron proof) ----
-        if None not in cam_ts_list and distinct_cam_ts <= 1:
-            print(f'[cam] HARDWARE TS ALL EQUAL ({distinct_cam_ts}) -> camera produced NO new frames (frozen / no trigger / TriggerMode not Off)')
-        elif distinct_cam_ts == len(cam_ts_list):
-            print(f'[cam] HARDWARE TS: OK {distinct_cam_ts}/{len(cam_ts_list)} all distinct -> 21 frames are genuine new exposures')
-        else:
-            print(f'[cam] HARDWARE TS: partial repeats ({distinct_cam_ts}/{len(cam_ts_list)})')
-        # per-frame hw-ts
-        for idx, target_ts, actual_ts, delta_ms, _f, cam_ts in picked_meta:
-            offset_s = target_ts - t_trigger
-            print(f'[cam] frame {idx:02d}/{total} target_off={offset_s*1000:6.1f}ms delta={delta_ms:+6.1f}ms hw_ts={cam_ts}')
-
-            offset_s = target_ts - t_trigger
-            print(f"[相机] 第{idx:02d}/{total}张 目标偏移={offset_s*1000:6.1f}ms 实际偏差={delta_ms:+6.1f}ms")
-        if len(picked_meta) >= 2:
-            ivs = [(picked_meta[j][2] - picked_meta[j-1][2]) * 1000.0 for j in range(1, len(picked_meta))]
-            avg = sum(ivs)/len(ivs); mn = min(ivs); mx = max(ivs)
-            print(f"[相机] 间隔: 平均={avg:.1f}ms 最小={mn:.1f}ms 最大={mx:.1f}ms (目标={frame_interval*1000:.1f}ms)")
-        print(f"[相机] ===== 统计结束 =====")
-
-        span = (len(batch) - 1) * frame_interval if len(batch) > 1 else 0.0
+    def _finish(self):
+        """连拍完成：汇总结果、置 _capture_done，唤醒 request_capture 的等待。"""
+        elapsed = time.perf_counter() - self._cap_start
+        with self._lock:
+            self._cap_state = "idle"
+            self._cap_running = False
+            batch = list(self._cap_frames)
+            hashes = list(self._cap_hashes)
+        saved = len(batch)
+        unique = len(set(hashes))
+        identical = (saved > 1 and unique <= 1)
+        elapsed = round(elapsed, 2)
         abs_files = [os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch]
-        cap_ok = (len(batch) > 0)
+        print(f"[拍照] 完成: 目标{TOTAL}张 实际{saved}张 唯一帧={unique}/{saved} "
+              f"耗时={elapsed}s 是否全同={identical}")
+        if identical:
+            print("[拍照] ⚠️ 21张全部相同 → 相机未持续出图(检查 TriggerMode=Off/网口掉流)")
+        if saved:
+            print(f"[拍照] 已落盘 {saved} 张 -> {os.path.abspath(SAVE_DIR)}")
+            print(f"[拍照] 首张: {abs_files[0]}")
+            print(f"[拍照] 末张: {abs_files[-1]}")
         self._last_result = {
-            "ok": cap_ok,
-            "saved": len(batch),
-            "unique_frames": unique_hashes,
-            "distinct_cam_ts": distinct_cam_ts,
+            "ok": saved > 0,
+            "saved": saved,
+            "unique_frames": unique,
             "identical": identical,
-            "total": total,
-            "elapsed": round(elapsed, 2),
-            "span_sec": round(span, 2),
-            "actual_fps": round(len(batch) / elapsed, 1) if elapsed > 0 else 0,
-            "mode": f"直接同步连拍({DURATION_SEC}s/{total}张,不依赖ring)",
+            "total": TOTAL,
+            "elapsed": elapsed,
+            "actual_fps": round(saved / elapsed, 1) if elapsed > 0 else 0,
+            "mode": f"触发后连拍{DURATION_SEC}s/{TOTAL}张(程序{FPS}fps,与相机帧率解耦)",
             "files": batch,
             "abs_files": abs_files,
             "save_dir": os.path.abspath(SAVE_DIR),
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        # 自证式落盘记录：即使 0 张也写，便于现场确认"是没抓到帧而非存错地方"
-        try:
-            manifest = {
-                "ok": cap_ok,
-                "saved": len(batch),
-                "total": total,
-                "unique_frames": unique_hashes,
-                "distinct_cam_ts": distinct_cam_ts,
-                "identical": identical,
-                "save_dir": os.path.abspath(SAVE_DIR),
-                "abs_files": abs_files,
-                "ts": self._last_result["ts"],
-            }
-            with open(os.path.join(SAVE_DIR, "_last_manual_capture.json"), "w", encoding="utf-8") as mf:
-                json.dump(manifest, mf, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[拍照] 写 manifest 失败(可忽略): {e}")
-        if cap_ok:
-            print(f"[拍照] 已落盘 {len(batch)} 张 -> {os.path.abspath(SAVE_DIR)}")
-            print(f"[拍照] 首张: {abs_files[0]}")
-            print(f"[拍照] 末张: {abs_files[-1]}")
-        else:
-            print(f"[拍照] ❌ 本次连拍 0 张有效帧，未写入任何文件(相机未出图/连接已断)。")
-            print(f"[拍照]   排查: 看启动日志 [相机] 出图率自测 的 fps/唯一帧；确认网口未掉流。")
-        self._capture_running.clear()
         self._capture_done.set()
 
-
-
-    def _run_capture_safe(self):
-        """连拍安全包装：无论 _do_capture 是否抛异常，都保证复位 _capture_running/_capture_done。
-
-        根因修复：原 _do_capture 仅靠函数末尾 clear()，若连拍中抛异常（最典型磁盘写满致
-        cv2.imwrite 失败），线程会带着 _capture_running=True 死掉 → 后台 _loop 永久让位 →
-        网页预览永久冻帧 + 红字，直到重启。此处用 try/finally 兜底，彻底消除该类永久冻结。
-        """
-        try:
-            self._do_capture()
-        except Exception as e:
-            self._error = f"连拍线程异常(已兜底恢复预览): {e}"
-            import traceback
-            traceback.print_exc()
-            print(f"[拍照] ❌ 连拍线程异常(已兜底，预览恢复): {e}", flush=True)
-        finally:
-            self._capture_running.clear()
-            self._capture_done.set()
+    def request_capture(self):
+        """外部触发连拍，阻塞直到完成，返回结果 dict。"""
+        if not self.running:
+            return {"ok": False, "error": "相机未运行"}
+        with self._lock:
+            if self._cap_running:
+                return {"ok": False, "error": "拍照进行中，请稍候"}
+            self._cap_running = True
+            self._cap_state = "capturing"
+            self._cap_idx = 0
+            self._cap_start = time.perf_counter()
+            self._cap_next = self._cap_start   # 第一张立即收集
+            self._cap_frames = []
+            self._cap_hashes = []
+            self._cap_t0_dt = datetime.datetime.now()
+        self._capture_done.clear()
+        if self._capture_done.wait(timeout=DURATION_SEC + 5.0):
+            with self._lock:
+                return self._last_result or {"ok": False, "error": "连拍无结果"}
+        # 超时兜底：复位状态，避免永久卡在 capturing
+        with self._lock:
+            self._cap_running = False
+            self._cap_state = "idle"
+        return {"ok": False, "error": "连拍超时"}
 
     def _format_filename(self, idx=None, dt=None, prefix="Image"):
         if dt is None:
@@ -1001,18 +567,6 @@ class CameraStreamer:
         idx_part = f"_{idx:02d}" if idx is not None else ""
         # 文件名带版本短号 p{VERSION_TAG}，现场一眼即可确认是否跑了最新程序
         return f"{prefix}{idx_part}__p{VERSION_TAG}__{ts}{SAVE_EXT}"
-
-    def request_capture(self):
-        """外部触发连拍，阻塞直到完成，返回结果 dict。"""
-        if not self.running:
-            return {"ok": False, "error": "相机未运行"}
-        self._capture_done.clear()
-        self._capture_req.set()
-        # 等待完成（最多 DURATION_SEC + 5s 余量）
-        timeout = DURATION_SEC + 5.0
-        if self._capture_done.wait(timeout=timeout):
-            return self._last_result or {"ok": False, "error": "连拍无结果"}
-        return {"ok": False, "error": "连拍超时"}
 
     def get_latest_jpeg(self):
         """返回最新帧的 JPEG 字节，或 None。
@@ -1035,14 +589,12 @@ class CameraStreamer:
             if len(disp.shape) == 2:  # 兜底：确保 3 通道再叠加文字
                 disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
             # 常驻心跳：帧号 + 当前时钟 + 卡顿秒数，绿色小字固定在左下角。
-            # 操作员一眼可判断"画面到底在不在出帧"，不再靠猜"车身动没动"；
             # 帧号递增=实时出帧；帧号不动+下方红字=相机冻结/信号丢失。
             clk = time.strftime("%H:%M:%S")
             hb = f"LIVE #{fno}  {clk}  卡顿{age:.1f}s"
             cv2.putText(disp, hb, (8, disp.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 255, 0), 1, cv2.LINE_AA)
             if age > STALE_SEC:
-                # 画面卡住告警：红底白字，固定位置，明确提示而非静默定格
                 txt = f"!! 预览卡住/信号丢失 ({age:.0f}s)"
                 cv2.rectangle(disp, (0, 0), (disp.shape[1], 34), (0, 0, 180), -1)
                 cv2.putText(disp, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1064,8 +616,7 @@ class CameraStreamer:
             "pixel_format": self.actual_fmt,
             "config": getattr(self, "_conf_log", []),
             "params": {
-                "fps": FPS, "duration_sec": DURATION_SEC,
-                "total": int(FPS * DURATION_SEC),
+                "fps": FPS, "duration_sec": DURATION_SEC, "total": TOTAL,
                 "exposure_us": EXPOSURE_TIME_US,
                 "gain_db": GAIN_DB,
                 "gain_display": "相机当前值" if GAIN_DB is None else f"{GAIN_DB} dB",
@@ -1074,10 +625,9 @@ class CameraStreamer:
             "save_dir": INSPECTION_ROOT,
             "last_result": self._last_result,
             "preview_age_sec": round(time.perf_counter() - self._latest_ts, 1),
-            "frame_no": self._frame_no,   # 预览帧累计计数：递增=在出帧；不动=相机冻结
-            "capture_running": self._capture_running.is_set(),  # 连拍是否进行中（True 且 frame_no 不动=拍照线程卡死/异常）
-            "recover_count": getattr(self, "_recover_count", 0),  # 自愈重启 grab 次数
-            "error": self._error,       # 取流/存盘异常（兜底后仍记录，便于排查）
+            "frame_no": self._frame_no,
+            "capture_running": self._cap_running,
+            "error": self._error,
         }
 
     def stop(self):
@@ -1092,23 +642,25 @@ class CameraStreamer:
 
 
 def run_selftest():
-    """自检模式：连相机 → 预热让环形缓冲铺满 → 触发一次 21 张 → 校验是否各不相同。
+    """自检模式：连相机 → 稳定 1s → 触发一次 21 张 → 校验是否各不相同。
 
     无需 PLC / 网页服务，~10 秒即可确认"每秒 3 张、21 张不同"是否已达成。
     返回 0=通过, 1=失败。
     """
     if not HAS_PYPYLON:
-        print("[自检] 未安装 pypylon，请先: pip install pypylon"); return 1
+        print("[自检] 未安装 pypylon，请先: pip install pypylon")
+        return 1
     print(f"[自检] VERSION={VERSION}")
     hub = CameraHub()
     try:
         hub.connect_all()
         hub.start_all()
     except Exception as e:
-        print(f"[自检] 连接/启动失败: {e}"); return 1
-    print(f"[自检] 相机已启动，预热 {DURATION_SEC + 1}s 让环形缓冲铺满...")
-    time.sleep(DURATION_SEC + 1)
-    print(f"[自检] 触发连拍 {int(FPS * DURATION_SEC)} 张...")
+        print(f"[自检] 连接/启动失败: {e}")
+        return 1
+    print("[自检] 相机已启动，稳定 1s ...")
+    time.sleep(1)
+    print(f"[自检] 触发连拍 {TOTAL} 张 ...")
     r = hub.request_capture_primary()
     try:
         hub.stop_all()
@@ -1123,8 +675,8 @@ def run_selftest():
     if ident:
         print("[自检] ❌ 失败: 21 张完全相同 → 相机未持续出图 或 旧代码未更新")
         return 1
-    if uniq == saved == int(FPS * DURATION_SEC):
-        print("[自检] ✓ 通过: 21 张各不相同，3fps 预触发生效")
+    if uniq == saved == TOTAL:
+        print(f"[自检] ✓ 通过: {TOTAL} 张各不相同，程序 {FPS}fps 连拍生效")
         return 0
     print(f"[自检] ⚠️ 部分通过: 唯一帧 {uniq}/{saved}")
     return 0
@@ -1206,14 +758,14 @@ def handle_car_signal(ctx):
     """出车信号上升沿回调：记录全部车 → 仅(9X/8X 且 NO_Paint=0)拍照 → 落库+写追溯。
 
     流程（用户定义）：
-      上升沿 → 先记录全部车的车型/NO_Paint/滑橇/PIN →
-      若车型是 9X 或 8X 且 NO_Paint=0 → 触发相机拍照（预触发，立即）；
+      上升沿 → 用提前锁存的 DB230 记录全部车的车型/NO_Paint/滑橇/PIN →
+      若车型是 9X 或 8X 且 NO_Paint=0 → 触发相机拍照（出车信号后立即 7s 连拍）；
       否则不拍照（免检车 / 未接入车型）。
     所有车型用同一出车信号触发，避免拍照时机不一致导致照片错位。
 
     本迭代【不跑检测】：拍照车用占位结果记录，检测等照片确认后再接。
     全程只读 PLC；本函数不写任何 PLC 地址。
-    ctx 为 plc_monitor.parse_context 的 dict，无锁存时为 None。
+    ctx 为 plc_monitor.parse_context 的 dict（提前锁存的 DB230 上下文）。
     """
     global hub
     if ctx is None:
@@ -1232,7 +784,7 @@ def handle_car_signal(ctx):
     should_capture = (key in ("9X", "8X")) and (not no_paint)
 
     # 持久记录"收到车信号"——PLC 上下文在 7 秒连拍期间会被下一台车覆盖，
-    # 此处在该车被锁存收到的瞬间落盘，确保 MM** 等信号有完整追溯(车型/滑橇/PIN/决策)。
+    # 此处在该车被收到的瞬间落盘，确保 MM** 等信号有完整追溯(车型/滑橇/PIN/决策)。
     log_capture_event(
         type="car_received",
         source="plc_auto",
@@ -1259,7 +811,6 @@ def handle_car_signal(ctx):
             print(f"[自动] 拍照失败（相机未出图/连接异常）: {capture_err}")
 
     # 当前所有车型仅拍照存档，不跑检测——等算法就绪后再接入。
-    # 届时 9X(MM**)→SealDetector，8X(NM41/NM42)→对应检测器，替换此段即可。
     from common.interfaces import DetectionResult, Defect
     det = DetectionResult(
         car_model=model, ok=True,
@@ -1387,8 +938,7 @@ def _prune_scratch(max_age_days=7, max_files=2000):
 def _gen_mjpeg():
     """MJPEG 流生成器（推送节拍上限 STREAM_FPS，避免无谓的 JPEG 编码拖 CPU）。
 
-    防御性：单帧异常被吞掉并短暂让步，绝不让整条流被打死——否则网页实时界面
-    会"卡死"（曾经的根因之一：get_latest_jpeg 抛错 → 生成器异常退出 → <img> 定格）。
+    防御性：单帧异常被吞掉并短暂让步，绝不让整条流被打死——否则网页实时界面会卡死。
     """
     last = 0.0
     interval = 1.0 / STREAM_FPS
@@ -1451,7 +1001,7 @@ def index():
 <div class="wrap">
   <div class="video"><img id="feed" src="/video_feed"></div>
   <div class="bar">
-    <button id="cap" onclick="capture()">📸 拍最近{DURATION_SEC}秒（{int(FPS*DURATION_SEC)} 张）</button>
+    <button id="cap" onclick="capture()">📸 拍 7 秒连拍（{TOTAL} 张）</button>
     <span id="capState" class="meta"></span>
   </div>
   <div class="meta" id="meta"></div>
@@ -1471,7 +1021,6 @@ const state=document.getElementById('state');
 const plcstate=document.getElementById('plcstate');
 const capBtn=document.getElementById('cap');
 const capState=document.getElementById('capState');
-const auto=document.getElementById('auto');
 const carbody=document.getElementById('carbody');
 
 function refreshStatus(){{
@@ -1495,7 +1044,7 @@ function refreshStatus(){{
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>程序版本</b>：v${{s.version_tag}}（照片文件名含此短号，可确认是否最新）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
-    h+=`<b>预触发</b>：点按钮即存最近 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（运动无延迟）<br>`;
+    h+=`<b>连拍</b>：点按钮即连拍 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（${{s.params.fps}}fps）<br>`;
     h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
     h+=`<b>照片存储</b>：${{s.save_dir}}（按 日期/PIN 分层，临时缓冲在 data/raw_images）`;
     meta.innerHTML=h;
@@ -1531,7 +1080,6 @@ def video_feed():
     if not hub.running:
         return Response("相机未运行", status=503)
     # no-cache 头：避免浏览器/代理把 MJPEG 流缓存住，导致网页画面"冻在首帧"
-    # （即车身明明在动、但预览画面不动的另一条独立根因）。
     resp = Response(_gen_mjpeg(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
@@ -1568,8 +1116,7 @@ def main():
     parser.add_argument("--host", default=WEB_HOST)
     parser.add_argument("--port", type=int, default=WEB_PORT)
     parser.add_argument("--plc-auto", action="store_true",
-                        help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→记录全部车→拍照→记录）")
-    parser.add_argument("--no-browser-note", action="store_true")
+                        help="启用 PLC 自动触发（只读监测 DB130.DBX0.1 上升沿→提前锁存DB230→记录全部车→拍照→记录）")
     parser.add_argument("--selftest", action="store_true",
                         help="自检模式: 连相机拍21张并校验是否各不相同(无需PLC/网页)")
     args = parser.parse_args()
@@ -1577,7 +1124,6 @@ def main():
     if args.selftest:
         rc = run_selftest()
         sys.exit(rc)
-
 
     if not HAS_PYPYLON or not HAS_FLASK:
         print("[错误] 缺少依赖，请在上位机执行：")
@@ -1607,8 +1153,8 @@ def main():
     for c in st["config"]:
         print(f"  - {c}")
     print(f"[网页采集] 分辨率={st['resolution']}  色彩={st['color']}  像素格式={st['pixel_format']}")
-    print(f"[网页采集] 预触发缓冲：点按钮/出车信号即存最近 {st['params']['duration_sec']}秒 "
-          f"= {st['params']['total']} 张（{st['params']['fps']}fps）")
+    print(f"[网页采集] 连拍：点按钮/出车信号后立即连拍 {st['params']['duration_sec']}秒 "
+          f"= {st['params']['total']} 张（{st['params']['fps']}fps，与相机帧率解耦）")
     print(f"[网页采集] 照片存储：{INSPECTION_ROOT}（按 日期/PIN 分层；data/raw_images 仅临时缓冲）")
 
     plc = None
@@ -1625,7 +1171,7 @@ def main():
                 # 重活派发到独立线程，PLC 线程立即返回继续轮询（避免阻塞漏检）
                 plc.start(lambda ctx: _capture_exec.submit(handle_car_signal, ctx))
                 print(f"[PLC] 已连接 {PLC_IP}（只读）· 自动触发已启用"
-                      f"（记录全部车；仅 9X/8X 且 NO_Paint=0 拍照）")
+                      f"（DB130.DBX0.1 上升沿触发；仅 9X/8X 且 NO_Paint=0 拍照）")
         except Exception as e:
             print(f"[警告] PLC 自动触发启动失败：{e}（回退手动模式）")
             plc = None

@@ -3,13 +3,11 @@
 
 设计要点：
   - 全程仅 read_area，绝不 write_area / db_write / plc_stop / download。
-  - 触发策略：以【新车上下文出现】为触发条件，而非依赖 DB130.DBX0.1 上升沿。
-    原因：相机连拍 21 张需约 7 秒，期间下一辆车会覆盖 DB230 的车型/滑橇/PIN；
-    若等上升沿再去读，读到的已是下一台车，导致本台车（如 MM**）漏拍或张冠李戴。
-  - 采用【首次采到即锁存、立即触发】：后台线程持续采样 DB230，仅在非空时更新
-    self.latched；一旦 self.latched 出现"与上次不同的新车"，立刻 dict 拷贝锁存并
-    通过 on_rising(ctx) 回调出去——此时上下文还是本台车，尚未被下一台覆盖。
-  - bit1 仍持续读取用于健康观测，但不再作为唯一触发条件。
+  - 触发策略：以【DB130.DBX0.1 出车信号上升沿(0→1)】为权威触发源（现场确认）。
+  - 关键矛盾：PLC 收到出车信号会【立即清零 DB230】，所以上升沿那一刻去读 DB230 必然为空。
+    解决：后台线程持续采样 DB230（200ms），仅在非空时更新 self.latched（提前锁存）；
+    上升沿到来时，用【此前锁存的】DB230 上下文作为回调 ctx，而非当前实时去读。
+  - 去重：同一车的多个抖动脉冲用 _last_car_key 去重，避免重复拍照。
 
 ctx 结构（dict）：
   {"no_paint": int(0/1), "skid": int, "model_int": int,
@@ -60,10 +58,6 @@ def parse_context(buf_a, buf_b):
     skid = int.from_bytes(buf_a[i(1218):i(1218) + 2], "big")          # DBW1218
     pin = buf_a[i(1224):i(1224) + 14].decode("latin-1", errors="replace")  # DBB1224..1237
     no_paint = (buf_b[0] >> 1) & 1                                   # DBX1257.1
-    # 调试：打印字节1257的原始值和二进制，方便确认信号位置
-    print(f"[PLC调试] 字节1257 raw=0x{buf_b[0]:02X} bin={buf_b[0]:08b} "
-          f"bit0={buf_b[0]&1} bit1={(buf_b[0]>>1)&1} bit2={(buf_b[0]>>2)&1} "
-          f"bit3={(buf_b[0]>>3)&1}")
     return {
         "no_paint": no_paint,
         "skid": skid,
@@ -159,21 +153,21 @@ class PlcMonitor:
                     print(f"[PLC] 读上下文失败: {e}")
                     # 上下文采样失败不致命，继续轮询，下次再采
 
-            # 触发策略（关键修复）：以"新车上下文出现"为准，而非依赖 bit1 上升沿。
-            # 相机拍 21 张需约 7 秒，期间下一台车会覆盖 DB230 的车型/滑橇/PIN；
-            # 若等上升沿再去读，读到的已是下一台车。故在【首次采到新车】即锁存(dict
-            # 拷贝)并触发，确保后续判断/拍照/落库都用本台车正确上下文，不被覆盖。
-            with self._lock:
-                lat = self.latched
-            if lat:
-                key = (lat["skid"], lat["pin"], lat["model"])
-                if key != self._last_car_key:
-                    self._last_car_key = key
-                    snap = dict(lat)      # 锁存于首次出现，先于被下一台车覆盖
-                    try:
-                        on_rising(snap)
-                    except Exception as e:
-                        print(f"[PLC] 回调异常: {e}")
+            # 触发策略（现场确认）：DB130.DBX0.1 出车信号上升沿(0→1)为权威触发源。
+            # 上升沿到来时 PLC 已清零 DB230，故用【此前锁存】的 DB230 上下文，
+            # 不在此刻去读实时 DB230（会读空）。用 _last_car_key 去重防抖动脉冲。
+            if bit == 1 and prev == 0:
+                with self._lock:
+                    lat = self.latched
+                if lat is not None:
+                    key = (lat["skid"], lat["pin"], lat["model"])
+                    if key != self._last_car_key:
+                        self._last_car_key = key
+                        snap = dict(lat)      # 提前锁存，先于被下一台车覆盖
+                        try:
+                            on_rising(snap)
+                        except Exception as e:
+                            print(f"[PLC] 回调异常: {e}")
 
             prev = bit
             time.sleep(poll_s)
