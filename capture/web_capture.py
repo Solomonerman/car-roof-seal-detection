@@ -16,9 +16,13 @@
 用法：
   1) 上位机安装依赖： pip install pypylon opencv-python flask python-snap7
   2) 关闭 pylon Viewer（避免相机被占用）
-  3) 手动模式： python capture/web_capture.py
+  3) 手动模式： python capture/web_capture.py           （不带 --plc-auto）
      自动模式： python capture/web_capture.py --plc-auto
-  4) 浏览器打开 http://<上位机IP>:5000 看实时画面、点按钮或看自动记录
+  4) 浏览器打开 http://<上位机IP>:5000 看实时画面。
+     网页顶部 [手动测试 | 自动监控] 切换：
+       · 手动测试——设曝光/增益/每秒张数/总张数，点拍即拍，与 PLC 无关、不判车型、
+         照片存 data/manual_test/日期/时间/（网页直接看缩略图），纯测相机。
+       · 自动监控——PLC 出车信号触发、车型筛选、存档（原逻辑）。
 
 取流架构（2026-08-15 重写）：
   全程序只有 CameraStreamer 后台 _loop 一个线程调用 RetrieveResult。预览与拍照
@@ -165,6 +169,9 @@ SAVE_DIR = os.path.join(ROOT, "data", "raw_images")      # 临时缓冲(拍完�
 INSPECTION_ROOT = os.path.join(ROOT, "data", "inspection")  # 最终存储根(按 日期/PIN 分层)
 SAVE_EXT = ".bmp"            # BMP 无损，适合算法检测；也可改 ".jpg"
 RECORD_DIR = os.path.join(ROOT, "data", "records")   # 自动触发追溯 sidecar JSON(非拍照车兜底)
+# 手动测试模式照片存储根：与自动存档(data/inspection)完全隔离，不入库、不参与车型筛选。
+# 每次点击拍摄建一个 日期/时间 子目录，网页缩略图直接读这里。
+MANUAL_TEST_ROOT = os.path.join(ROOT, "data", "manual_test")
 
 # ===================== 收到车信号追溯日志（持久化到磁盘）=====================
 # 用途：PLC 上下文(DB230 车型/滑橇/PIN)在相机 7 秒连拍期间会被下一台车覆盖，
@@ -256,6 +263,9 @@ class CameraStreamer:
         self.height = 0
         self.actual_fmt = "未知"
         self.camera_info = {}
+        # 相机参数（运行时可由网页"手动测试"面板调整，初始取自顶部常量；connect 后读回实际值）
+        self._exposure_us = EXPOSURE_TIME_US
+        self._gain_db = GAIN_DB
 
         self._latest = None
         self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)
@@ -312,6 +322,20 @@ class CameraStreamer:
                          if hasattr(self.cam.GetDeviceInfo(), "GetIpAddress") else "N/A"),
         }
         self._configure()
+        # 读回相机实际生效的曝光/增益，作为运行时调整的基准（_configure 可能沿用相机当前值，
+        # 也可能被钳位，以实际 GetValue 为准）。
+        try:
+            n = self.cam.GetNodeMap().GetNode("ExposureTime")
+            if n:
+                self._exposure_us = n.GetValue()
+        except Exception:
+            pass
+        try:
+            n = self.cam.GetNodeMap().GetNode("Gain")
+            if n:
+                self._gain_db = n.GetValue()
+        except Exception:
+            pass
 
     def _configure(self):
         nodemap = self.cam.GetNodeMap()
@@ -469,20 +493,22 @@ class CameraStreamer:
         with self._lock:
             if self._cap_state != "capturing":
                 return
-            if self._cap_idx >= TOTAL:
+            if self._cap_idx >= self._cap_total:
                 return
             if now < self._cap_next:
                 return
             idx = self._cap_idx + 1
             self._cap_idx = idx
-            self._cap_next += 1.0 / FPS
+            self._cap_next += 1.0 / self._cap_fps
             cap_start = self._cap_start
             cap_t0_dt = self._cap_t0_dt
-            done = (self._cap_idx >= TOTAL)
+            cap_save_dir = self._cap_save_dir
+            cap_prefix = self._cap_prefix
+            done = (self._cap_idx >= self._cap_total)
         # 锁外写盘：单个写盘异常只跳过当前张，不炸整批、不炸取流
         frame_dt = cap_t0_dt + datetime.timedelta(seconds=(now - cap_start))
-        fname = self._format_filename(idx=idx, dt=frame_dt)
-        fpath = os.path.join(SAVE_DIR, fname)
+        fname = self._format_filename(idx=idx, dt=frame_dt, prefix=cap_prefix)
+        fpath = os.path.join(cap_save_dir, fname)
         try:
             cv2.imwrite(fpath, frame)
             h = _frame_hash(frame)
@@ -506,17 +532,20 @@ class CameraStreamer:
             self._cap_running = False
             batch = list(self._cap_frames)
             hashes = list(self._cap_hashes)
+            cap_save_dir = self._cap_save_dir
+            cap_fps = self._cap_fps
+            cap_total = self._cap_total
         saved = len(batch)
         unique = len(set(hashes))
         identical = (saved > 1 and unique <= 1)
         elapsed = round(elapsed, 2)
-        abs_files = [os.path.abspath(os.path.join(SAVE_DIR, f)) for f in batch]
-        print(f"[拍照] 完成: 目标{TOTAL}张 实际{saved}张 唯一帧={unique}/{saved} "
-              f"耗时={elapsed}s 是否全同={identical}")
+        abs_files = [os.path.abspath(os.path.join(cap_save_dir, f)) for f in batch]
+        print(f"[拍照] 完成: 目标{cap_total}张 实际{saved}张 唯一帧={unique}/{saved} "
+              f"耗时={elapsed}s 是否全同={identical} 落盘={cap_save_dir}")
         if identical:
-            print("[拍照] ⚠️ 21张全部相同 → 相机未持续出图(检查 TriggerMode=Off/网口掉流)")
+            print("[拍照] ⚠️ 全部相同 → 相机未持续出图(检查 TriggerMode=Off/网口掉流)")
         if saved:
-            print(f"[拍照] 已落盘 {saved} 张 -> {os.path.abspath(SAVE_DIR)}")
+            print(f"[拍照] 已落盘 {saved} 张 -> {os.path.abspath(cap_save_dir)}")
             print(f"[拍照] 首张: {abs_files[0]}")
             print(f"[拍照] 末张: {abs_files[-1]}")
         self._last_result = {
@@ -524,21 +553,81 @@ class CameraStreamer:
             "saved": saved,
             "unique_frames": unique,
             "identical": identical,
-            "total": TOTAL,
+            "total": cap_total,
             "elapsed": elapsed,
             "actual_fps": round(saved / elapsed, 1) if elapsed > 0 else 0,
-            "mode": f"触发后连拍{DURATION_SEC}s/{TOTAL}张(程序{FPS}fps,与相机帧率解耦)",
+            "mode": f"连拍{cap_total}张(程序{cap_fps}fps,与相机帧率解耦)",
             "files": batch,
             "abs_files": abs_files,
-            "save_dir": os.path.abspath(SAVE_DIR),
+            "save_dir": os.path.abspath(cap_save_dir),
             "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._capture_done.set()
 
-    def request_capture(self):
-        """外部触发连拍，阻塞直到完成，返回结果 dict。"""
+    # ---------- 运行时参数调整（手动测试面板用，自由运行下直接写相机）----------
+    def set_exposure(self, us):
+        """运行时设置曝光时间(µs)，返回相机实际生效值。安全钳位 [50, 100000]µs。"""
+        if not self.running or self.cam is None:
+            return {"ok": False, "error": "相机未运行", "exposure_us": self._exposure_us}
+        us = max(50, min(100000, int(round(us))))
+        try:
+            # 先确保曝光自动已关，否则手动值写不进去
+            n = self.cam.GetNodeMap().GetNode("ExposureTime")
+            nm = self.cam.GetNodeMap().GetNode("ExposureMode")
+            if nm:
+                try: nm.SetValue("Timed")
+                except Exception: pass
+            n.SetValue(us)
+            actual = n.GetValue()
+            self._exposure_us = actual
+            print(f"[相机] 曝光已设为 {actual}µs（请求 {us}µs）")
+            return {"ok": True, "exposure_us": actual}
+        except Exception as e:
+            return {"ok": False, "error": f"曝光设置失败: {e}", "exposure_us": self._exposure_us}
+
+    def set_gain(self, db):
+        """运行时设置增益(dB)，返回相机实际生效值。安全钳位 [0, 24]dB。
+
+        db=None 表示"沿用相机当前值、不修改"（方便先看清当前画面再决定）。
+        """
+        if not self.running or self.cam is None:
+            return {"ok": False, "error": "相机未运行", "gain_db": self._gain_db}
+        if db is None:
+            try:
+                n = self.cam.GetNodeMap().GetNode("Gain")
+                self._gain_db = n.GetValue() if n else None
+            except Exception:
+                pass
+            return {"ok": True, "gain_db": self._gain_db, "note": "沿用相机当前值"}
+        db = max(0.0, min(24.0, float(db)))
+        try:
+            n = self.cam.GetNodeMap().GetNode("Gain")
+            n.SetValue(db)
+            actual = n.GetValue()
+            self._gain_db = actual
+            print(f"[相机] 增益已设为 {actual}dB（请求 {db}dB）")
+            return {"ok": True, "gain_db": actual}
+        except Exception as e:
+            return {"ok": False, "error": f"增益设置失败: {e}", "gain_db": self._gain_db}
+
+    def request_capture(self, fps=None, total=None, save_dir=None, prefix="Image"):
+        """外部触发连拍，阻塞直到完成，返回结果 dict。
+
+        参数（每次可覆盖，自动模式用默认、手动测试模式由网页传入）：
+          fps      : 拍照节奏(张/秒)，仅决定软件收集节拍，与相机实际帧率解耦 → 不会锁死
+          total    : 总张数
+          save_dir : 落盘目录（自动=SAVE_DIR 临时缓冲，手动测试=MANUAL_TEST_ROOT/日期/时间）
+          prefix   : 文件名前缀（自动=Image，手动=Test）
+        """
         if not self.running:
             return {"ok": False, "error": "相机未运行"}
+        fps = fps or FPS
+        total = total or TOTAL
+        save_dir = save_dir or SAVE_DIR
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": f"创建存储目录失败: {e}"}
         with self._lock:
             if self._cap_running:
                 return {"ok": False, "error": "拍照进行中，请稍候"}
@@ -550,8 +639,14 @@ class CameraStreamer:
             self._cap_frames = []
             self._cap_hashes = []
             self._cap_t0_dt = datetime.datetime.now()
+            # 本次拍照参数（_collect/_finish 读取）
+            self._cap_fps = fps
+            self._cap_total = total
+            self._cap_save_dir = save_dir
+            self._cap_prefix = prefix
+        dur = total / fps if fps > 0 else DURATION_SEC
         self._capture_done.clear()
-        if self._capture_done.wait(timeout=DURATION_SEC + 5.0):
+        if self._capture_done.wait(timeout=dur + 5.0):
             with self._lock:
                 return self._last_result or {"ok": False, "error": "连拍无结果"}
         # 超时兜底：复位状态，避免永久卡在 capturing
@@ -617,9 +712,10 @@ class CameraStreamer:
             "config": getattr(self, "_conf_log", []),
             "params": {
                 "fps": FPS, "duration_sec": DURATION_SEC, "total": TOTAL,
-                "exposure_us": EXPOSURE_TIME_US,
-                "gain_db": GAIN_DB,
-                "gain_display": "相机当前值" if GAIN_DB is None else f"{GAIN_DB} dB",
+                "exposure_us": self._exposure_us,
+                "gain_db": self._gain_db,
+                "gain_display": ("相机当前值" if self._gain_db is None
+                                 else f"{self._gain_db} dB"),
                 "gamma": GAMMA,
             },
             "save_dir": INSPECTION_ROOT,
@@ -997,31 +1093,141 @@ def index():
 <body>
 <header><h1>车顶密封条相机 · 实时取景</h1>
   <span class="badge" id="state">连接中…</span>
-  <span class="badge" id="plcstate">PLC…</span></header>
+  <span class="badge" id="plcstate">PLC…</span>
+  <span class="badge" id="modeinfo">—</span></header>
 <div class="wrap">
   <div class="video"><img id="feed" src="/video_feed"></div>
-  <div class="bar">
-    <button id="cap" onclick="capture()">📸 拍 7 秒连拍（{TOTAL} 张）</button>
-    <span id="capState" class="meta"></span>
+
+  <div style="display:flex;gap:8px;margin:14px 0">
+    <button id="tabManual" onclick="switchTab('manual')" style="background:#2d6cdf">手动测试</button>
+    <button id="tabAuto" onclick="switchTab('auto')" style="background:#555">自动监控</button>
   </div>
-  <div class="meta" id="meta"></div>
-  <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
-  <table class="ctab"><thead><tr>
-    <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测(未接入)</th>
-  </tr></thead><tbody id="carbody">
-    <tr><td colspan="7" class="meta">手动模式</td></tr>
-  </tbody></table>
+
+  <!-- 手动测试面板：测相机，设参数，点拍即拍，与 PLC 无关 -->
+  <div id="panelManual">
+    <div style="border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:12px;background:#161616">
+      <div style="font-size:14px;margin-bottom:8px;color:#9cf">相机参数（实时写入相机，预览立即生效）</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:12px;color:#aaa">曝光(µs)<br>
+          <input id="exp" type="number" min="50" max="100000" step="50"
+                 style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <label style="font-size:12px;color:#aaa">增益(dB，留空=沿用相机当前值)<br>
+          <input id="gain" type="number" min="0" max="24" step="0.5"
+                 style="width:120px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <button onclick="applyCam()">应用参数</button>
+        <span id="camState" class="meta"></span>
+      </div>
+      <div style="font-size:13px;color:#aaa;margin-top:10px">连拍设置</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:4px">
+        <label style="font-size:12px;color:#aaa">每秒张数(1-48)<br>
+          <input id="fps" type="number" min="1" max="48" step="1" value="3"
+                 style="width:80px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <label style="font-size:12px;color:#aaa">总张数(1-200)<br>
+          <input id="total" type="number" min="1" max="200" step="1" value="21"
+                 style="width:80px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+      </div>
+      <div style="font-size:12px;color:#789;margin-top:8px">
+        说明：仅测试相机拍摄功能，不判车型、不存检测库、不连 PLC；照片存 data/manual_test/日期/时间/。</div>
+    </div>
+    <div class="bar">
+      <button id="cap" onclick="manualCapture()">📸 开始拍摄（手动测试）</button>
+      <span id="capState" class="meta"></span>
+    </div>
+    <div id="gal" style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0"></div>
+  </div>
+
+  <!-- 自动监控面板：PLC 触发 + 车型筛选 + 存档 -->
+  <div id="panelAuto" style="display:none">
+    <div class="meta" id="meta"></div>
+    <div class="bar">
+      <button id="capAuto" onclick="autoCapture()">📸 强制拍摄（补拍/调试）</button>
+      <span id="capStateAuto" class="meta"></span>
+    </div>
+    <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
+    <table class="ctab"><thead><tr>
+      <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测(未接入)</th>
+    </tr></thead><tbody id="carbody">
+      <tr><td colspan="7" class="meta">等待出车信号…</td></tr>
+    </tbody></table>
+  </div>
+
   <h3 style="font-size:14px;margin:18px 0 6px">采集日志</h3>
   <div id="log">等待操作…</div>
 </div>
 <script>
-const meta=document.getElementById('meta');
-const log=document.getElementById('log');
 const state=document.getElementById('state');
 const plcstate=document.getElementById('plcstate');
-const capBtn=document.getElementById('cap');
-const capState=document.getElementById('capState');
+const modeinfo=document.getElementById('modeinfo');
+const meta=document.getElementById('meta');
+const log=document.getElementById('log');
 const carbody=document.getElementById('carbody');
+const capState=document.getElementById('capState');
+const capStateAuto=document.getElementById('capStateAuto');
+const camState=document.getElementById('camState');
+const gal=document.getElementById('gal');
+let _inited=false;
+
+function switchTab(name){{
+  document.getElementById('panelManual').style.display=(name==='manual')?'block':'none';
+  document.getElementById('panelAuto').style.display=(name==='auto')?'block':'none';
+  document.getElementById('tabManual').style.background=(name==='manual')?'#2d6cdf':'#555';
+  document.getElementById('tabAuto').style.background=(name==='auto')?'#2d6cdf':'#555';
+}}
+
+function applyCam(){{
+  const exp=parseFloat(document.getElementById('exp').value);
+  const gv=document.getElementById('gain').value.trim();
+  const gain=(gv==='')?null:parseFloat(gv);
+  const body={{exposure_us:isNaN(exp)?null:exp}};
+  if(gain!==null) body.gain_db=gain;
+  camState.textContent='应用中…';
+  fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(r=>r.json()).then(res=>{{
+      let m='';
+      if(res.exposure) m+=(res.exposure.ok?('曝光='+res.exposure.exposure_us+'µs '):('曝光失败:'+(res.exposure.error||'')+' '));
+      if(res.gain) m+=(res.gain.ok?('增益='+res.gain.gain_db+'dB'):('增益失败:'+(res.gain.error||'')));
+      camState.textContent=m||'已应用';
+    }}).catch(e=>{{camState.textContent='参数应用出错:'+e;}});
+}}
+
+function manualCapture(){{
+  const fps=parseInt(document.getElementById('fps').value)||3;
+  const total=parseInt(document.getElementById('total').value)||21;
+  const btn=document.getElementById('cap');
+  btn.disabled=true; capState.textContent='拍摄中…'; gal.innerHTML='';
+  fetch('/api/capture',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{test:true,fps:fps,total:total}})}})
+    .then(r=>r.json()).then(res=>{{
+      if(res.ok){{
+        let line=`[${{res.ts}}] 手动测试 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
+                 `已存到：${{res.save_dir}}\\n`+
+                 `唯一帧=${{res.unique_frames}}/${{res.saved}}`+(res.identical?' ⚠️全部相同(相机未持续出图)':'')+`\\n`;
+        log.textContent=line+'\\n'+log.textContent;
+        (res.rel_files||[]).forEach(r=>{{
+          let i=document.createElement('img');
+          i.src='/api/image?rel='+encodeURIComponent(r);
+          i.style.cssText='height:90px;border:1px solid #444;border-radius:4px';
+          gal.appendChild(i);
+        }});
+        if(!(res.rel_files||[]).length) gal.innerHTML='<span class="meta">无缩略图</span>';
+      }}else{{
+        log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
+      }}
+      capState.textContent=''; btn.disabled=false;
+    }}).catch(e=>{{capState.textContent='';btn.disabled=false;
+      log.textContent='[网络错误] '+e+'\\n'+log.textContent;}});
+}}
+
+function autoCapture(){{
+  const btn=document.getElementById('capAuto');
+  btn.disabled=true; capStateAuto.textContent='拍摄中…';
+  fetch('/api/capture',{{method:'POST'}}).then(r=>r.json()).then(res=>{{
+    if(res.ok){{ log.textContent=`[${{res.ts}}] 强制拍摄 拍 ${{res.saved}}/${{res.total}} 张 -> ${{res.save_dir}}\\n`+log.textContent; }}
+    else {{ log.textContent='[强制拍摄错误] '+(res.error||'')+'\\n'+log.textContent; }}
+    capStateAuto.textContent=''; btn.disabled=false;
+  }}).catch(e=>{{capStateAuto.textContent='';btn.disabled=false;
+    log.textContent='[网络错误] '+e+'\\n'+log.textContent;}});
+}}
 
 function refreshStatus(){{
   fetch('/api/status').then(r=>r.json()).then(s=>{{
@@ -1029,6 +1235,7 @@ function refreshStatus(){{
     else{{state.textContent='● 离线';state.style.background='#b5482f';}}
     if(s.plc_auto){{
       plcstate.textContent='● PLC自动';plcstate.style.background='#2d6cdf';
+      modeinfo.textContent='自动监控：PLC触发中';
       let rows=(s.recent_cars||[]).map(c=>{{
         let ph=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
         let dt='<span class="no">未接入</span>';
@@ -1039,36 +1246,25 @@ function refreshStatus(){{
       carbody.innerHTML = rows || `<tr><td colspan="7" class="meta">等待出车信号…</td></tr>`;
     }}else{{
       plcstate.textContent='● PLC未启用';plcstate.style.background='#555';
-      carbody.innerHTML='<tr><td colspan="7" class="meta">手动模式：PLC 自动触发未启用（加 --plc-auto 开启）</td></tr>';
+      modeinfo.textContent='手动测试：PLC未启用（加 --plc-auto 开启自动）';
+      carbody.innerHTML='<tr><td colspan="7" class="meta">自动监控未启用（加 --plc-auto 启动）</td></tr>';
     }}
     let h=`<b>相机</b>：${{s.camera.model}}（序列号 ${{s.camera.serial}}）<br>`;
     h+=`<b>程序版本</b>：v${{s.version_tag}}（照片文件名含此短号，可确认是否最新）<br>`;
     h+=`<b>分辨率</b>：${{s.resolution}} · ${{s.color}} · ${{s.pixel_format}}<br>`;
-    h+=`<b>连拍</b>：点按钮即连拍 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（${{s.params.fps}}fps）<br>`;
-    h+=`<b>曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
-    h+=`<b>照片存储</b>：${{s.save_dir}}（按 日期/PIN 分层，临时缓冲在 data/raw_images）`;
+    h+=`<b>自动连拍</b>：出车信号触发连拍 ${{s.params.duration_sec}} 秒 = <b>${{s.params.total}} 张</b>（${{s.params.fps}}fps）<br>`;
+    h+=`<b>当前曝光</b>：${{s.params.exposure_us}} µs · <b>增益</b>：${{s.params.gain_display}} · Gamma：${{s.params.gamma}}<br>`;
+    h+=`<b>自动照片存储</b>：${{s.save_dir}}（按 日期/PIN 分层）`;
     meta.innerHTML=h;
+    if(!_inited){{
+      document.getElementById('exp').value=s.params.exposure_us;
+      document.getElementById('gain').value=(s.params.gain_db==null)?'':s.params.gain_db;
+      _inited=true;
+    }}
   }}).catch(()=>{{state.textContent='● 连接失败';state.style.background='#b5482f';}});
 }}
 
-function capture(){{
-  capBtn.disabled=true; capState.textContent='拍摄中…';
-  fetch('/api/capture',{{method:'POST'}}).then(r=>r.json()).then(res=>{{
-    if(res.ok){{
-      let line=`[${{res.ts}}] 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
-               `已存到：${{res.save_dir}}\\n`+
-               (res.abs_files||res.files).slice(0,3).map(f=>'  '+f).join('\\n')+
-               ((res.abs_files||res.files).length>3?`\\n  ... 共 ${{(res.abs_files||res.files).length}} 张`:'');
-      log.textContent=line+'\\n\\n'+log.textContent;
-    }}else{{
-      log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
-    }}
-    capState.textContent='';
-    capBtn.disabled=false;
-  }}).catch(e=>{{capState.textContent='';capBtn.disabled=false;
-    log.textContent='[网络错误] '+e+'\\n'+log.textContent;}});
-}}
-
+switchTab('manual');
 refreshStatus();
 setInterval(refreshStatus, 5000);
 </script>
@@ -1093,21 +1289,76 @@ def api_status():
     return jsonify(hub.status())
 
 
+@app.route("/api/camera", methods=["POST"])
+def api_camera():
+    """手动测试面板用：运行时调整相机曝光/增益（仅在自由运行下直接写相机）。"""
+    if not hub.running or not hub.streamers:
+        return jsonify({"ok": False, "error": "相机未运行"})
+    data = request.get_json(silent=True) or {}
+    resp = {"ok": True}
+    if "exposure_us" in data and data["exposure_us"] is not None:
+        resp["exposure"] = hub.streamers[0].set_exposure(data["exposure_us"])
+    if "gain_db" in data:
+        g = data["gain_db"]
+        g = None if (g is None or g == "" or g == "None") else g
+        resp["gain"] = hub.streamers[0].set_gain(g)
+    if not resp.get("exposure") and not resp.get("gain"):
+        resp["ok"] = False
+        resp["error"] = "未收到 exposure_us / gain_db 参数"
+    return jsonify(resp)
+
+
+@app.route("/api/image")
+def api_image():
+    """安全提供手动测试照片缩略图：rel 为相对 ROOT 的路径，越界返回 404。"""
+    rel = request.args.get("rel", "")
+    full = os.path.normpath(os.path.join(ROOT, rel))
+    if not full.startswith(ROOT) or not os.path.isfile(full):
+        return Response("not found", status=404)
+    ext = os.path.splitext(full)[1].lower()
+    mt = {"bmp": "image/bmp", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+          "png": "image/png"}.get(ext, "application/octet-stream")
+    try:
+        with open(full, "rb") as f:
+            data = f.read()
+        return Response(data, mimetype=mt)
+    except Exception:
+        return Response("read error", status=500)
+
+
 @app.route("/api/capture", methods=["POST"])
 def api_capture():
     if not hub.running:
         return jsonify({"ok": False, "error": "相机未运行"})
-    # 手动按钮：纯拍照（不检测、不入库），用于远程盯屏调试/补拍
-    result = hub.request_capture_primary()
-    _prune_scratch()   # 手动调试图也兜底清理，防磁盘涨满
-    if result.get("ok"):
-        print(f"[网页] 手动拍照完成: {result.get('saved')} 张 -> {result.get('save_dir')}")
-        for p in result.get("abs_files", [])[:3]:
-            print(f"[网页]   落盘: {p}")
-        if len(result.get("abs_files", [])) > 3:
-            print(f"[网页]   ... 共 {len(result.get('abs_files', []))} 张")
+    data = request.get_json(silent=True) or {}
+    test = bool(data.get("test", False))
+    fps = data.get("fps")
+    total = data.get("total")
+    if test:
+        # 手动测试模式：与 PLC 无关、不判车型、不入库；照片落 data/manual_test/日期/时间/
+        sess = datetime.datetime.now().strftime("%Y-%m-%d/%H%M%S")
+        save_dir = os.path.join(MANUAL_TEST_ROOT, sess)
+        result = hub.request_capture_primary(fps=fps, total=total,
+                                             save_dir=save_dir, prefix="Test")
+        print(f"[网页] 手动测试拍摄: {result.get('saved')} 张 -> {result.get('save_dir')}")
     else:
-        print(f"[网页] 手动拍照失败: {result.get('error')} (saved={result.get('saved')})")
+        # 强制拍摄（自动模式下补拍/调试）：沿用默认 21@3fps，不入库
+        result = hub.request_capture_primary()
+        _prune_scratch()
+        if result.get("ok"):
+            print(f"[网页] 强制拍摄完成: {result.get('saved')} 张 -> {result.get('save_dir')}")
+        else:
+            print(f"[网页] 强制拍摄失败: {result.get('error')}")
+    # 把绝对路径转成相对 ROOT 的安全 rel，供网页 /api/image 读取缩略图
+    rel_files = []
+    for f in result.get("abs_files", []):
+        try:
+            rel = os.path.relpath(f, ROOT)
+            if not rel.startswith(".."):
+                rel_files.append(rel)
+        except Exception:
+            pass
+    result["rel_files"] = rel_files
     return jsonify(result)
 
 
