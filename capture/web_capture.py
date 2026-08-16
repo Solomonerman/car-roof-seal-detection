@@ -869,20 +869,23 @@ class CameraStreamer:
             self._cap_running = False
             self._cap_state = "idle"
             batch = list(self._cap_frames)
+            hashes = list(self._cap_hashes)
             cap_save_dir = self._cap_save_dir
             cap_total = self._cap_total
         saved = len(batch)
+        unique = len(set(hashes))          # 与 _finish 口径一致：唯一帧=已存帧去重，而非错填为 saved
         cam_frames = self._frame_no - self._cap_frame_no0
-        print(f"[拍照] 超时兜底: 目标{cap_total}张 实际仅存{saved}张 "
+        elapsed = round(timeout, 2)        # 与等待阈值一致（原 dur+5.0 与 timeout 算法不一致）
+        print(f"[拍照] 超时兜底: 目标{cap_total}张 实际仅存{saved}张 唯一帧={unique}/{saved} "
               f"（拍照期间相机出帧{cam_frames}帧）-> "
               f"{os.path.abspath(cap_save_dir) if cap_save_dir else ''}")
         self._last_result = {
             "ok": saved > 0,
             "saved": saved,
-            "unique_frames": saved,
+            "unique_frames": unique,
             "total": cap_total,
-            "elapsed": round(dur + 5.0, 2),
-            "actual_fps": round(saved / (dur + 5.0), 2) if (dur + 5.0) else 0,
+            "elapsed": elapsed,
+            "actual_fps": round(saved / elapsed, 2) if elapsed > 0 else 0,
             "save_dir": cap_save_dir,
             "error": "连拍超时(未完成全部张数)",
         }
