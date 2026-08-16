@@ -766,26 +766,25 @@ class CameraStreamer:
                         pass
             except Exception:
                 pass
-            # ③ 两个曝光节点都写，记录各自写后读回值（找出真正生效的那个）
+            # ③ 只写启动确认的真实曝光节点（该相机仅 ExposureTimeAbs 可用，
+            #    ExposureTime 节点不存在会报 ERR；不再试写不存在节点，避免噪音）
+            node_name = getattr(self, "_exposure_node", "ExposureTimeAbs")
+            n = nm.GetNode(node_name)
             readbacks = {}
-            for name in ("ExposureTime", "ExposureTimeAbs"):
-                n = nm.GetNode(name)
-                if n is None:
-                    continue
+            if n is None:
+                # 兜底：启动记录的节点不可用时退回另一个节点
+                alt = "ExposureTimeAbs" if node_name != "ExposureTimeAbs" else "ExposureTime"
+                n = nm.GetNode(alt)
+                if n is not None:
+                    node_name = alt
+            if n is not None:
                 try:
                     n.SetValue(us)
-                    readbacks[name] = n.GetValue()
+                    readbacks[node_name] = n.GetValue()
                 except Exception as e:
-                    readbacks[name] = f"ERR:{e}"
+                    readbacks[node_name] = f"ERR:{e}"
             diag["readbacks"] = readbacks
-            # 实际生效值：优先启动确认的节点，否则取任一有数字读回的
-            node_name = getattr(self, "_exposure_node", "ExposureTime")
             actual = readbacks.get(node_name)
-            if actual is None and readbacks:
-                for v in readbacks.values():
-                    if isinstance(v, (int, float)):
-                        actual = v
-                        break
             try:
                 actual = float(actual)
             except Exception:
