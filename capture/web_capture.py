@@ -1252,15 +1252,16 @@ def index():
       </div>
       <div style="font-size:13px;color:#aaa;margin-top:10px">连拍设置</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:4px">
-        <label style="font-size:12px;color:#aaa">每秒张数(1-48)<br>
-          <input id="fps" type="number" min="1" max="48" step="1" value="3"
+        <label style="font-size:12px;color:#aaa">每秒张数(1-6)<br>
+          <input id="fps" type="number" min="1" max="6" step="1" value="3"
                  style="width:80px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <label style="font-size:12px;color:#aaa">总张数(1-200)<br>
           <input id="total" type="number" min="1" max="200" step="1" value="21"
                  style="width:80px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
       </div>
       <div style="font-size:12px;color:#789;margin-top:8px">
-        说明：仅测试相机拍摄功能，不判车型、不存检测库、不连 PLC；照片存 data/manual_test/日期/时间/。</div>
+        说明：仅测试相机拍摄功能，不判车型、不存检测库、不连 PLC；照片存 data/manual_test/日期/时间/。<br>
+        相机已封顶 6fps（防 1Gbps 链路拥塞冻屏），连拍速度上限即 6，设更高无效。</div>
     </div>
     <div class="bar">
       <button id="cap" onclick="manualCapture()">📸 开始拍摄（手动测试）</button>
@@ -1320,7 +1321,8 @@ function applyCam(){{
 }}
 
 function manualCapture(){{
-  const fps=parseInt(document.getElementById('fps').value)||3;
+  let fps=parseInt(document.getElementById('fps').value)||3;
+  if(fps>6){fps=6;} if(fps<1){fps=1;}
   const total=parseInt(document.getElementById('total').value)||21;
   const btn=document.getElementById('cap');
   btn.disabled=true; capState.textContent='拍摄中…'; gal.innerHTML='';
@@ -1461,6 +1463,8 @@ def api_capture():
     data = request.get_json(silent=True) or {}
     test = bool(data.get("test", False))
     fps = data.get("fps")
+    if isinstance(fps, (int, float)) and not isinstance(fps, bool):
+        fps = max(1, min(6, int(fps)))   # 相机封顶 6fps，连拍速度不得超 6（防链路拥塞冻屏）
     total = data.get("total")
     if test:
         # 手动测试模式：与 PLC 无关、不判车型、不入库；照片落 data/manual_test/日期/时间/
