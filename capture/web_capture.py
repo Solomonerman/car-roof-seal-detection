@@ -781,6 +781,7 @@ class CameraStreamer:
             os.makedirs(save_dir, exist_ok=True)
         except Exception as e:
             return {"ok": False, "error": f"创建存储目录失败: {e}"}
+        print(f"[拍照] 开始连拍: 目标{total}张 @{fps}fps -> {save_dir}")
         with self._lock:
             if self._cap_running:
                 return {"ok": False, "error": "拍照进行中，请稍候"}
@@ -802,11 +803,27 @@ class CameraStreamer:
         if self._capture_done.wait(timeout=dur + 5.0):
             with self._lock:
                 return self._last_result or {"ok": False, "error": "连拍无结果"}
-        # 超时兜底：复位状态，避免永久卡在 capturing
+        # 超时兜底：复位状态，避免永久卡在 capturing；并把已存张数如实回填
         with self._lock:
             self._cap_running = False
             self._cap_state = "idle"
-        return {"ok": False, "error": "连拍超时"}
+            batch = list(self._cap_frames)
+            cap_save_dir = self._cap_save_dir
+            cap_total = self._cap_total
+        saved = len(batch)
+        print(f"[拍照] 超时兜底: 目标{cap_total}张 实际仅存{saved}张 -> "
+              f"{os.path.abspath(cap_save_dir) if cap_save_dir else ''}")
+        self._last_result = {
+            "ok": saved > 0,
+            "saved": saved,
+            "unique_frames": saved,
+            "total": cap_total,
+            "elapsed": round(dur + 5.0, 2),
+            "actual_fps": round(saved / (dur + 5.0), 2) if (dur + 5.0) else 0,
+            "save_dir": cap_save_dir,
+            "error": "连拍超时(未完成全部张数)",
+        }
+        return self._last_result
 
     def _format_filename(self, idx=None, dt=None, prefix="Image"):
         if dt is None:
@@ -1348,41 +1365,41 @@ function manualCapture(){{
   if(fps>6){{fps=6;}} if(fps<1){{fps=1;}}
   const total=parseInt(document.getElementById('total').value)||21;
   const btn=document.getElementById('cap');
-  btn.disabled=true; capState.textContent='拍摄中…'; gal.innerHTML='';
+  if(btn){{btn.disabled=true;}}
+  capState.textContent='拍摄中…(约7秒,最多12秒)'; gal.innerHTML='';
   console.log('[前端] 开始手动拍摄', {{fps:fps,total:total}});
   const payload={{test:true,fps:fps,total:total}};
   const ctrl=new AbortController();
   const t=setTimeout(()=>ctrl.abort(), 30000);
-  try{{
-    fetch('/api/capture',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+  // 单一恢复函数：无论成功/失败/超时，按钮必回到可点状态（绿色）
+  let restored=false;
+  const restore=()=>{{ if(restored) return; restored=true; clearTimeout(t); ctrl.abort();
+    capState.textContent=''; if(btn){{btn.disabled=false;}} }};
+  const safety=setTimeout(restore, 25000);   // 终极兜底：25秒内任何情况都强制恢复按钮
+  fetch('/api/capture',{{method:'POST',headers:{{'Content-Type':'application/json'}},
       body:JSON.stringify(payload), signal:ctrl.signal}})
-      .then(r=>{{clearTimeout(t); console.log('[前端] /api/capture 响应状态', r.status); return r.json();}})
-      .then(res=>{{
-        console.log('[前端] /api/capture 结果', res);
-        if(res.ok){{
-          let line=`[${{res.ts}}] 手动测试 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
-                   `已存到：${{res.save_dir}}\\n`+
-                   `唯一帧=${{res.unique_frames}}/${{res.saved}}`+(res.identical?' ⚠️全部相同(相机未持续出图)':'')+`\\n`;
-          log.textContent=line+'\\n'+log.textContent;
-          (res.rel_files||[]).forEach(r=>{{
-            let i=document.createElement('img');
-            i.src='/api/image?rel='+encodeURIComponent(r);
-            i.style.cssText='height:90px;border:1px solid #444;border-radius:4px';
-            gal.appendChild(i);
-          }});
-          if(!(res.rel_files||[]).length) gal.innerHTML='<span class="meta">无缩略图</span>';
-        }}else{{
-          log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
-        }}
-        capState.textContent=''; btn.disabled=false;
-      }}).catch(e=>{{clearTimeout(t); capState.textContent='';btn.disabled=false;
-        log.textContent='[网络/请求错误] '+e+'\\n'+log.textContent;
-        console.error('[前端] /api/capture 失败', e);}});
-  }}catch(e){{
-    clearTimeout(t); capState.textContent='';btn.disabled=false;
-    log.textContent='[前端异常] '+e+'\\n'+log.textContent;
-    console.error('[前端] 发起 /api/capture 时同步抛错', e);
-  }}
+    .then(r=>{{clearTimeout(safety); console.log('[前端] /api/capture 响应状态', r.status); return r.json();}})
+    .then(res=>{{
+      console.log('[前端] /api/capture 结果', res);
+      if(res.ok){{
+        let line=`[${{res.ts}}] 手动测试 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
+                 `已存到：${{res.save_dir}}\\n`+
+                 `唯一帧=${{res.unique_frames}}/${{res.saved}}`+(res.identical?' ⚠️全部相同(相机未持续出图)':'')+`\\n`;
+        log.textContent=line+'\\n'+log.textContent;
+        (res.rel_files||[]).forEach(r=>{{
+          let i=document.createElement('img');
+          i.src='/api/image?rel='+encodeURIComponent(r);
+          i.style.cssText='height:90px;border:1px solid #444;border-radius:4px';
+          gal.appendChild(i);
+        }});
+        if(!(res.rel_files||[]).length) gal.innerHTML='<span class="meta">无缩略图</span>';
+      }}else{{
+        log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
+      }}
+    }})
+    .catch(e=>{{ console.error('[前端] /api/capture 失败', e);
+      log.textContent='[网络/请求错误] '+e+'（若已存照片请去 manual_test 目录查看）\\n'+log.textContent; }})
+    .finally(restore);
 }}
 
 function autoCapture(){{
