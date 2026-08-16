@@ -298,6 +298,9 @@ class CameraStreamer:
         self.camera_info = {}
         # 相机参数（运行时可由网页"手动测试"面板调整，初始取自顶部常量；connect 后读回实际值）
         self._exposure_us = EXPOSURE_TIME_US
+        self._exposure_user = EXPOSURE_TIME_US   # 用户"期望"曝光值（仅 set_exposure 更新；
+        #   _open_camera 重连会重置相机为默认并改写 _exposure_us，但不会动本值，
+        #   故自愈重连后用本值把用户设定重新下发，避免手动曝光被静默清零）
         self._exposure_node = "ExposureTime"   # 启动时确认的实际生效节点名(ExposureTime/ExposureTimeAbs)
         self._gain_db = GAIN_DB
 
@@ -591,6 +594,7 @@ class CameraStreamer:
         try:
             self.cam.StopGrabbing()
             self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+            self._reapply_exposure()   # 重连后把用户期望曝光重新下发（防被重置为默认2000）
             g = self.cam.RetrieveResult(2000, py.TimeoutHandling_Return)
             if g and g.GrabSucceeded():
                 g.Release()
@@ -620,6 +624,7 @@ class CameraStreamer:
         try:
             self._open_camera()                     # 重建 self.cam + 打开 + 配置 + 读回参数
             self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+            self._reapply_exposure()   # 完整重连后把用户期望曝光重新下发（防被重置为默认2000）
             g = self.cam.RetrieveResult(3000, py.TimeoutHandling_Return)
             if g and g.GrabSucceeded():
                 img = _grab_to_frame(g)
@@ -790,6 +795,7 @@ class CameraStreamer:
             except Exception:
                 actual = us
             self._exposure_us = actual
+            self._exposure_user = actual   # 记录用户期望曝光，自愈重连后据此重新下发
             diag["exposure_us"] = actual
             diag["node"] = node_name
             print(f"[相机] 曝光请求 {us}µs → 实际 {actual}µs 节点 {node_name} "
@@ -797,6 +803,26 @@ class CameraStreamer:
             return diag
         except Exception as e:
             return {"ok": False, "error": f"曝光设置失败: {e}", "exposure_us": self._exposure_us}
+
+    def _reapply_exposure(self):
+        """自愈重连成功后，把用户期望曝光(self._exposure_user)重新下发到相机。
+
+        完整重连会经 _open_camera 把相机曝光重置为默认 2000µs（且只读回 ExposureTime
+        节点，该相机此节点不存在故不更新 _exposure_us），导致用户之前在网页设的曝光被
+        静默清零。故重连后主动用 _exposure_node 把 _exposure_user 重新写回，使手动曝光
+        在掉线重连后依然存活。失败仅打印告警，不抛异常（避免干扰取流恢复）。
+        """
+        us = getattr(self, "_exposure_user", None)
+        node = getattr(self, "_exposure_node", None)
+        if us is None or node is None or self.cam is None:
+            return
+        try:
+            n = self.cam.GetNodeMap().GetNode(node)
+            if n is not None:
+                n.SetValue(int(round(us)))
+                print(f"[相机] 重连后重发曝光={int(round(us))}µs (节点 {node})")
+        except Exception as e:
+            print(f"[相机] 重连后重发曝光失败(下个周期重试): {e}")
 
     def set_gain(self, db):
         """运行时设置增益(dB)，返回相机实际生效值。安全钳位 [0, 24]dB。
