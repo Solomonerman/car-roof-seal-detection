@@ -727,38 +727,75 @@ class CameraStreamer:
 
     # ---------- 运行时参数调整（手动测试面板用，自由运行下直接写相机）----------
     def set_exposure(self, us):
-        """运行时设置曝光时间(µs)，返回相机实际生效值。安全钳位 [50, 100000]µs。"""
+        """运行时设置曝光时间(µs)，返回相机真实状态用于远程诊断。安全钳位 [50, 100000]µs。
+
+        返回字段含 auto(自动曝光当前值)/mode(曝光模式)/readbacks(各曝光节点写后读回)，
+        便于判断"值写了但亮度不变"到底是：自动曝光没关掉 / 写错节点 / 还是场景已饱和。
+        """
         if not self.running or self.cam is None:
             return {"ok": False, "error": "相机未运行", "exposure_us": self._exposure_us}
         us = max(50, min(100000, int(round(us))))
         try:
             nm = self.cam.GetNodeMap()
-            # ① 先关自动曝光+设定时模式，否则手动值会被自动算法立即覆盖(亮度不变)
+            diag = {"ok": True, "requested": us}
+            # ① 关自动曝光（读回确认是否真关掉——若仍是 Continuous 则手动值会被覆盖）
             try:
-                auto = nm.GetNode("ExposureAuto")
-                if auto is not None:
-                    auto.SetValue("Off")
+                a = nm.GetNode("ExposureAuto")
+                if a is not None:
+                    try:
+                        a.SetValue("Off")
+                    except Exception:
+                        pass
+                    try:
+                        diag["auto"] = a.GetValue()
+                    except Exception:
+                        diag["auto"] = "读不到"
             except Exception:
-                pass
+                diag["auto"] = "节点无"
+            # ② 定时模式
             try:
                 em = nm.GetNode("ExposureMode")
                 if em is not None:
-                    em.SetValue("Timed")
+                    try:
+                        em.SetValue("Timed")
+                    except Exception:
+                        pass
+                    try:
+                        diag["mode"] = em.GetValue()
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            # ② 用与启动时相同的实际生效节点(ExposureTime 或 ExposureTimeAbs)，
-            #    否则写错节点(如相机只用 ExposureTimeAbs)会导致"值写了但亮度不变"
+            # ③ 两个曝光节点都写，记录各自写后读回值（找出真正生效的那个）
+            readbacks = {}
+            for name in ("ExposureTime", "ExposureTimeAbs"):
+                n = nm.GetNode(name)
+                if n is None:
+                    continue
+                try:
+                    n.SetValue(us)
+                    readbacks[name] = n.GetValue()
+                except Exception as e:
+                    readbacks[name] = f"ERR:{e}"
+            diag["readbacks"] = readbacks
+            # 实际生效值：优先启动确认的节点，否则取任一有数字读回的
             node_name = getattr(self, "_exposure_node", "ExposureTime")
-            n = nm.GetNode(node_name)
-            if n is None:
-                n = nm.GetNode("ExposureTime")
-            if n is None:
-                return {"ok": False, "error": "曝光节点不可用", "exposure_us": self._exposure_us}
-            n.SetValue(us)
-            actual = n.GetValue()
+            actual = readbacks.get(node_name)
+            if actual is None and readbacks:
+                for v in readbacks.values():
+                    if isinstance(v, (int, float)):
+                        actual = v
+                        break
+            try:
+                actual = float(actual)
+            except Exception:
+                actual = us
             self._exposure_us = actual
-            print(f"[相机] 曝光已设为 {actual}µs（请求 {us}µs，节点 {node_name}）")
-            return {"ok": True, "exposure_us": actual}
+            diag["exposure_us"] = actual
+            diag["node"] = node_name
+            print(f"[相机] 曝光请求 {us}µs → 实际 {actual}µs 节点 {node_name} "
+                  f"auto={diag.get('auto')} mode={diag.get('mode')} readbacks={readbacks}")
+            return diag
         except Exception as e:
             return {"ok": False, "error": f"曝光设置失败: {e}", "exposure_us": self._exposure_us}
 
@@ -1330,7 +1367,8 @@ def index():
       </div>
       <div style="font-size:12px;color:#789;margin-top:8px">
         说明：仅测试相机拍摄功能，不判车型、不存检测库、不连 PLC；照片存 data/manual_test/日期/时间/。<br>
-        相机已封顶 6fps（防 1Gbps 链路拥塞冻屏），连拍速度上限即 6，设更高无效。</div>
+        相机已封顶 6fps（防 1Gbps 链路拥塞冻屏），连拍速度上限即 6，设更高无效。<br>
+        调曝光后看上方状态：若显示 <b>Auto=Off</b> 且 <b>节点读回=设定值</b> 但照片仍一样，多半是场景过曝饱和——把曝光调到 100µs 看是否明显变暗即可验证（变暗=曝光生效）。</div>
     </div>
     <div class="bar">
       <button id="cap" onclick="manualCapture()">📸 开始拍摄（手动测试）</button>
@@ -1384,7 +1422,19 @@ function applyCam(){{
   fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
     .then(r=>r.json()).then(res=>{{
       let m='';
-      if(res.exposure) m+=(res.exposure.ok?('曝光='+res.exposure.exposure_us+'µs '):('曝光失败:'+(res.exposure.error||'')+' '));
+      if(res.exposure){{
+        const e=res.exposure;
+        if(e.ok){{
+          m+='曝光='+e.exposure_us+'µs ';
+          if(e.auto!==undefined) m+='[Auto='+e.auto+'] ';
+          if(e.mode!==undefined) m+='[Mode='+e.mode+'] ';
+          if(e.readbacks){{ m+='[节点读回 ';
+            for(const k in e.readbacks) m+=k+'='+e.readbacks[k]+' ';
+            m+='] '; }}
+        }} else {{
+          m+='曝光失败:'+(e.error||'')+' ';
+        }}
+      }}
       camState.textContent=m||'已应用';
     }}).catch(e=>{{camState.textContent='参数应用出错:'+e;}});
 }}
