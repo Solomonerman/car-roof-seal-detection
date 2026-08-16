@@ -553,14 +553,17 @@ class CameraStreamer:
                     continue
                 frame = _grab_to_frame(grab)   # 深拷贝，杜绝连续帧指向同一缓冲
                 grab.Release()
-                if frame is None:
-                    # 无效帧（0尺寸/空缓冲）：保留上一帧 _latest，不更新、不收集，
-                    # 避免把空数组写盘（cv2.imwrite !_img.empty()）也不让预览变黑。
-                    if time.perf_counter() - last_good > SELFHEAL_SEC:
-                        self._selfheal()
-                        last_good = time.perf_counter()
-                    continue
                 now = time.perf_counter()
+                if frame is None:
+                    # 无效帧（0尺寸/空缓冲）：不更新 _latest（保留上一有效帧），
+                    # 但仍按拍照节奏调用 _collect（内部回退 _latest 保住成片）。
+                    # 若直接跳过 _collect，坏帧期间不收集 → 张数不足甚至连拍超时。
+                    if now - last_good > SELFHEAL_SEC:
+                        self._selfheal()
+                        last_good = now
+                    if self._cap_state == "capturing":
+                        self._collect(None, now)
+                    continue
                 last_good = now
                 with self._lock:
                     self._latest = frame          # 始终刷新 → 预览不冻结
