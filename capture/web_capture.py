@@ -1322,7 +1322,7 @@ function applyCam(){{
 
 function manualCapture(){{
   let fps=parseInt(document.getElementById('fps').value)||3;
-  if(fps>6){fps=6;} if(fps<1){fps=1;}
+  if(fps>6){{fps=6;}} if(fps<1){{fps=1;}}
   const total=parseInt(document.getElementById('total').value)||21;
   const btn=document.getElementById('cap');
   btn.disabled=true; capState.textContent='拍摄中…'; gal.innerHTML='';
