@@ -298,6 +298,7 @@ class CameraStreamer:
         self.camera_info = {}
         # 相机参数（运行时可由网页"手动测试"面板调整，初始取自顶部常量；connect 后读回实际值）
         self._exposure_us = EXPOSURE_TIME_US
+        self._exposure_node = "ExposureTime"   # 启动时确认的实际生效节点名(ExposureTime/ExposureTimeAbs)
         self._gain_db = GAIN_DB
 
         self._latest = None
@@ -417,6 +418,7 @@ class CameraStreamer:
                     continue
                 n.SetValue(EXPOSURE_TIME_US)
                 conf.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
+                self._exposure_node = name   # 记录实际生效的曝光节点，set_exposure 复用同一节点
                 ok = True
                 break
             except Exception as e:
@@ -673,9 +675,13 @@ class CameraStreamer:
             with self._lock:
                 self._error = f"写盘失败: {e}"
         if done:
+            # 注意：不能在此处持锁调用 _finish()——_finish 内部也会 with self._lock，
+            # 而 threading.Lock 不可重入，会在"最后一张"时死锁 _loop 线程 → 预览永久冻结。
+            # 故先释放锁读取状态，再无锁调用 _finish()（它自己会加锁）。
             with self._lock:
-                if self._cap_state == "capturing":
-                    self._finish()
+                still_capturing = (self._cap_state == "capturing")
+            if still_capturing:
+                self._finish()
 
     def _finish(self):
         """连拍完成：汇总结果、置 _capture_done，唤醒 request_capture 的等待。"""
@@ -726,16 +732,32 @@ class CameraStreamer:
             return {"ok": False, "error": "相机未运行", "exposure_us": self._exposure_us}
         us = max(50, min(100000, int(round(us))))
         try:
-            # 先确保曝光自动已关，否则手动值写不进去
-            n = self.cam.GetNodeMap().GetNode("ExposureTime")
-            nm = self.cam.GetNodeMap().GetNode("ExposureMode")
-            if nm:
-                try: nm.SetValue("Timed")
-                except Exception: pass
+            nm = self.cam.GetNodeMap()
+            # ① 先关自动曝光+设定时模式，否则手动值会被自动算法立即覆盖(亮度不变)
+            try:
+                auto = nm.GetNode("ExposureAuto")
+                if auto is not None:
+                    auto.SetValue("Off")
+            except Exception:
+                pass
+            try:
+                em = nm.GetNode("ExposureMode")
+                if em is not None:
+                    em.SetValue("Timed")
+            except Exception:
+                pass
+            # ② 用与启动时相同的实际生效节点(ExposureTime 或 ExposureTimeAbs)，
+            #    否则写错节点(如相机只用 ExposureTimeAbs)会导致"值写了但亮度不变"
+            node_name = getattr(self, "_exposure_node", "ExposureTime")
+            n = nm.GetNode(node_name)
+            if n is None:
+                n = nm.GetNode("ExposureTime")
+            if n is None:
+                return {"ok": False, "error": "曝光节点不可用", "exposure_us": self._exposure_us}
             n.SetValue(us)
             actual = n.GetValue()
             self._exposure_us = actual
-            print(f"[相机] 曝光已设为 {actual}µs（请求 {us}µs）")
+            print(f"[相机] 曝光已设为 {actual}µs（请求 {us}µs，节点 {node_name}）")
             return {"ok": True, "exposure_us": actual}
         except Exception as e:
             return {"ok": False, "error": f"曝光设置失败: {e}", "exposure_us": self._exposure_us}
