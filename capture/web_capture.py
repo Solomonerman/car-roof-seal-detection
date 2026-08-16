@@ -949,11 +949,16 @@ class CameraHub:
             return None
         return self.streamers[0].get_latest_jpeg()
 
-    def request_capture_primary(self):
-        """手动按钮用：返回主相机连拍结果 dict（含 files/saved/...）。"""
+    def request_capture_primary(self, fps=None, total=None, save_dir=None, prefix="Image"):
+        """手动按钮用：返回主相机连拍结果 dict（含 files/saved/...）。
+
+        可选透传拍照参数（手动测试模式由网页传入 fps/total/save_dir/prefix）；
+        无参时沿用默认 21@3fps（自检/强制拍摄路径）。
+        """
         if not self.streamers:
             return {"ok": False, "error": "相机未运行"}
-        return self.streamers[0].request_capture()
+        return self.streamers[0].request_capture(fps=fps, total=total,
+                                                 save_dir=save_dir, prefix=prefix)
 
     def request_capture_all(self):
         """自动触发用：触发全部相机，返回主相机文件列表 + 各相机结果。"""
