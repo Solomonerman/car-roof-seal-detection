@@ -449,9 +449,25 @@ class CameraStreamer:
             conf.append("触发模式=Off(自由运行,末次强制)")
         except Exception as e:
             conf.append(f"触发模式末次强制异常: {e}")
-        # 注意：不碰 AcquisitionFrameRate*（帧率节点），相机自由运行。
-        # 拍照 3fps 由程序控制，与相机帧率解耦，根治 fps 锁死（历史曾锁到 2 张/秒）。
-        conf.append(f"采集帧率=相机自由运行(拍照由程序按 {FPS}fps 节流)")
+        # 采集帧率封顶（关键：防 1Gbps 链路被 48fps 原生自由运行压垮 → 取图超时/预览冻结）。
+        # 教训（现场复现）：aca1920-48gm 上单数 AcquisitionFrameRate 是占位节点不可用，
+        #       可用的是 AcquisitionFrameRateEnable + AcquisitionFrameRateAbs。
+        #       【必须成对写入】先写安全 Abs 值、再开 Enable；曾因"单开 Enable 而 Abs 未
+        #       写有效值"导致相机冻结(21 张全同/0 张)。封顶 6fps 既 >= 软件拍照 3fps，
+        #       又远低于 48fps 压垮网卡的阈值。拍照节奏由程序 3fps 节流，与相机帧率解耦，
+        #       不会把拍照锁死（历史曾锁到 2 张/秒是拍照节流 bug，与此无关）。
+        SAFE_FPS = 6.0
+        n_abs = nodemap.GetNode("AcquisitionFrameRateAbs")
+        n_en = nodemap.GetNode("AcquisitionFrameRateEnable")
+        if n_abs is None or n_en is None:
+            conf.append("采集帧率=帧率节点不可用(占位)，保持相机默认；软件按 3fps 节流兜底")
+        else:
+            try:
+                n_abs.SetValue(SAFE_FPS)   # ① 先写安全值
+                n_en.SetValue(True)        # ② 再开限制（成对，绝不留"Enable 无有效 Abs"）
+                conf.append(f"采集帧率=封顶 {SAFE_FPS}fps(Enable+Abs 成对；拍照仍按 {FPS}fps 节流)")
+            except Exception as e:
+                conf.append(f"采集帧率封顶失败(已忽略，软件节流兜底): {e}")
         self._conf_log = conf
         for c in conf:
             print(f"  - {c}")
@@ -487,17 +503,27 @@ class CameraStreamer:
         """唯一取流线程：持续取帧更新预览；拍照进行中按 3fps 收集帧写盘。
 
         全程只有这里调用 RetrieveResult，彻底规避"双线程并发取流"的冻屏根因。
+        另含自愈：相机 GigE 心跳超时/网口抖动会令固件静默停出图（无异常、
+        GrabSucceeded 恒为 False、_loop 看似活着实则空转 → 画面定格）。故监测
+        "超过阈值无新帧"即重启取流，不退出进程。
         """
+        SELFHEAL_SEC = 5.0
+        last_good = time.perf_counter()
         while self.running:
             try:
                 grab = self.cam.RetrieveResult(1000, py.TimeoutHandling_Return)
                 if not grab or not grab.GrabSucceeded():
                     if grab:
                         grab.Release()
+                    # 自愈：超过阈值无新帧（相机静默停出图/心跳超时）→ 重启取流
+                    if time.perf_counter() - last_good > SELFHEAL_SEC:
+                        self._selfheal()
+                        last_good = time.perf_counter()
                     continue
                 frame = _grab_to_frame(grab)   # 深拷贝，杜绝连续帧指向同一缓冲
                 grab.Release()
                 now = time.perf_counter()
+                last_good = now
                 with self._lock:
                     self._latest = frame          # 始终刷新 → 预览不冻结
                     self._latest_ts = now
@@ -508,6 +534,22 @@ class CameraStreamer:
                 self._error = f"取流异常: {e}"
                 print(f"[相机] 取流异常(继续): {e}")
                 time.sleep(0.1)
+
+    def _selfheal(self):
+        """相机静默停出图（GigE 心跳超时/网口抖动）→ 重启取流，不退出进程。
+
+        仅在 _loop 判定"超过 SELFHEAL_SEC 无新帧"时调用；失败则下个周期重试。
+        """
+        try:
+            print(f"[相机] 自检：{SELFHEAL_SEC}s 无新帧，重启取流(StopGrab+StartGrab)...")
+            self.cam.StopGrabbing()
+            self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+            g = self.cam.RetrieveResult(2000, py.TimeoutHandling_Return)
+            if g and g.GrabSucceeded():
+                g.Release()
+            print("[相机] 自检：取流已重启")
+        except Exception as e:
+            print(f"[相机] 自检重启失败(下个周期重试): {e}")
 
     def _collect(self, frame, now):
         """拍照状态机：仅当到下一目标时间(每 1/FPS 秒)才收集一帧，节奏由程序控制。
