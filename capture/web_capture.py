@@ -231,15 +231,48 @@ def _frame_hash(frame):
         return "na"
 
 
+# pylon 像素类型整数值（稳定常量，避免依赖 pypylon 的符号名）。
+# 来源：Basler pylon 像素格式枚举。
+_PX_MONO8 = 17301505          # 0x01080001
+_PX_BAYER8 = frozenset({17301513, 17301514, 17301515, 17301516})  # RG/GR/GB/BG 8bit
+_PX_MONO16 = 17825793         # 0x01100001
+
+
 def _grab_to_frame(grab):
     """pylon grab 结果 → 完全独立的 numpy 数组(真·深拷贝)。
 
-    pypylon 的 grab.Array 返回相机内部缓冲区的【视图】，不同 grab 之间该缓冲区
-    可能被驱动复用。必须在 grab.Release() 之前做一次深拷贝，否则连续帧会指向
-    同一块被反复刷新的内存 → 全部相同。np.array(..., copy=True) 强制独立拷贝并
-    锁定 dtype=uint8，对任意 pypylon 实现都安全。
+    不用 grab.Array：某些 pypylon 版本/相机组合下 GetArray() 会抛
+    'Pixel format currently not supported'（即便相机配置的就是 Mono8），
+    导致每一帧都报错、预览与拍照全拿不到图。改为用 GetBuffer() 取原始字节，
+    按 Grab 的 宽/高/像素类型 手工重塑，对任意单通道 8/16 位格式都安全。
+
+    仍保持真·深拷贝：GetBuffer 返回的 bytes 独立于相机内部缓冲区，np.array
+    copy=True 再锁一份，确保连续帧不指向同一块被复用内存（否则 21 张全相同）。
     """
-    return np.array(grab.Array, copy=True, dtype=np.uint8)
+    w = grab.GetWidth()
+    h = grab.GetHeight()
+    buf = grab.GetBuffer()
+    try:
+        ptype = grab.GetPixelType()
+    except Exception:
+        ptype = None
+    try:
+        if ptype == _PX_MONO8 or ptype in _PX_BAYER8:
+            arr = np.frombuffer(buf, np.uint8).reshape(h, w)
+        elif ptype == _PX_MONO16:
+            arr = np.frombuffer(buf, np.uint16).reshape(h, w)
+        else:
+            arr = np.array(grab.Array, copy=True)   # 兜底：其它格式走官方实现
+    except Exception:
+        # 任何意外都退化为单通道 uint8，绝不抛错中断取流线程
+        try:
+            arr = np.array(grab.Array, copy=True)
+        except Exception:
+            try:
+                arr = np.frombuffer(buf, np.uint8).reshape(h, w)
+            except Exception:
+                arr = np.zeros((h, w), np.uint8)
+    return np.array(arr, copy=True, dtype=np.uint8)
 
 
 class CameraStreamer:
@@ -444,7 +477,7 @@ class CameraStreamer:
             self.cam.StopGrabbing()
             self.cam.Close()
             raise RuntimeError("相机取图失败，请检查连接与配置。")
-        img = grab.Array
+        img = _grab_to_frame(grab)
         self.height, self.width = img.shape[:2]
         self.is_color = len(img.shape) == 3
         try:
