@@ -250,8 +250,14 @@ def _grab_to_frame(grab):
     """
     w = grab.GetWidth()
     h = grab.GetHeight()
+    # 防御：极少数 grab 返回 0 尺寸/空缓冲（GigE 抖动、缓冲回收）→ 直接判无效，
+    # 绝不能造零尺寸数组（cv2.imwrite 会 !_img.empty() 崩溃，批量写盘全失败）。
+    if w <= 0 or h <= 0:
+        return None
     buf = grab.GetBuffer()
     n = len(buf)
+    if n <= 0:
+        return None
     try:
         if n == w * h * 3:
             arr = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
@@ -260,13 +266,10 @@ def _grab_to_frame(grab):
         elif n == w * h:
             arr = np.frombuffer(buf, np.uint8).reshape(h, w)
         else:
-            # 尺寸对不上（极少见）：尽力按单通道重塑，失败则退化安全帧
-            try:
-                arr = np.frombuffer(buf, np.uint8).reshape(h, w)
-            except Exception:
-                arr = np.zeros((h, w), np.uint8)
+            # 尺寸对不上（极少见）→ 判无效，交由上层回退上一帧，不造黑/空图
+            return None
     except Exception:
-        arr = np.zeros((h, w), np.uint8)
+        return None
     if arr.dtype != np.uint8:
         arr = arr.astype(np.uint8)   # 16bit 路径转 uint8（截断高位；单色相机走不到此分支）
     return np.array(arr, copy=True)
@@ -550,6 +553,13 @@ class CameraStreamer:
                     continue
                 frame = _grab_to_frame(grab)   # 深拷贝，杜绝连续帧指向同一缓冲
                 grab.Release()
+                if frame is None:
+                    # 无效帧（0尺寸/空缓冲）：保留上一帧 _latest，不更新、不收集，
+                    # 避免把空数组写盘（cv2.imwrite !_img.empty()）也不让预览变黑。
+                    if time.perf_counter() - last_good > SELFHEAL_SEC:
+                        self._selfheal()
+                        last_good = time.perf_counter()
+                    continue
                 now = time.perf_counter()
                 last_good = now
                 with self._lock:
@@ -639,14 +649,19 @@ class CameraStreamer:
             cap_t0_dt = self._cap_t0_dt
             cap_save_dir = self._cap_save_dir
             cap_prefix = self._cap_prefix
+            cap_latest = self._latest       # 回退源：最近一次有效帧（永不空）
             done = (self._cap_idx >= self._cap_total)
+        # 选有效帧：当帧有效优先；当帧为空（偶发坏帧）则回退最近有效帧，保住成片
+        cap_frame = frame if (frame is not None and getattr(frame, "size", 0) > 0) else cap_latest
         # 锁外写盘：单个写盘异常只跳过当前张，不炸整批、不炸取流
         frame_dt = cap_t0_dt + datetime.timedelta(seconds=(now - cap_start))
         fname = self._format_filename(idx=idx, dt=frame_dt, prefix=cap_prefix)
         fpath = os.path.join(cap_save_dir, fname)
         try:
-            cv2.imwrite(fpath, frame)
-            h = _frame_hash(frame)
+            if cap_frame is None or cap_frame.size == 0:
+                raise ValueError("无可写帧(当前帧与回退帧均为空)")
+            cv2.imwrite(fpath, cap_frame)
+            h = _frame_hash(cap_frame)
             with self._lock:
                 self._cap_frames.append(fname)
                 self._cap_hashes.append(h)
