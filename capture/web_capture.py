@@ -321,14 +321,21 @@ class CameraStreamer:
     def connect(self):
         if not HAS_PYPYLON:
             raise RuntimeError("未安装 pypylon，请先在上位机执行：pip install pypylon")
+        self._open_camera()
 
+    def _open_camera(self):
+        """创建 + 打开 + 配置相机对象。供 connect() 初次连接与 _selfheal() 完整重连用。
+
+        失败抛异常（connect 向上传播；_selfheal 捕获后下个周期重试）。调用前应确保
+        旧 self.cam 句柄已 Close/DestroyDevice（_selfheal 第二层会处理）。
+        """
         factory = py.TlFactory.GetInstance()
         ip = self.camera_ip
         if ip:
             info = py.DeviceInfo()
             info.SetPropertyValue("IpAddress", ip)
             try:
-                self.cam = py.InstantCamera(factory.CreateDevice(info))
+                dev = factory.CreateDevice(info)
             except Exception:
                 raise RuntimeError(
                     f"无法连接 IP={ip} 的相机。检查：通电/网线/同网段/防火墙/"
@@ -337,13 +344,13 @@ class CameraStreamer:
         elif CAMERA_SERIAL:
             info = py.DeviceInfo()
             info.SetPropertyValue("SerialNumber", CAMERA_SERIAL)
-            self.cam = py.InstantCamera(factory.CreateDevice(info))
+            dev = factory.CreateDevice(info)
         else:
             devices = factory.EnumerateDevices()
             if not devices:
                 raise RuntimeError("未发现任何 Basler 相机。检查通电/网线/防火墙。")
-            self.cam = py.InstantCamera(factory.CreateDevice(devices[0]))
-
+            dev = devices[0]
+        self.cam = py.InstantCamera(dev)
         self.cam.Open()
         self.camera_info = {
             "model": self.cam.GetDeviceInfo().GetModelName(),
@@ -472,6 +479,24 @@ class CameraStreamer:
                 conf.append(f"采集帧率=封顶 {SAFE_FPS}fps(Enable+Abs 成对；拍照仍按 {FPS}fps 节流)")
             except Exception as e:
                 conf.append(f"采集帧率封顶失败(已忽略，软件节流兜底): {e}")
+        # GigE 心跳超时：防止网络抖动/主机繁忙时相机误判"主机掉线"而主动断开
+        # （典型表现正是：运行十几秒后报 physically removed，画面定格）。之前代码
+        # 误用节点名 BeatTimeOut（从未生效），正确名为 GevHeartbeatTimeout。延长到
+        # 60s 给足余量（即便主机偶发繁忙也不会被相机踢掉）。上限更小则取上限。
+        try:
+            hb = nodemap.GetNode("GevHeartbeatTimeout")
+            if hb is not None:
+                try:
+                    hb.SetValue(60000)
+                    conf.append("心跳超时=60000ms")
+                except Exception:
+                    try:
+                        hb.SetValue(hb.GetMax())
+                        conf.append(f"心跳超时=上限({int(hb.GetMax())}ms)")
+                    except Exception as e:
+                        conf.append(f"心跳超时设置跳过: {e}")
+        except Exception:
+            pass
         self._conf_log = conf
         for c in conf:
             print(f"  - {c}")
@@ -539,20 +564,59 @@ class CameraStreamer:
                 time.sleep(0.1)
 
     def _selfheal(self):
-        """相机静默停出图（GigE 心跳超时/网口抖动）→ 重启取流，不退出进程。
+        """相机掉线（静默停出图 / physically removed / 心跳超时）→ 自动恢复，不退出进程。
 
-        仅在 _loop 判定"超过 SELFHEAL_SEC 无新帧"时调用；失败则下个周期重试。
+        分两级：
+          ① 句柄尚可用 → 仅 StopGrab+StartGrab 重启取流（应对偶发停出图）；
+          ② 句柄失效(physically removed) → 销毁旧句柄，重新枚举+创建+打开+配置+取流。
+        每次调用只尝试一轮，由 _loop 每 SELFHEAL_SEC 秒调用一次形成周期重试；
+        这样网络/供电恢复后程序能自动重新连上，无需人工重启服务。
         """
+        # 第一层：句柄尚可用时，仅重启取流
         try:
-            print(f"[相机] 自检：{SELFHEAL_SEC}s 无新帧，重启取流(StopGrab+StartGrab)...")
             self.cam.StopGrabbing()
             self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
             g = self.cam.RetrieveResult(2000, py.TimeoutHandling_Return)
             if g and g.GrabSucceeded():
                 g.Release()
-            print("[相机] 自检：取流已重启")
+                print("[相机] 自检：取流已重启")
+                return
+            if g:
+                g.Release()
         except Exception as e:
-            print(f"[相机] 自检重启失败(下个周期重试): {e}")
+            print(f"[相机] 自检：句柄级重启失败(准备完整重连): {e}")
+        # 第二层：physically removed / 句柄失效 → 销毁旧句柄并完整重建相机
+        print("[相机] 自检：尝试完整重连相机（销毁旧句柄，重新枚举并打开）...")
+        try:
+            try:
+                self.cam.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                self.cam.Close()
+            except Exception:
+                pass
+            try:
+                self.cam.DestroyDevice()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self._open_camera()                     # 重建 self.cam + 打开 + 配置 + 读回参数
+            self.cam.StartGrabbing(py.GrabStrategy_LatestImageOnly)
+            g = self.cam.RetrieveResult(3000, py.TimeoutHandling_Return)
+            if g and g.GrabSucceeded():
+                img = _grab_to_frame(g)
+                g.Release()
+                self.height, self.width = img.shape[:2]
+                print("[相机] 完整重连成功，取流恢复")
+            else:
+                if g:
+                    g.Release()
+                print("[相机] 完整重连：相机已重连但暂未出图，下个周期重试")
+        except Exception as e:
+            print(f"[相机] 完整重连失败(下个周期重试): {e}")
 
     def _collect(self, frame, now):
         """拍照状态机：仅当到下一目标时间(每 1/FPS 秒)才收集一帧，节奏由程序控制。
