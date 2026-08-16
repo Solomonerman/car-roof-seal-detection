@@ -451,20 +451,13 @@ class CameraStreamer:
             conf.append(f"像素格式={PIXEL_FORMAT}")
         except Exception as e:
             conf.append(f"像素格式设置异常(沿用当前值): {e}")
-        # 末次强制 TriggerMode=Off（防相机 UserSet 重载把触发重新打开，导致只出 1 帧冻结）。
+        # 末次强制 TriggerMode=Off（防相机 UserSet 重载/后续参数把触发重新打开，导致只出 1 帧冻结）。
+        # 注：AcquisitionMode=Continuous 已在上方设置；TriggerMode=Off 时 TriggerSource 无意义，
+        #     故此处仅保留安全关键的 TriggerMode 末次强制，去除冗余。
         try:
             tm = nodemap.GetNode("TriggerMode")
             if tm is not None:
                 tm.SetValue("Off")
-            am = nodemap.GetNode("AcquisitionMode")
-            if am is not None:
-                am.SetValue("Continuous")
-            try:
-                ts = nodemap.GetNode("TriggerSource")
-                if ts is not None:
-                    ts.SetValue("Software")
-            except Exception:
-                pass
             conf.append("触发模式=Off(自由运行,末次强制)")
         except Exception as e:
             conf.append(f"触发模式末次强制异常: {e}")
@@ -825,29 +818,8 @@ class CameraStreamer:
             print(f"[相机] 重连后重发曝光失败(下个周期重试): {e}")
 
     def set_gain(self, db):
-        """运行时设置增益(dB)，返回相机实际生效值。安全钳位 [0, 24]dB。
-
-        db=None 表示"沿用相机当前值、不修改"（方便先看清当前画面再决定）。
-        """
-        if not self.running or self.cam is None:
-            return {"ok": False, "error": "相机未运行", "gain_db": self._gain_db}
-        if db is None:
-            try:
-                n = self.cam.GetNodeMap().GetNode("Gain")
-                self._gain_db = n.GetValue() if n else None
-            except Exception:
-                pass
-            return {"ok": True, "gain_db": self._gain_db, "note": "沿用相机当前值"}
-        db = max(0.0, min(24.0, float(db)))
-        try:
-            n = self.cam.GetNodeMap().GetNode("Gain")
-            n.SetValue(db)
-            actual = n.GetValue()
-            self._gain_db = actual
-            print(f"[相机] 增益已设为 {actual}dB（请求 {db}dB）")
-            return {"ok": True, "gain_db": actual}
-        except Exception as e:
-            return {"ok": False, "error": f"增益设置失败: {e}", "gain_db": self._gain_db}
+        """增益为固定值(GAIN_DB)，前端无调整入口；保留占位以兼容旧调用，实际不修改相机。"""
+        return {"ok": True, "gain_db": self._gain_db, "note": "增益固定，未修改"}
 
     def request_capture(self, fps=None, total=None, save_dir=None, prefix="Image"):
         """外部触发连拍，阻塞直到完成，返回结果 dict。
@@ -940,9 +912,7 @@ class CameraStreamer:
                 return None
             scale = STREAM_WIDTH / self.width if self.width else 1.0
             disp = cv2.resize(frame, (STREAM_WIDTH, int(self.height * scale)))
-            if not self.is_color:
-                disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
-            if len(disp.shape) == 2:  # 兜底：确保 3 通道再叠加文字
+            if disp.ndim == 2:  # 单色/异常 2 通道 → 转 3 通道再叠加文字（合并原两处冗余转换）
                 disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
             # 常驻心跳：帧号 + 当前时钟 + 卡顿秒数，绿色小字固定在左下角。
             # 帧号递增=实时出帧；帧号不动+下方红字=相机冻结/信号丢失。
@@ -1049,6 +1019,7 @@ class CameraHub:
         self.plc_auto = False          # 是否启用 PLC 自动触发
         self.last_auto = None          # 最近一次自动检测结果（供 UI 展示）
         self.recent_cars = []          # 最近若干台车（供网页"最近车辆"表展示）
+        self._recent_lock = threading.Lock()   # 保护 recent_cars：PLC 线程写 vs Flask status 读
 
     def connect_all(self):
         if not self.ips:
@@ -1102,16 +1073,18 @@ class CameraHub:
                 "by_camera": by_camera}
 
     def status(self):
+        with self._recent_lock:
+            recent = list(self.recent_cars)   # 加锁拷贝，避免与自动线程并发写竞争
         if not self.streamers:
             return {"running": False, "plc_auto": self.plc_auto,
-                    "last_auto": self.last_auto, "recent_cars": self.recent_cars,
+                    "last_auto": self.last_auto, "recent_cars": recent,
                     "cameras": []}
         base = self.streamers[0].status()
         base["cameras"] = [s.status() for s in self.streamers]
         base["primary_ip"] = self.primary_ip
         base["plc_auto"] = self.plc_auto
         base["last_auto"] = self.last_auto
-        base["recent_cars"] = self.recent_cars
+        base["recent_cars"] = recent
         return base
 
 
@@ -1206,11 +1179,12 @@ def handle_car_signal(ctx):
     _prune_scratch()
 
     # 最近车辆表（网页展示，最多保留 10 台）
-    hub.recent_cars.insert(0, {
-        "ts": ts, "model": model, "skid": skid, "pin": pin,
-        "no_paint": bool(no_paint), "captured": captured, "key": key,
-    })
-    hub.recent_cars = hub.recent_cars[:10]
+    with hub._recent_lock:
+        hub.recent_cars.insert(0, {
+            "ts": ts, "model": model, "skid": skid, "pin": pin,
+            "no_paint": bool(no_paint), "captured": captured, "key": key,
+        })
+        hub.recent_cars = hub.recent_cars[:10]
     hub.last_auto = {"ts": ts, "skid": skid, "model": model,
                      "ok": True, "captured": captured}
 
@@ -1581,20 +1555,16 @@ def api_status():
 
 @app.route("/api/camera", methods=["POST"])
 def api_camera():
-    """手动测试面板用：运行时调整相机曝光/增益（仅在自由运行下直接写相机）。"""
+    """手动测试面板用：运行时调整相机曝光（仅在自由运行下直接写相机）。
+
+    注：增益为固定值(GAIN_DB)，前端不提供调整入口，set_gain 死代码已移除。
+    """
     if not hub.running or not hub.streamers:
         return jsonify({"ok": False, "error": "相机未运行"})
     data = request.get_json(silent=True) or {}
-    resp = {"ok": True}
-    if "exposure_us" in data and data["exposure_us"] is not None:
-        resp["exposure"] = hub.streamers[0].set_exposure(data["exposure_us"])
-    if "gain_db" in data:
-        g = data["gain_db"]
-        g = None if (g is None or g == "" or g == "None") else g
-        resp["gain"] = hub.streamers[0].set_gain(g)
-    if not resp.get("exposure") and not resp.get("gain"):
-        resp["ok"] = False
-        resp["error"] = "未收到 exposure_us / gain_db 参数"
+    if "exposure_us" not in data or data["exposure_us"] is None:
+        return jsonify({"ok": False, "error": "未收到 exposure_us 参数"})
+    resp = {"ok": True, "exposure": hub.streamers[0].set_exposure(data["exposure_us"])}
     return jsonify(resp)
 
 
@@ -1631,6 +1601,11 @@ def api_capture():
         except (TypeError, ValueError):
             fps = None
     total = data.get("total")
+    if total is not None:
+        try:
+            total = max(1, min(1000, int(total)))   # 后端兜底钳位：防绕过网页写海量张写满磁盘
+        except (TypeError, ValueError):
+            total = None
     if test:
         # 手动测试模式：与 PLC 无关、不判车型、不入库；照片落 data/manual_test/日期/时间/
         sess = datetime.datetime.now().strftime("%Y-%m-%d/%H%M%S")
