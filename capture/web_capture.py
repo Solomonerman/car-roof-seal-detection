@@ -1299,8 +1299,8 @@ def index():
       </div>
       <div style="font-size:13px;color:#aaa;margin-top:10px">连拍设置</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:4px">
-        <label style="font-size:12px;color:#aaa">每秒张数(1-6)<br>
-          <input id="fps" type="number" min="1" max="6" step="1" value="3"
+        <label style="font-size:12px;color:#aaa">每秒张数(1-6, 允许小数如2.5=2秒5张)<br>
+          <input id="fps" type="number" min="1" max="6" step="0.5" value="3"
                  style="width:80px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <label style="font-size:12px;color:#aaa">总张数(1-200)<br>
           <input id="total" type="number" min="1" max="200" step="1" value="21"
@@ -1368,7 +1368,7 @@ function applyCam(){{
 }}
 
 function manualCapture(){{
-  let fps=parseInt(document.getElementById('fps').value)||3;
+  let fps=parseFloat(document.getElementById('fps').value)||3;
   if(fps>6){{fps=6;}} if(fps<1){{fps=1;}}
   const total=parseInt(document.getElementById('total').value)||21;
   const btn=document.getElementById('cap');
@@ -1528,8 +1528,11 @@ def api_capture():
         return jsonify({"ok": False, "error": "相机未运行"})
     test = bool(data.get("test", False))
     fps = data.get("fps")
-    if isinstance(fps, (int, float)) and not isinstance(fps, bool):
-        fps = max(1, min(6, int(fps)))   # 相机封顶 6fps，连拍速度不得超 6（防链路拥塞冻屏）
+    if fps is not None:
+        try:
+            fps = max(1.0, min(6.0, float(fps)))   # 相机封顶 6fps；允许小数(如2.5=2秒5张)
+        except (TypeError, ValueError):
+            fps = None
     total = data.get("total")
     if test:
         # 手动测试模式：与 PLC 无关、不判车型、不入库；照片落 data/manual_test/日期/时间/
