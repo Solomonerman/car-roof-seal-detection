@@ -148,6 +148,10 @@ FPS = 3                # 连拍帧率（张/秒），程序侧固定节奏，与
 DURATION_SEC = 7       # 连拍持续时长（秒）
 TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
+# 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
+# 会令固件静默停出图，无异常、GrabSucceeded 恒为 False），即重启取流，不退出进程。
+SELFHEAL_SEC = 5.0
+
 # ===================== 相机连接参数 =====================
 # 现场相机 IP 列表（多相机就绪：左右相机共用同一出车信号，把 IP 追加进来即可，
 # 其余代码无需改动；当前仅左相机一台）。第二台接入后，自动模式会同时触发全部相机。
@@ -507,7 +511,6 @@ class CameraStreamer:
         GrabSucceeded 恒为 False、_loop 看似活着实则空转 → 画面定格）。故监测
         "超过阈值无新帧"即重启取流，不退出进程。
         """
-        SELFHEAL_SEC = 5.0
         last_good = time.perf_counter()
         while self.running:
             try:
