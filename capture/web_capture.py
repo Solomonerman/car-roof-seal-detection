@@ -20,8 +20,9 @@
      自动模式： python capture/web_capture.py --plc-auto
   4) 浏览器打开 http://<上位机IP>:5000 看实时画面。
      网页顶部 [手动测试 | 自动监控] 切换：
-       · 手动测试——设曝光/增益/每秒张数/总张数，点拍即拍，与 PLC 无关、不判车型、
+       · 手动测试——设曝光/每秒张数/总张数，点拍即拍，与 PLC 无关、不判车型、
          照片存 data/manual_test/日期/时间/（网页直接看缩略图），纯测相机。
+         （增益不可调，固定沿用相机当前值 Gain Raw 136）
        · 自动监控——PLC 出车信号触发、车型筛选、存档（原逻辑）。
 
 取流架构（2026-08-15 重写）：
@@ -1144,9 +1145,7 @@ def index():
         <label style="font-size:12px;color:#aaa">曝光(µs)<br>
           <input id="exp" type="number" min="50" max="100000" step="50"
                  style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
-        <label style="font-size:12px;color:#aaa">增益(dB，留空=沿用相机当前值)<br>
-          <input id="gain" type="number" min="0" max="24" step="0.5"
-                 style="width:120px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <span style="font-size:12px;color:#789">增益：固定沿用相机当前值（Gain Raw 136，不可在此修改）</span>
         <button onclick="applyCam()">应用参数</button>
         <span id="camState" class="meta"></span>
       </div>
@@ -1209,16 +1208,12 @@ function switchTab(name){{
 
 function applyCam(){{
   const exp=parseFloat(document.getElementById('exp').value);
-  const gv=document.getElementById('gain').value.trim();
-  const gain=(gv==='')?null:parseFloat(gv);
   const body={{exposure_us:isNaN(exp)?null:exp}};
-  if(gain!==null) body.gain_db=gain;
   camState.textContent='应用中…';
   fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
     .then(r=>r.json()).then(res=>{{
       let m='';
       if(res.exposure) m+=(res.exposure.ok?('曝光='+res.exposure.exposure_us+'µs '):('曝光失败:'+(res.exposure.error||'')+' '));
-      if(res.gain) m+=(res.gain.ok?('增益='+res.gain.gain_db+'dB'):('增益失败:'+(res.gain.error||'')));
       camState.textContent=m||'已应用';
     }}).catch(e=>{{camState.textContent='参数应用出错:'+e;}});
 }}
@@ -1291,7 +1286,6 @@ function refreshStatus(){{
     meta.innerHTML=h;
     if(!_inited){{
       document.getElementById('exp').value=s.params.exposure_us;
-      document.getElementById('gain').value=(s.params.gain_db==null)?'':s.params.gain_db;
       _inited=true;
     }}
   }}).catch(()=>{{state.textContent='● 连接失败';state.style.background='#b5482f';}});
