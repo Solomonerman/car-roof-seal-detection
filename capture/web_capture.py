@@ -232,20 +232,14 @@ def _frame_hash(frame):
         return "na"
 
 
-# pylon 像素类型整数值（稳定常量，避免依赖 pypylon 的符号名）。
-# 来源：Basler pylon 像素格式枚举。
-_PX_MONO8 = 17301505          # 0x01080001
-_PX_BAYER8 = frozenset({17301513, 17301514, 17301515, 17301516})  # RG/GR/GB/BG 8bit
-_PX_MONO16 = 17825793         # 0x01100001
-
-
 def _grab_to_frame(grab):
     """pylon grab 结果 → 完全独立的 numpy 数组(真·深拷贝)。
 
-    不用 grab.Array：某些 pypylon 版本/相机组合下 GetArray() 会抛
-    'Pixel format currently not supported'（即便相机配置的就是 Mono8），
-    导致每一帧都报错、预览与拍照全拿不到图。改为用 GetBuffer() 取原始字节，
-    按 Grab 的 宽/高/像素类型 手工重塑，对任意单通道 8/16 位格式都安全。
+    不用 grab.Array：本机 pypylon 版本下 GetArray() 对 Mono8 也会抛
+    'Pixel format currently not supported'，且在部分流式帧上甚至返回空数组
+    （导致预览 cv2.resize 报 !ssize.empty）。改为用 GetBuffer() 取原始字节，
+    【按字节总数自动判断像素布局】(w*h / w*h*2 / w*h*3)，完全不依赖像素类型
+    常量，对任意 8bit 单通道(Mono/Bayer)、16bit 单通道、RGB 都安全。
 
     仍保持真·深拷贝：GetBuffer 返回的 bytes 独立于相机内部缓冲区，np.array
     copy=True 再锁一份，确保连续帧不指向同一块被复用内存（否则 21 张全相同）。
@@ -253,27 +247,25 @@ def _grab_to_frame(grab):
     w = grab.GetWidth()
     h = grab.GetHeight()
     buf = grab.GetBuffer()
+    n = len(buf)
     try:
-        ptype = grab.GetPixelType()
-    except Exception:
-        ptype = None
-    try:
-        if ptype == _PX_MONO8 or ptype in _PX_BAYER8:
-            arr = np.frombuffer(buf, np.uint8).reshape(h, w)
-        elif ptype == _PX_MONO16:
+        if n == w * h * 3:
+            arr = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+        elif n == w * h * 2:
             arr = np.frombuffer(buf, np.uint16).reshape(h, w)
+        elif n == w * h:
+            arr = np.frombuffer(buf, np.uint8).reshape(h, w)
         else:
-            arr = np.array(grab.Array, copy=True)   # 兜底：其它格式走官方实现
-    except Exception:
-        # 任何意外都退化为单通道 uint8，绝不抛错中断取流线程
-        try:
-            arr = np.array(grab.Array, copy=True)
-        except Exception:
+            # 尺寸对不上（极少见）：尽力按单通道重塑，失败则退化安全帧
             try:
                 arr = np.frombuffer(buf, np.uint8).reshape(h, w)
             except Exception:
                 arr = np.zeros((h, w), np.uint8)
-    return np.array(arr, copy=True, dtype=np.uint8)
+    except Exception:
+        arr = np.zeros((h, w), np.uint8)
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)   # 16bit 路径转 uint8（截断高位；单色相机走不到此分支）
+    return np.array(arr, copy=True)
 
 
 class CameraStreamer:
@@ -709,7 +701,7 @@ class CameraStreamer:
                 frame = self._latest
                 age = time.perf_counter() - self._latest_ts
                 fno = self._frame_no
-            if frame is None:
+            if frame is None or getattr(frame, "size", 0) == 0:
                 return None
             scale = STREAM_WIDTH / self.width if self.width else 1.0
             disp = cv2.resize(frame, (STREAM_WIDTH, int(self.height * scale)))
