@@ -689,12 +689,14 @@ class CameraStreamer:
             cap_fps = self._cap_fps
             cap_total = self._cap_total
         saved = len(batch)
+        cam_frames = self._frame_no - self._cap_frame_no0
         unique = len(set(hashes))
         identical = (saved > 1 and unique <= 1)
         elapsed = round(elapsed, 2)
         abs_files = [os.path.abspath(os.path.join(cap_save_dir, f)) for f in batch]
         print(f"[拍照] 完成: 目标{cap_total}张 实际{saved}张 唯一帧={unique}/{saved} "
-              f"耗时={elapsed}s 是否全同={identical} 落盘={cap_save_dir}")
+              f"耗时={elapsed}s 是否全同={identical} 相机出帧={cam_frames} "
+              f"落盘={cap_save_dir}")
         if identical:
             print("[拍照] ⚠️ 全部相同 → 相机未持续出图(检查 TriggerMode=Off/网口掉流)")
         if saved:
@@ -798,9 +800,12 @@ class CameraStreamer:
             self._cap_total = total
             self._cap_save_dir = save_dir
             self._cap_prefix = prefix
+            self._cap_frame_no0 = self._frame_no   # 拍照起始帧号（用于诊断相机是否持续出图）
         dur = total / fps if fps > 0 else DURATION_SEC
+        # 超时余量：基础 6s + 张数*0.6，给偶发 GigE 抖动/自愈留足时间，避免误超时
+        timeout = dur + max(6.0, total * 0.6)
         self._capture_done.clear()
-        if self._capture_done.wait(timeout=dur + 5.0):
+        if self._capture_done.wait(timeout=timeout):
             with self._lock:
                 return self._last_result or {"ok": False, "error": "连拍无结果"}
         # 超时兜底：复位状态，避免永久卡在 capturing；并把已存张数如实回填
@@ -811,7 +816,9 @@ class CameraStreamer:
             cap_save_dir = self._cap_save_dir
             cap_total = self._cap_total
         saved = len(batch)
-        print(f"[拍照] 超时兜底: 目标{cap_total}张 实际仅存{saved}张 -> "
+        cam_frames = self._frame_no - self._cap_frame_no0
+        print(f"[拍照] 超时兜底: 目标{cap_total}张 实际仅存{saved}张 "
+              f"（拍照期间相机出帧{cam_frames}帧）-> "
               f"{os.path.abspath(cap_save_dir) if cap_save_dir else ''}")
         self._last_result = {
             "ok": saved > 0,
@@ -1374,7 +1381,7 @@ function manualCapture(){{
   // 单一恢复函数：无论成功/失败/超时，按钮必回到可点状态（绿色）
   let restored=false;
   const restore=()=>{{ if(restored) return; restored=true; clearTimeout(t); ctrl.abort();
-    capState.textContent=''; if(btn){{btn.disabled=false;}} }};
+    if(btn){{btn.disabled=false;}} }};   // 只恢复按钮；拍摄结果由下方 .then 写进 capState 保留显示
   const safety=setTimeout(restore, 25000);   // 终极兜底：25秒内任何情况都强制恢复按钮
   fetch('/api/capture',{{method:'POST',headers:{{'Content-Type':'application/json'}},
       body:JSON.stringify(payload), signal:ctrl.signal}})
@@ -1382,6 +1389,7 @@ function manualCapture(){{
     .then(res=>{{
       console.log('[前端] /api/capture 结果', res);
       if(res.ok){{
+        capState.textContent='✅ 完成 '+res.saved+'/'+res.total+' 张'; capState.style.color='#6f6';
         let line=`[${{res.ts}}] 手动测试 完成 拍 ${{res.saved}}/${{res.total}} 张 · 耗时 ${{res.elapsed}}s · ${{res.actual_fps}} fps\\n`+
                  `已存到：${{res.save_dir}}\\n`+
                  `唯一帧=${{res.unique_frames}}/${{res.saved}}`+(res.identical?' ⚠️全部相同(相机未持续出图)':'')+`\\n`;
@@ -1394,10 +1402,12 @@ function manualCapture(){{
         }});
         if(!(res.rel_files||[]).length) gal.innerHTML='<span class="meta">无缩略图</span>';
       }}else{{
+        capState.textContent='❌ 0张 · '+(res.error||'未写入任何文件'); capState.style.color='#f66';
         log.textContent='[错误] '+(res.error||'未知错误')+'（未写入任何文件）\\n'+log.textContent;
       }}
     }})
     .catch(e=>{{ console.error('[前端] /api/capture 失败', e);
+      capState.textContent='⚠️ 网络/请求错误'; capState.style.color='#fa3';
       log.textContent='[网络/请求错误] '+e+'（若已存照片请去 manual_test 目录查看）\\n'+log.textContent; }})
     .finally(restore);
 }}
