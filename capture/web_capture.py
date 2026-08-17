@@ -148,6 +148,11 @@ FPS = 3                # 连拍帧率（张/秒），程序侧固定节奏，与
 DURATION_SEC = 7       # 连拍持续时长（秒）
 TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
+# 拍摄前延迟（秒）：收到 PLC 出车信号 / 点击手动拍摄按钮后，先等目标物移动到
+# 相机视野合适位置再开始连拍。自动(PLC触发)与手动(点击按钮)共用，均在
+# request_capture 入口统一延迟，避免把"刚出车/刚点按钮"那一刻拍进去。
+PRE_CAPTURE_DELAY = 3.5
+
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
 # 会令固件静默停出图，无异常、GrabSucceeded 恒为 False），即重启取流，不退出进程。
 SELFHEAL_SEC = 5.0
@@ -159,7 +164,7 @@ CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
 CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
 
 # ===================== 相机采集参数 =====================
-EXPOSURE_TIME_US = 2000      # 曝光时间（微秒）
+EXPOSURE_TIME_US = 3000      # 曝光时间（微秒），默认 3000（2000 偏暗，现场已上调）
 # 增益：设为 None = 沿用相机【当前值】、不修改。
 #   你在 pylon Viewer 里已设过增益（现场暗光、曝光锁 2000µs 的可用档），
 #   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
@@ -839,10 +844,16 @@ class CameraStreamer:
             os.makedirs(save_dir, exist_ok=True)
         except Exception as e:
             return {"ok": False, "error": f"创建存储目录失败: {e}"}
-        print(f"[拍照] 开始连拍: 目标{total}张 @{fps}fps -> {save_dir}")
+        # 拍摄前延迟：收到指令(PLC出车信号/点击手动)后先等目标物移动到视野合适位置。
+        # 放在加锁之前、且不持锁睡觉，既不影响取流线程，也避免此前"日志先打印、锁后拿"的
+        # 竞态窗口（手动恰好卡在打印与加锁之间会误判两场同时开始）。
+        if PRE_CAPTURE_DELAY > 0:
+            print(f"[拍照] 收到拍摄指令，延迟 {PRE_CAPTURE_DELAY}s 后开始连拍")
+            time.sleep(PRE_CAPTURE_DELAY)
         with self._lock:
             if self._cap_running:
                 return {"ok": False, "error": "拍照进行中，请稍候"}
+            print(f"[拍照] 开始连拍: 目标{total}张 @{fps}fps -> {save_dir}")
             self._cap_running = True
             self._cap_state = "capturing"
             self._cap_idx = 0
@@ -1447,7 +1458,7 @@ function manualCapture(){{
   const total=parseInt(document.getElementById('total').value)||21;
   const btn=document.getElementById('cap');
   if(btn){{btn.disabled=true;}}
-  capState.textContent='拍摄中…(约7秒,最多12秒)'; gal.innerHTML='';
+  capState.textContent='准备中…(延迟3.5秒后开始拍摄，共约10秒)'; gal.innerHTML='';
   console.log('[前端] 开始手动拍摄', {{fps:fps,total:total}});
   const payload={{test:true,fps:fps,total:total}};
   const ctrl=new AbortController();
