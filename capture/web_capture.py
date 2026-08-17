@@ -149,7 +149,7 @@ DURATION_SEC = 7       # 连拍持续时长（秒）
 TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
 # 自动监控连拍参数（PLC 触发 / 强制拍摄）：与手动测试模式解耦，单独配置。
-AUTO_FPS = 2.5                # 自动连拍帧率（张/秒）= 2秒5张
+AUTO_FPS = 2.75                # 自动连拍帧率（张/秒）= 2秒5张
 AUTO_DURATION_SEC = 5         # 自动连拍持续时长（秒）
 AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 张
 
