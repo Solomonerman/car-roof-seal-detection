@@ -1368,9 +1368,12 @@ def index():
       <div style="font-size:14px;margin-bottom:8px;color:#9cf">相机参数（实时写入相机，预览立即生效）</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
         <label style="font-size:12px;color:#aaa">曝光(µs)<br>
-          <input id="exp" type="number" min="50" max="100000" step="50"
+          <input id="exp" type="number" min="50" max="100000" step="50" value="3000"
                  style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
-        <span style="font-size:12px;color:#789">增益：固定沿用相机当前值（Gain Raw 136，不可在此修改）</span>
+        <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
+          <input id="delay" type="number" min="0" max="30" step="0.5" value="3.5"
+                 style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <span style="font-size:12px;color:#789">增益：固定沿用相机当前值（Gain Raw 136，不可在此修改）。帧率见下方“连拍设置”，点“应用参数”一并生效。</span>
         <button onclick="applyCam()">应用参数</button>
         <span id="camState" class="meta"></span>
       </div>
@@ -1435,7 +1438,11 @@ function switchTab(name){{
 
 function applyCam(){{
   const exp=parseFloat(document.getElementById('exp').value);
-  const body={{exposure_us:isNaN(exp)?null:exp}};
+  const fps=parseFloat(document.getElementById('fps').value);
+  const delay=parseFloat(document.getElementById('delay').value);
+  const body={{exposure_us:isNaN(exp)?null:exp,
+              fps:isNaN(fps)?null:fps,
+              delay:isNaN(delay)?null:delay}};
   camState.textContent='应用中…';
   fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
     .then(r=>r.json()).then(res=>{{
@@ -1453,6 +1460,8 @@ function applyCam(){{
           m+='曝光失败:'+(e.error||'')+' ';
         }}
       }}
+      if(res.fps!==undefined && res.fps!==null){{ document.getElementById('fps').value=res.fps; m+='帧率='+res.fps+'fps '; }}
+      if(res.delay!==undefined && res.delay!==null){{ document.getElementById('delay').value=res.delay; m+='延时='+res.delay+'s '; }}
       camState.textContent=m||'已应用';
     }}).catch(e=>{{camState.textContent='参数应用出错:'+e;}});
 }}
@@ -1574,9 +1583,12 @@ def api_status():
 
 @app.route("/api/camera", methods=["POST"])
 def api_camera():
-    """手动测试面板用：运行时调整相机曝光（仅在自由运行下直接写相机）。
+    """手动测试面板用：运行时调整相机调试参数（曝光 / 帧率 / 拍照延时）。仅在自由运行下直接写相机。
 
-    注：增益为固定值(GAIN_DB)，前端不提供调整入口，set_gain 死代码已移除。
+    注：增益为固定值(GAIN_DB)，前端不提供调整入口。
+    - 曝光：实时写入相机（set_exposure 已关自动曝光、走 ExposureTimeAbs 真实节点）。
+    - 帧率：仅改手动默认全局 FPS，不动 AUTO_FPS；同步重算 TOTAL 供自检/状态显示。
+    - 拍照延时：改 PRE_CAPTURE_DELAY（手动与自动共用，拍摄入口统一延迟）。
     """
     if not hub.running or not hub.streamers:
         return jsonify({"ok": False, "error": "相机未运行"})
@@ -1584,6 +1596,17 @@ def api_camera():
     if "exposure_us" not in data or data["exposure_us"] is None:
         return jsonify({"ok": False, "error": "未收到 exposure_us 参数"})
     resp = {"ok": True, "exposure": hub.streamers[0].set_exposure(data["exposure_us"])}
+    # 帧率（手动默认全局，封顶 6fps；不影响自动模式 AUTO_FPS）
+    if data.get("fps") is not None:
+        global FPS, TOTAL
+        FPS = max(0.5, min(6.0, float(data["fps"])))
+        TOTAL = int(FPS * DURATION_SEC)
+        resp["fps"] = round(FPS, 2)
+    # 拍照延时（手动与自动共用）
+    if data.get("delay") is not None:
+        global PRE_CAPTURE_DELAY
+        PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["delay"])))
+        resp["delay"] = round(PRE_CAPTURE_DELAY, 2)
     return jsonify(resp)
 
 
