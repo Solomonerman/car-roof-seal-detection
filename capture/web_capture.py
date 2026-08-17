@@ -148,6 +148,11 @@ FPS = 3                # 连拍帧率（张/秒），程序侧固定节奏，与
 DURATION_SEC = 7       # 连拍持续时长（秒）
 TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
+# 自动监控连拍参数（PLC 触发 / 强制拍摄）：与手动测试模式解耦，单独配置。
+AUTO_FPS = 2.5                # 自动连拍帧率（张/秒）= 2秒5张
+AUTO_DURATION_SEC = 5         # 自动连拍持续时长（秒）
+AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 张
+
 # 拍摄前延迟（秒）：收到 PLC 出车信号 / 点击手动拍摄按钮后，先等目标物移动到
 # 相机视野合适位置再开始连拍。自动(PLC触发)与手动(点击按钮)共用，均在
 # request_capture 入口统一延迟，避免把"刚出车/刚点按钮"那一刻拍进去。
@@ -956,7 +961,7 @@ class CameraStreamer:
             "pixel_format": self.actual_fmt,
             "config": getattr(self, "_conf_log", []),
             "params": {
-                "fps": FPS, "duration_sec": DURATION_SEC, "total": TOTAL,
+                "fps": AUTO_FPS, "duration_sec": AUTO_DURATION_SEC, "total": AUTO_TOTAL,
                 "exposure_us": self._exposure_us,
                 "gain_db": self._gain_db,
                 "gain_display": ("相机当前值" if self._gain_db is None
@@ -1077,7 +1082,7 @@ class CameraHub:
         primary_files = []
         primary_result = None
         for ip, s in zip(self.ips, self.streamers):
-            r = s.request_capture()
+            r = s.request_capture(fps=AUTO_FPS, total=AUTO_TOTAL)
             by_camera[ip] = r
             if ip == self.primary_ip:
                 primary_files = r.get("files", [])
@@ -1108,7 +1113,7 @@ def handle_car_signal(ctx):
 
     流程（用户定义）：
       上升沿 → 用提前锁存的 DB230 记录全部车的车型/NO_Paint/滑橇/PIN →
-      若车型是 9X 或 8X 且 NO_Paint=0 → 触发相机拍照（出车信号后立即 7s 连拍）；
+      若车型是 9X 或 8X 且 NO_Paint=0 → 触发相机拍照（出车信号后立即 5s 连拍）；
       否则不拍照（免检车 / 未接入车型）。
     所有车型用同一出车信号触发，避免拍照时机不一致导致照片错位。
 
@@ -1132,7 +1137,7 @@ def handle_car_signal(ctx):
     key = route_algorithm(model)
     should_capture = (key in ("9X", "8X")) and (not no_paint)
 
-    # 持久记录"收到车信号"——PLC 上下文在 7 秒连拍期间会被下一台车覆盖，
+    # 持久记录"收到车信号"——PLC 上下文在 5 秒连拍期间会被下一台车覆盖，
     # 此处在该车被收到的瞬间落盘，确保 MM** 等信号有完整追溯(车型/滑橇/PIN/决策)。
     log_capture_event(
         type="car_received",
@@ -1628,8 +1633,8 @@ def api_capture():
                                              save_dir=save_dir, prefix="Test")
         print(f"[网页] 手动测试拍摄: {result.get('saved')} 张 -> {result.get('save_dir')}")
     else:
-        # 强制拍摄（自动模式下补拍/调试）：沿用默认 21@3fps，不入库
-        result = hub.request_capture_primary()
+        # 强制拍摄（自动模式下补拍/调试）：沿用自动参数 12@2.5fps，不入库
+        result = hub.request_capture_primary(fps=AUTO_FPS, total=AUTO_TOTAL)
         _prune_scratch()
         if result.get("ok"):
             print(f"[网页] 强制拍摄完成: {result.get('saved')} 张 -> {result.get('save_dir')}")
