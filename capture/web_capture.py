@@ -153,10 +153,13 @@ AUTO_FPS = 2.75                # 自动连拍帧率（张/秒）= 2秒5张
 AUTO_DURATION_SEC = 5         # 自动连拍持续时长（秒）
 AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 张
 
-# 拍摄前延迟（秒）：收到 PLC 出车信号 / 点击手动拍摄按钮后，先等目标物移动到
-# 相机视野合适位置再开始连拍。自动(PLC触发)与手动(点击按钮)共用，均在
-# request_capture 入口统一延迟，避免把"刚出车/刚点按钮"那一刻拍进去。
-PRE_CAPTURE_DELAY = 3.5
+# 拍摄前延迟（秒）：收到拍摄指令后，先等目标物移动到相机视野合适位置再开始连拍。
+# 自动(PLC触发)与手动(点击按钮)【分开定义、可在界面分别调整】，避免把"刚到位/刚点
+# 按钮"那一刻拍进去。request_capture 不再用单一全局，而由调用方显式传入对应延时。
+#   - 自动(AUTO)：默认 2.0s（出车信号+同步信号满足后，等车身到视野再拍）
+#   - 手动(MANUAL)：默认 5.0s（手动测试 / 自检之外的手动拍摄）
+AUTO_PRE_CAPTURE_DELAY = 2.0
+MANUAL_PRE_CAPTURE_DELAY = 5.0
 
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
 # 会令固件静默停出图，无异常、GrabSucceeded 恒为 False），即重启取流，不退出进程。
@@ -831,7 +834,7 @@ class CameraStreamer:
         """增益为固定值(GAIN_DB)，前端无调整入口；保留占位以兼容旧调用，实际不修改相机。"""
         return {"ok": True, "gain_db": self._gain_db, "note": "增益固定，未修改"}
 
-    def request_capture(self, fps=None, total=None, save_dir=None, prefix="Image"):
+    def request_capture(self, fps=None, total=None, save_dir=None, prefix="Image", delay=None):
         """外部触发连拍，阻塞直到完成，返回结果 dict。
 
         参数（每次可覆盖，自动模式用默认、手动测试模式由网页传入）：
@@ -852,9 +855,12 @@ class CameraStreamer:
         # 拍摄前延迟：收到指令(PLC出车信号/点击手动)后先等目标物移动到视野合适位置。
         # 放在加锁之前、且不持锁睡觉，既不影响取流线程，也避免此前"日志先打印、锁后拿"的
         # 竞态窗口（手动恰好卡在打印与加锁之间会误判两场同时开始）。
-        if PRE_CAPTURE_DELAY > 0:
-            print(f"[拍照] 收到拍摄指令，延迟 {PRE_CAPTURE_DELAY}s 后开始连拍")
-            time.sleep(PRE_CAPTURE_DELAY)
+        # delay 由调用方显式传入（自动= AUTO_PRE_CAPTURE_DELAY / 手动= MANUAL_PRE_CAPTURE_DELAY）；
+        # 未传则回退手动默认（自检等无参调用）。
+        cap_delay = delay if delay is not None else MANUAL_PRE_CAPTURE_DELAY
+        if cap_delay > 0:
+            print(f"[拍照] 收到拍摄指令，延迟 {cap_delay}s 后开始连拍")
+            time.sleep(cap_delay)
         with self._lock:
             if self._cap_running:
                 return {"ok": False, "error": "拍照进行中，请稍候"}
@@ -1007,7 +1013,7 @@ def run_selftest():
     print("[自检] 相机已启动，稳定 1s ...")
     time.sleep(1)
     print(f"[自检] 触发连拍 {TOTAL} 张 ...")
-    r = hub.request_capture_primary()
+    r = hub.request_capture_primary(delay=2.0)
     try:
         hub.stop_all()
     except Exception:
@@ -1065,16 +1071,18 @@ class CameraHub:
             return None
         return self.streamers[0].get_latest_jpeg()
 
-    def request_capture_primary(self, fps=None, total=None, save_dir=None, prefix="Image"):
+    def request_capture_primary(self, fps=None, total=None, save_dir=None, prefix="Image", delay=None):
         """手动按钮用：返回主相机连拍结果 dict（含 files/saved/...）。
 
-        可选透传拍照参数（手动测试模式由网页传入 fps/total/save_dir/prefix）；
-        无参时沿用默认 21@3fps（自检/强制拍摄路径）。
+        可选透传拍照参数（手动测试模式由网页传入 fps/total/save_dir/prefix/delay）；
+        无参时沿用默认 21@3fps（自检/强制拍摄路径）。delay 决定拍摄前延时：
+        手动路径传 MANUAL_PRE_CAPTURE_DELAY，强制拍摄传 AUTO_PRE_CAPTURE_DELAY，自检传 2.0。
         """
         if not self.streamers:
             return {"ok": False, "error": "相机未运行"}
         return self.streamers[0].request_capture(fps=fps, total=total,
-                                                 save_dir=save_dir, prefix=prefix)
+                                                 save_dir=save_dir, prefix=prefix,
+                                                 delay=delay)
 
     def request_capture_all(self):
         """自动触发用：触发全部相机，返回主相机文件列表 + 各相机结果。"""
@@ -1082,7 +1090,8 @@ class CameraHub:
         primary_files = []
         primary_result = None
         for ip, s in zip(self.ips, self.streamers):
-            r = s.request_capture(fps=AUTO_FPS, total=AUTO_TOTAL)
+            r = s.request_capture(fps=AUTO_FPS, total=AUTO_TOTAL,
+                                  delay=AUTO_PRE_CAPTURE_DELAY)
             by_camera[ip] = r
             if ip == self.primary_ip:
                 primary_files = r.get("files", [])
@@ -1372,7 +1381,7 @@ def index():
           <input id="exp" type="number" min="50" max="100000" step="50" value="3000"
                  style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
-          <input id="delay" type="number" min="0" max="30" step="0.5" value="3.5"
+          <input id="delay" type="number" min="0" max="30" step="0.5" value="5"
                  style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <span style="font-size:12px;color:#789">增益：固定沿用相机当前值（Gain Raw 136，不可在此修改）。帧率见下方“连拍设置”，点“应用参数”一并生效。</span>
         <button onclick="applyCam()">应用参数</button>
@@ -1406,6 +1415,20 @@ def index():
       <button id="capAuto" onclick="autoCapture()">📸 强制拍摄（补拍/调试）</button>
       <span id="capStateAuto" class="meta"></span>
     </div>
+    <div style="border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:12px;background:#161616">
+      <div style="font-size:14px;margin-bottom:8px;color:#9cf">自动拍照延时（仅自动 PLC 触发 / 强制拍摄生效，手动模式不受影响）</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
+          <input id="autoDelay" type="number" min="0" max="30" step="0.5" value="2"
+                 style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <button onclick="applyAutoDelay()">应用参数</button>
+        <span id="autoCamState" class="meta"></span>
+      </div>
+      <div style="font-size:12px;color:#789;margin-top:8px">
+        说明：自动触发条件 = 出车信号(DB130.DBX0.1)上升沿 + 车身同步信号(DB890.DBX225.2 与 225.3 同时为 1)。
+        三者满足后等本延时再连拍；本值仅作用自动模式，手动延时在“手动测试”面板单独设置（默认 5s）。
+      </div>
+    </div>
     <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
     <table class="ctab"><thead><tr>
       <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测(未接入)</th>
@@ -1427,6 +1450,7 @@ const carbody=document.getElementById('carbody');
 const capState=document.getElementById('capState');
 const capStateAuto=document.getElementById('capStateAuto');
 const camState=document.getElementById('camState');
+const autoCamState=document.getElementById('autoCamState');
 const gal=document.getElementById('gal');
 let _inited=false;
 
@@ -1465,6 +1489,23 @@ function applyCam(){{
       if(res.delay!==undefined && res.delay!==null){{ document.getElementById('delay').value=res.delay; m+='延时='+res.delay+'s '; }}
       camState.textContent=m||'已应用';
     }}).catch(e=>{{camState.textContent='参数应用出错:'+e;}});
+}}
+
+function applyAutoDelay(){{
+  const d=parseFloat(document.getElementById('autoDelay').value);
+  const body={{auto_delay:isNaN(d)?null:d}};
+  autoCamState.textContent='应用中…';
+  fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(r=>r.json()).then(res=>{{
+      let m='';
+      if(res.auto_delay!==undefined && res.auto_delay!==null){{
+        document.getElementById('autoDelay').value=res.auto_delay;
+        m+='自动延时='+res.auto_delay+'s ';
+      }} else if(res.error){{
+        m=res.error;
+      }}
+      autoCamState.textContent=m||'已应用';
+    }}).catch(e=>{{autoCamState.textContent='参数应用出错:'+e;}});
 }}
 
 function manualCapture(){{
@@ -1584,30 +1625,41 @@ def api_status():
 
 @app.route("/api/camera", methods=["POST"])
 def api_camera():
-    """手动测试面板用：运行时调整相机调试参数（曝光 / 帧率 / 拍照延时）。仅在自由运行下直接写相机。
+    """运行时调整相机调试参数。手动测试面板用：曝光 / 帧率 / 手动拍照延时；
+    自动监控面板用：自动拍照延时。仅在自由运行下直接写相机。
 
     注：增益为固定值(GAIN_DB)，前端不提供调整入口。
     - 曝光：实时写入相机（set_exposure 已关自动曝光、走 ExposureTimeAbs 真实节点）。
     - 帧率：仅改手动默认全局 FPS，不动 AUTO_FPS；同步重算 TOTAL 供自检/状态显示。
-    - 拍照延时：改 PRE_CAPTURE_DELAY（手动与自动共用，拍摄入口统一延迟）。
+    - 手动拍照延时(delay)：改 MANUAL_PRE_CAPTURE_DELAY（仅手动测试/自检；不影响自动模式）。
+    - 自动拍照延时(auto_delay)：改 AUTO_PRE_CAPTURE_DELAY（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
+    exposure_us / fps / delay / auto_delay 均可独立发送，按需只传需要改的项。
     """
     if not hub.running or not hub.streamers:
         return jsonify({"ok": False, "error": "相机未运行"})
     data = request.get_json(silent=True) or {}
-    if "exposure_us" not in data or data["exposure_us"] is None:
-        return jsonify({"ok": False, "error": "未收到 exposure_us 参数"})
-    resp = {"ok": True, "exposure": hub.streamers[0].set_exposure(data["exposure_us"])}
+    resp = {"ok": True}
+    # 曝光（实时写相机）
+    if data.get("exposure_us") is not None:
+        resp["exposure"] = hub.streamers[0].set_exposure(data["exposure_us"])
     # 帧率（手动默认全局，封顶 6fps；不影响自动模式 AUTO_FPS）
     if data.get("fps") is not None:
         global FPS, TOTAL
         FPS = max(0.5, min(6.0, float(data["fps"])))
         TOTAL = int(FPS * DURATION_SEC)
         resp["fps"] = round(FPS, 2)
-    # 拍照延时（手动与自动共用）
+    # 手动拍照延时（仅手动测试/自检；不影响自动模式）
     if data.get("delay") is not None:
-        global PRE_CAPTURE_DELAY
-        PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["delay"])))
-        resp["delay"] = round(PRE_CAPTURE_DELAY, 2)
+        global MANUAL_PRE_CAPTURE_DELAY
+        MANUAL_PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["delay"])))
+        resp["delay"] = round(MANUAL_PRE_CAPTURE_DELAY, 2)
+    # 自动拍照延时（仅自动 PLC 触发/强制拍摄；不影响手动模式）
+    if data.get("auto_delay") is not None:
+        global AUTO_PRE_CAPTURE_DELAY
+        AUTO_PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["auto_delay"])))
+        resp["auto_delay"] = round(AUTO_PRE_CAPTURE_DELAY, 2)
+    if set(resp.keys()) <= {"ok"}:
+        return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay）"})
     return jsonify(resp)
 
 
@@ -1654,11 +1706,13 @@ def api_capture():
         sess = datetime.datetime.now().strftime("%Y-%m-%d/%H%M%S")
         save_dir = os.path.join(MANUAL_TEST_ROOT, sess)
         result = hub.request_capture_primary(fps=fps, total=total,
-                                             save_dir=save_dir, prefix="Test")
+                                             save_dir=save_dir, prefix="Test",
+                                             delay=MANUAL_PRE_CAPTURE_DELAY)
         print(f"[网页] 手动测试拍摄: {result.get('saved')} 张 -> {result.get('save_dir')}")
     else:
         # 强制拍摄（自动模式下补拍/调试）：沿用自动参数 12@2.5fps，不入库
-        result = hub.request_capture_primary(fps=AUTO_FPS, total=AUTO_TOTAL)
+        result = hub.request_capture_primary(fps=AUTO_FPS, total=AUTO_TOTAL,
+                                             delay=AUTO_PRE_CAPTURE_DELAY)
         _prune_scratch()
         if result.get("ok"):
             print(f"[网页] 强制拍摄完成: {result.get('saved')} 张 -> {result.get('save_dir')}")

@@ -4,6 +4,10 @@
 设计要点：
   - 全程仅 read_area，绝不 write_area / db_write / plc_stop / download。
   - 触发策略：以【DB130.DBX0.1 出车信号上升沿(0→1)】为权威触发源（现场确认）。
+  - 新增车身同步条件：出车信号仅“预约”拍照，须再等【DB890.DBX225.2 与 DBX225.3
+    同时为 1】才真正触发（雪橇到达相机视野位置）。解决“车身同步性不好”问题。
+    同步信号通常在出车信号后约 2s 才置 1，故用窗口等待(SYNC_WINDOW_SEC)，而非
+    要求上升沿那一刻就为 1（否则会全部漏拍）。
   - 关键矛盾：PLC 收到出车信号会【立即清零 DB230】，所以上升沿那一刻去读 DB230 必然为空。
     解决：后台线程持续采样 DB230（200ms），仅在非空时更新 self.latched（提前锁存）；
     上升沿到来时，用【此前锁存的】DB230 上下文作为回调 ctx，而非当前实时去读。
@@ -37,9 +41,11 @@ PLC_SLOT = 2
 DB130_SIG = (130, 0, 1)      # DB130 字节0（含 DBX0.1 出车信号）
 DB230_A = (230, 1208, 30)    # DB230 字节1208..1237（车型/滑橇/PIN）
 DB230_B = (230, 1257, 1)     # DB230 字节1257（含 DBX1257.1 NO_Paint）
+DB890_SYN = (890, 225, 1)    # DB890 字节225（含 DBX225.2 / DBX225.3 车身同步信号）
 
 POLL_MS = 10     # 信号轮询间隔（毫秒）
 CTX_MS = 200     # DB230 上下文采样间隔（毫秒）
+SYNC_WINDOW_SEC = 8.0   # 出车信号后，等待两个同步信号(DB890.225.2/225.3)同时为 1 的最长窗口（秒）；超时则跳过该车
 
 
 def parse_context(buf_a, buf_b):
@@ -82,6 +88,9 @@ class PlcMonitor:
         self._lock = threading.Lock()
         self.latched = None          # 最近一次“非空”的 DB230 上下文
         self._last_car_key = None    # 已触发过的车标识(skid,pin,model)，用于新车去重触发
+        self._outcar_pending = False # 出车信号已收到、等待车身同步信号(DB890.225.2/3)期间为 True
+        self._outcar_ctx = None      # 等待期间锁存的车上下文（出车信号上升沿那一刻）
+        self._outcar_t = 0.0         # 出车信号上升沿时刻（perf_counter），用于窗口超时
         self._thread = None
         self.connected = False       # 健康态：供 UI/日志观测（断线重连期间为 False）
 
@@ -138,9 +147,20 @@ class PlcMonitor:
                 print(f"[PLC] 读信号失败: {e}")
                 if not self._reconnect():
                     break
+                self._outcar_pending = False   # 重连后丢弃尚未触发的等待
                 continue
 
             now = time.perf_counter()
+
+            # 车身同步信号：DB890.DBX225.2 与 DBX225.3 须同时为 1（雪橇到达相机视野位置）。
+            # 与出车信号同周期读取，确保上升沿后能在本轮询窗口内及时检测到。
+            # 读取失败→当次视为未同步（保守跳过），不触发重连（与信号读失败区分）。
+            sync_ok = False
+            try:
+                db890 = bytes(self.client.read_area(S7AreaDB, *DB890_SYN))
+                sync_ok = ((db890[0] >> 2) & 1) == 1 and ((db890[0] >> 3) & 1) == 1
+            except Exception as e:
+                print(f"[PLC] 读同步信号(DB890.DBX225.2/225.3)失败: {e}")
 
             # 持续采样 DB230：仅在非空时更新锁存（静默，不打印）
             if now - last_ctx_t >= ctx_s:
@@ -154,6 +174,11 @@ class PlcMonitor:
                     # 上下文采样失败不致命，继续轮询，下次再采
 
             # 触发策略（现场确认）：DB130.DBX0.1 出车信号上升沿(0→1)为权威触发源。
+            # 【新增同步条件】出车信号仅“预约”一次拍照；真正拍照须等车身同步信号
+            # (DB890.DBX225.2/225.3) 同时为 1（雪橇运行到相机视野位置）。这解决“车身
+            # 同步性不好”问题——只有车身到位才拍，而不是一出车信号就拍。
+            # 同步信号通常在出车信号后约 2s 才置 1（雪橇运行到下一传感器），故用窗口
+            # 等待（SYNC_WINDOW_SEC），而非要求上升沿那一刻就为 1（那样会全部漏拍）。
             # 上升沿到来时 PLC 已清零 DB230，故用【此前锁存】的 DB230 上下文，
             # 不在此刻去读实时 DB230（会读空）。用 _last_car_key 去重防抖动脉冲。
             if bit == 1 and prev == 0:
@@ -163,11 +188,29 @@ class PlcMonitor:
                     key = (lat["skid"], lat["pin"], lat["model"])
                     if key != self._last_car_key:
                         self._last_car_key = key
-                        snap = dict(lat)      # 提前锁存，先于被下一台车覆盖
-                        try:
-                            on_rising(snap)
-                        except Exception as e:
-                            print(f"[PLC] 回调异常: {e}")
+                        self._outcar_pending = True
+                        self._outcar_ctx = dict(lat)   # 提前锁存，先于被下一台车覆盖
+                        self._outcar_t = now
+                        print(f"[PLC] 出车信号上升沿，预约拍照（等待同步信号 DB890.225.2/3）"
+                              f" skid={lat['skid']} model={lat['model']!r}")
+
+            # 已预约：等待同步信号到位（或窗口超时放弃），再触发拍照回调。
+            if self._outcar_pending:
+                if sync_ok:
+                    self._outcar_pending = False
+                    snap = self._outcar_ctx
+                    self._outcar_ctx = None
+                    try:
+                        on_rising(snap)
+                    except Exception as e:
+                        print(f"[PLC] 回调异常: {e}")
+                elif now - self._outcar_t > SYNC_WINDOW_SEC:
+                    skid = self._outcar_ctx.get("skid") if self._outcar_ctx else "?"
+                    model = self._outcar_ctx.get("model") if self._outcar_ctx else "?"
+                    self._outcar_pending = False
+                    self._outcar_ctx = None
+                    print(f"[PLC] 出车信号后 {SYNC_WINDOW_SEC:.0f}s 内同步信号(DB890.225.2/3)"
+                          f"未满足，跳过拍照 skid={skid} model={model!r}")
 
             prev = bit
             time.sleep(poll_s)
