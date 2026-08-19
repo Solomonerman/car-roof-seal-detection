@@ -65,12 +65,16 @@ class StorageService:
 
     def save(self, model: str, det, images: list,
              skid=None, pin="", no_paint=False, captured=False,
-             event_time=None, cam_idx=0) -> InspectionRecord:
+             event_time=None, cam_idx=0, model_key=None) -> InspectionRecord:
         # 一台车一个自包含文件夹：data/inspection/<日期>/<车>/
         ev = event_time or datetime.datetime.now()
         date = ev.strftime("%Y-%m-%d")
         car_key = _car_key(pin, skid)
-        subdir = os.path.join(date, car_key)
+        # 车型代码后缀（如 9X / 8X）：仅追加到【文件夹名】，文件名保持原 car_key 不变。
+        # model_key 由自动回调(handle_car_signal)传入；不传则不加后缀，
+        # 兼容旧调用方(state_machine)与无车型信息的场景——行为完全不变。
+        car_dir_name = car_key + ("_" + _safe(model_key) if model_key else "")
+        subdir = os.path.join(date, car_dir_name)
         folder = os.path.join(self.store.local_dir, subdir)
         refs = []
         for i, p in enumerate(images, 1):

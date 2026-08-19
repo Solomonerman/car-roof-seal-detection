@@ -1183,7 +1183,8 @@ def handle_car_signal(ctx):
         from storage.service import get_service
         rec = get_service().save(model, det, paths,
                                  skid=skid, pin=pin, no_paint=no_paint,
-                                 captured=captured, event_time=ts_dt)
+                                 captured=captured, event_time=ts_dt,
+                                 model_key=key)
         db_ok = True
     except Exception as e:
         print(f"[自动] 落库失败: {e}")
