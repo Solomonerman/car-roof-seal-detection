@@ -156,9 +156,9 @@ AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 �
 # 拍摄前延迟（秒）：收到拍摄指令后，先等目标物移动到相机视野合适位置再开始连拍。
 # 自动(PLC触发)与手动(点击按钮)【分开定义、可在界面分别调整】，避免把"刚到位/刚点
 # 按钮"那一刻拍进去。request_capture 不再用单一全局，而由调用方显式传入对应延时。
-#   - 自动(AUTO)：默认 2.0s（出车信号+同步信号满足后，等车身到视野再拍）
+#   - 自动(AUTO)：默认 3.5s（出车信号+同步信号满足后，等车身到视野再拍）
 #   - 手动(MANUAL)：默认 5.0s（手动测试 / 自检之外的手动拍摄）
-AUTO_PRE_CAPTURE_DELAY = 2.0
+AUTO_PRE_CAPTURE_DELAY = 3.5
 MANUAL_PRE_CAPTURE_DELAY = 5.0
 
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
@@ -172,7 +172,7 @@ CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
 CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
 
 # ===================== 相机采集参数 =====================
-EXPOSURE_TIME_US = 3000      # 曝光时间（微秒），默认 3000（2000 偏暗，现场已上调）
+EXPOSURE_TIME_US = 4000      # 曝光时间（微秒），默认 4000（现场已上调）
 # 增益：设为 None = 沿用相机【当前值】、不修改。
 #   你在 pylon Viewer 里已设过增益（现场暗光、曝光锁 2000µs 的可用档），
 #   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
@@ -1415,7 +1415,7 @@ def index():
       <div style="font-size:14px;margin-bottom:8px;color:#9cf">相机参数（实时写入相机，预览立即生效）</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
         <label style="font-size:12px;color:#aaa">曝光(µs)<br>
-          <input id="exp" type="number" min="50" max="100000" step="50" value="3000"
+          <input id="exp" type="number" min="50" max="100000" step="50" value="4000"
                  style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
           <input id="delay" type="number" min="0" max="30" step="0.5" value="5"
@@ -1456,7 +1456,7 @@ def index():
       <div style="font-size:14px;margin-bottom:8px;color:#9cf">自动拍照延时（仅自动 PLC 触发 / 强制拍摄生效，手动模式不受影响）</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
         <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
-          <input id="autoDelay" type="number" min="0" max="30" step="0.5" value="2"
+          <input id="autoDelay" type="number" min="0" max="30" step="0.5" value="3.5"
                  style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <button onclick="applyAutoDelay()">应用参数</button>
         <span id="autoCamState" class="meta"></span>
