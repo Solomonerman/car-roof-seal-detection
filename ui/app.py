@@ -12,6 +12,7 @@
 import os
 import sys
 import glob
+import html as _html
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -93,6 +94,11 @@ def records():
     return {"count": _db.count(), "items": items}
 
 
+def _esc(s) -> str:
+    """HTML 转义，防止查询输入注入页面。"""
+    return _html.escape(str(s), quote=True)
+
+
 @app.get("/img")
 def img(path: str = Query(..., description="相对 ROOT 的安全路径")):
     """安全读取图片：仅允许访问 ROOT 内文件，防目录穿越。"""
@@ -105,12 +111,31 @@ def img(path: str = Query(..., description="相对 ROOT 的安全路径")):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    all_recs = _db.get_records(limit=50)
-    hidden = sum(1 for r in all_recs if not r.image_refs)
+def index(skid: str = Query("", description="滑橇号筛选"),
+          model: str = Query("", description="车型筛选"),
+          date: str = Query("", description="日期 YYYY-MM-DD"),
+          only_ng: bool = Query(False, description="仅显示NG")):
+    # 取较宽的历史用于查询（无筛选时再截断为最近 50 条）
+    all_recs = _db.get_records(limit=500)
+    q = skid.strip()
+    m = model.strip()
+    d = date.strip()
+    if q:
+        all_recs = [r for r in all_recs if q in str(r.skid)]
+    if m:
+        all_recs = [r for r in all_recs if m in (r.car_model or "")]
+    if d:
+        all_recs = [r for r in all_recs if (r.timestamp or "").startswith(d)]
+    if only_ng:
+        all_recs = [r for r in all_recs if not r.ok]
     recs = [r for r in all_recs if r.image_refs]   # 仅显示实际拍照(有照片)的车，过滤免检跳过等无检测记录
     total = _db.count()
     ng = sum(1 for r in recs if not r.ok)
+    # 默认（无筛选）仅显示最近 50 条；有筛选时显示全部匹配（最多 200）
+    if not (q or m or d or only_ng):
+        recs = recs[:50]
+    else:
+        recs = recs[:200]
 
     cards = []
     for r in recs:
@@ -158,6 +183,11 @@ def index():
 
     cards_html = "\n".join(cards) if cards else "<p class='muted'>暂无记录</p>"
 
+    skid_esc = _esc(skid)
+    model_esc = _esc(model)
+    date_esc = _esc(date)
+    ng_checked = "checked" if only_ng else ""
+
     return f"""
     <html><head>
       <meta charset="utf-8">
@@ -167,6 +197,14 @@ def index():
         body {{ font-family: Arial, "Microsoft YaHei", sans-serif; margin: 16px; background:#f5f6f8; }}
         h2 {{ margin: 4px 0 12px; }}
         .sum {{ color:#555; margin-bottom: 12px; }}
+        .qpanel {{ background:#fff; border:1px solid #cdd; border-radius:8px; padding:10px 12px; margin-bottom:12px; display:flex; flex-wrap:wrap; align-items:center; gap:10px; }}
+        .qpanel span {{ font-size:13px; color:#333; }}
+        .qpanel input[type=text], .qpanel input[type=date] {{ padding:3px 6px; border:1px solid #bbb; border-radius:4px; }}
+        .qpanel .chk {{ display:inline-flex; align-items:center; gap:4px; }}
+        .qpanel button {{ padding:4px 14px; border:0; border-radius:4px; background:#2e7fd0; color:#fff; cursor:pointer; }}
+        .qpanel button:hover {{ background:#2569ad; }}
+        .qpanel .reset {{ margin-left:4px; color:#666; text-decoration:none; font-size:13px; }}
+        .qpanel .reset:hover {{ color:#d23b3b; }}
         .card {{ background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px 14px; margin-bottom:14px; box-shadow:0 1px 3px rgba(0,0,0,.05); }}
         .chead {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; border-bottom:1px solid #eee; padding-bottom:8px; margin-bottom:8px; }}
         .ts {{ font-weight:bold; }}
@@ -189,8 +227,16 @@ def index():
     </head>
     <body>
       <h2>车顶胶条检测 - 实时监控</h2>
+      <form method="get" class="qpanel">
+        <span>滑橇号 <input type="text" name="skid" value="{skid_esc}" size="8" placeholder="如 3699"></span>
+        <span>车型 <input type="text" name="model" value="{model_esc}" size="8" placeholder="如 9X"></span>
+        <span>日期 <input type="date" name="date" value="{date_esc}"></span>
+        <span class="chk"><label><input type="checkbox" name="only_ng" value="1" {ng_checked}> 仅 NG</label></span>
+        <button type="submit">查询</button>
+        <a class="reset" href="/">重置</a>
+      </form>
       <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），原始照片与检测叠加图同尺寸放大展示供工人目视检查。</div>
-      <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条（已隐藏无检测 {hidden} 条）｜ NG：<b style="color:#d23b3b">{ng}</b></div>
+      <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}
     </body></html>
     """
