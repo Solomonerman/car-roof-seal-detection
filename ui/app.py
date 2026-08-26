@@ -126,19 +126,10 @@ def index():
         else:
             defects_html = "<div class='muted'>无缺陷记录</div>"
 
-        # 仅展示胶条位置的第 5~10 张：原始照片切片 + 检测叠加图（detector 只对这些帧生成）
-        det_refs = (r.image_refs or [])[DET_FRAME_FROM - 1: DET_FRAME_TO]
-
-        # 原始照片缩略图（仅第5~10张）
-        raw_imgs = "".join(
-            f"<img class='thumb' src='{_img_url(ref)}' title='{ref}'>"
-            for ref in det_refs
-        ) or "<div class='muted'>无照片</div>"
-
-        # 检测叠加图（可视化核心，仅第5~10张）
+        # 检测叠加图（可视化核心，仅第5~10张；不显示原始照片）
         ov = _overlay_urls(r.proc_dir)
         ov_imgs = "".join(
-            f"<img class='thumb ov' src='/img?path={p}' title='检测叠加图'>"
+            f"<div class='det-frame'><img class='thumb ov' src='/img?path={p}' title='检测叠加图（第{DET_FRAME_FROM}~{DET_FRAME_TO}张）'></div>"
             for p in ov
         ) or "<div class='muted'>无叠加图（8X/未知车型或未生成）</div>"
 
@@ -152,7 +143,6 @@ def index():
           </div>
           <div class="sec hi"><b>检测结果（第{DET_FRAME_FROM}~{DET_FRAME_TO}张 · 胶条位置）：</b><div class="row">{ov_imgs}</div></div>
           <div class="sec"><b>缺陷判定：</b>{defects_html}</div>
-          <div class="sec"><b>原始照片（第{DET_FRAME_FROM}~{DET_FRAME_TO}张）：</b><div class="row">{raw_imgs}</div></div>
         </div>
         """)
 
@@ -178,9 +168,10 @@ def index():
         .sec {{ margin:6px 0; }}
         .sec.hi {{ background:#fff7e6; border:1px solid #e0a83a; border-radius:6px; padding:8px 10px; }}
         .banner {{ background:#eaf3ff; border:1px solid #9cc4f0; color:#23527c; border-radius:6px; padding:8px 12px; margin-bottom:12px; font-size:13px; }}
-        .row {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }}
+        .row {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:8px; }}
+        .det-frame {{ flex:1 1 420px; min-width:360px; max-width:100%; }}
         .thumb {{ width:150px; height:auto; border:1px solid #ccc; border-radius:4px; background:#000; }}
-        .thumb.ov {{ border-color:#e0902a; }}
+        .thumb.ov {{ width:100%; height:auto; border:2px solid #e0902a; border-radius:6px; background:#000; box-shadow:0 2px 6px rgba(0,0,0,.2); }}
         .defects {{ margin:4px 0; padding-left:18px; }}
         .defects li.ok {{ color:#2e9e4f; }}
         .defects li.ng {{ color:#d23b3b; font-weight:bold; }}
@@ -189,7 +180,7 @@ def index():
     </head>
     <body>
       <h2>车顶胶条检测 - 实时监控</h2>
-      <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），其余照片非胶条位置、不做检测。</div>
+      <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），不显示原始照片，只展示带检测标注的叠加图供工人目视检查。</div>
       <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条（已隐藏无检测 {hidden} 条）｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}
     </body></html>
