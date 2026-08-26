@@ -167,7 +167,7 @@ MANUAL_PRE_CAPTURE_DELAY = 5.0
 # 传入 _run_detection 前完成；UI(5000/8000)按此范围切片展示原始照片。
 # 改这里即可整体调整“哪些张参与检测”，不影响拍摄/张数。
 DETECT_FRAME_FROM = 5      # 参与检测的首张（含）
-DETECT_FRAME_TO = 10       # 参与检测的末张（含）
+DETECT_FRAME_TO = 9        # 参与检测的末张（含）
 
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
 # 会令固件静默停出图，无异常、GrabSucceeded 恒为 False），即重启取流，不退出进程。
