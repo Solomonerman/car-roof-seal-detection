@@ -161,6 +161,14 @@ AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 �
 AUTO_PRE_CAPTURE_DELAY = 3.5
 MANUAL_PRE_CAPTURE_DELAY = 5.0
 
+# —— 检测帧范围（1-indexed，仅胶条所在位置）——
+# 自动连拍共 AUTO_TOTAL 张，其中第 1~4 张与第 11~13 张为车身/背景，非胶条位置，
+# 不纳入检测；仅第 5~10 张为胶条区域，跑真实检测。检测切片在 handle_car_signal
+# 传入 _run_detection 前完成；UI(5000/8000)按此范围切片展示原始照片。
+# 改这里即可整体调整“哪些张参与检测”，不影响拍摄/张数。
+DETECT_FRAME_FROM = 5      # 参与检测的首张（含）
+DETECT_FRAME_TO = 10       # 参与检测的末张（含）
+
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
 # 会令固件静默停出图，无异常、GrabSucceeded 恒为 False），即重启取流，不退出进程。
 SELFHEAL_SEC = 5.0
@@ -1218,8 +1226,12 @@ def handle_car_signal(ctx):
     # —— 检测接入（核心打通）——
     # 拍照后的图跑真实检测，替换原占位结果；检测只读图、不改任何相机/拍摄逻辑。
     # 检测过程数据（mask/叠加图）落地到 data/process_data/<车>/，供可视化读取。
+    # 仅对胶条所在的第 DETECT_FRAME_FROM~DETECT_FRAME_TO 张做检测，其余照片
+    # 非胶条位置不做检测（切片后传给检测器，叠加图/缺陷也只覆盖这些帧）。
     paths = [os.path.join(SAVE_DIR, f) for f in files]
-    det, proc_dir = _run_detection(model, key, paths, ts_dt)
+    detect_paths = paths[DETECT_FRAME_FROM - 1: DETECT_FRAME_TO] \
+        if len(paths) >= DETECT_FRAME_FROM else []
+    det, proc_dir = _run_detection(model, key, detect_paths, ts_dt)
 
     # 落库（含 skid/pin/no_paint/captured）；StorageService 内部按 日期/PIN 分层、
     # 去重移动、轮转，并返回该车文件夹路径
@@ -1244,15 +1256,21 @@ def handle_car_signal(ctx):
     # 兜底清理调试目录（自动图已移入 data/inspection，这里只清手动调试残留）
     _prune_scratch()
 
-    # 最近车辆表（网页展示，最多保留 10 台）
+    # 最近车辆表（网页展示，最多保留 10 台）；携带真实检测结果（ok/defects）供 5000 页面展示
     with hub._recent_lock:
         hub.recent_cars.insert(0, {
             "ts": ts, "model": model, "skid": skid, "pin": pin,
             "no_paint": bool(no_paint), "captured": captured, "key": key,
+            "ok": (det.ok if det is not None else None),
+            "defects": ([d.__dict__ for d in det.defects]
+                        if det is not None else []),
         })
         hub.recent_cars = hub.recent_cars[:10]
     hub.last_auto = {"ts": ts, "skid": skid, "model": model,
-                     "ok": True, "captured": captured}
+                     "ok": (det.ok if det is not None else None),
+                     "captured": captured,
+                     "defects": ([d.__dict__ for d in det.defects]
+                                 if det is not None else [])}
 
     # 打印（action 必须区分三种情况，避免把"相机0帧"误显示为"车型未接入"）
     if captured:
@@ -1468,7 +1486,7 @@ def index():
     </div>
     <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
     <table class="ctab"><thead><tr>
-      <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测(未接入)</th>
+      <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测</th>
     </tr></thead><tbody id="carbody">
       <tr><td colspan="7" class="meta">等待出车信号…</td></tr>
     </tbody></table>
@@ -1610,7 +1628,13 @@ function refreshStatus(){{
       modeinfo.textContent='自动监控：PLC触发中';
       let rows=(s.recent_cars||[]).map(c=>{{
         let ph=c.captured?'<span class="yes">是</span>':'<span class="no">否</span>';
-        let dt='<span class="no">未接入</span>';
+        let dt;
+        if(!c.captured){{ dt='<span class="muted">未拍照</span>'; }}
+        else if(c.ok){{ dt='<span class="yes">OK</span>'; }}
+        else {{
+          let ng=(c.defects||[]).filter(d=>['missing','break','overspray','width'].includes(d.label)).length;
+          dt=`<span class="no">NG(${{ng}})</span>`;
+        }}
         return `<tr><td>${{c.ts}}</td><td>${{c.model}}</td><td>${{c.skid}}</td>`
           +`<td>${{c.pin}}</td><td>${{c.no_paint?'<span class="no">是</span>':'<span class="yes">否</span>'}}</td>`
           +`<td>${{ph}}</td><td>${{dt}}</td></tr>`;

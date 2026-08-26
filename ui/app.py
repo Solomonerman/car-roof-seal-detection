@@ -24,6 +24,11 @@ INSPECTION_LOCAL = os.path.join("data", "inspection")   # 对应 ObjectStore.loc
 app = FastAPI(title="车顶胶条检测 - 监控")
 _db = Database()
 
+# 检测帧范围（1-indexed，与 capture/web_capture.py 的 DETECT_FRAME_FROM/TO 保持一致）：
+# 连拍 13 张中仅第 5~10 张为胶条位置、参与检测；UI 仅展示这些帧的原始照片与叠加图。
+DET_FRAME_FROM = 5
+DET_FRAME_TO = 10
+
 
 # ---- 缺陷标签 → 中文 + 明细文本 ----
 _LABEL_CN = {
@@ -121,13 +126,16 @@ def index():
         else:
             defects_html = "<div class='muted'>无缺陷记录</div>"
 
-        # 原始照片缩略图
+        # 仅展示胶条位置的第 5~10 张：原始照片切片 + 检测叠加图（detector 只对这些帧生成）
+        det_refs = (r.image_refs or [])[DET_FRAME_FROM - 1: DET_FRAME_TO]
+
+        # 原始照片缩略图（仅第5~10张）
         raw_imgs = "".join(
             f"<img class='thumb' src='{_img_url(ref)}' title='{ref}'>"
-            for ref in (r.image_refs or [])
+            for ref in det_refs
         ) or "<div class='muted'>无照片</div>"
 
-        # 检测叠加图（可视化核心）
+        # 检测叠加图（可视化核心，仅第5~10张）
         ov = _overlay_urls(r.proc_dir)
         ov_imgs = "".join(
             f"<img class='thumb ov' src='/img?path={p}' title='检测叠加图'>"
@@ -142,9 +150,9 @@ def index():
             {badge}
             <span class="meta">滑橇={r.skid} PIN={r.pin} NO_Paint={'是' if r.no_paint else '否'}</span>
           </div>
+          <div class="sec hi"><b>检测结果（第{DET_FRAME_FROM}~{DET_FRAME_TO}张 · 胶条位置）：</b><div class="row">{ov_imgs}</div></div>
           <div class="sec"><b>缺陷判定：</b>{defects_html}</div>
-          <div class="sec"><b>原始照片（{len(r.image_refs or [])} 张）：</b><div class="row">{raw_imgs}</div></div>
-          <div class="sec"><b>检测叠加图：</b><div class="row">{ov_imgs}</div></div>
+          <div class="sec"><b>原始照片（第{DET_FRAME_FROM}~{DET_FRAME_TO}张）：</b><div class="row">{raw_imgs}</div></div>
         </div>
         """)
 
@@ -168,6 +176,8 @@ def index():
         .badge.ok {{ background:#2e9e4f; }}
         .badge.ng {{ background:#d23b3b; }}
         .sec {{ margin:6px 0; }}
+        .sec.hi {{ background:#fff7e6; border:1px solid #e0a83a; border-radius:6px; padding:8px 10px; }}
+        .banner {{ background:#eaf3ff; border:1px solid #9cc4f0; color:#23527c; border-radius:6px; padding:8px 12px; margin-bottom:12px; font-size:13px; }}
         .row {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }}
         .thumb {{ width:150px; height:auto; border:1px solid #ccc; border-radius:4px; background:#000; }}
         .thumb.ov {{ border-color:#e0902a; }}
@@ -179,6 +189,7 @@ def index():
     </head>
     <body>
       <h2>车顶胶条检测 - 实时监控</h2>
+      <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），其余照片非胶条位置、不做检测。</div>
       <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条（已隐藏无检测 {hidden} 条）｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}
     </body></html>
