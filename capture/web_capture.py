@@ -1117,6 +1117,47 @@ class CameraHub:
 
 
 # ===================== PLC 自动触发回调（仅 --plc-auto）=====================
+def _run_detection(model, key, image_paths, ts_dt):
+    """拍照后跑真实检测，返回 (DetectionResult, proc_dir_rel)。
+
+    设计约束：只“读图 + 算”，绝不碰相机/拍摄任何逻辑。
+      - key 经 router 命中检测器（当前 9X）→ SealDetector 跑真实检测；
+        未命中（8X/未知）→ 占位“算法未接入”，与之前行为一致（仅拍照存档）。
+      - proc_dir_rel 为相对 ROOT 的目录（data/process_data/<时间>_<key>），
+        内含 detector 生成的 mask/叠加图，供 ui/app.py 可视化读取。
+    检测异常不致命：捕获后回退占位，保证拍照/落库链路不中断。
+    """
+    from detection.router import get_detector
+    from common.interfaces import DetectionResult, Defect
+
+    if not image_paths:
+        return DetectionResult(car_model=model, ok=True,
+                                defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                                                meta={"reason": "无照片"})],
+                                message="无照片·未检测"), ""
+
+    detector = get_detector(key)
+    if detector is None:
+        return DetectionResult(car_model=model, ok=True,
+                                defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                                                meta={"reason": "算法未接入"})],
+                                confidence=0.0, message="拍照存档·算法未接入"), ""
+
+    proc_dir_rel = os.path.join("data", "process_data",
+                                 f"{ts_dt.strftime('%Y%m%d_%H%M%S')}_{key}")
+    proc_dir_abs = os.path.join(ROOT, proc_dir_rel)
+    try:
+        det = detector.detect(car_model=model, images=image_paths,
+                               process_dir=proc_dir_abs)
+        return det, proc_dir_rel
+    except Exception as e:
+        print(f"[检测] 运行异常: {e}")
+        return DetectionResult(car_model=model, ok=True,
+                                defects=[Defect(0, 0, 0, 0, "pending", 0.0,
+                                                meta={"reason": f"检测异常:{e}"})],
+                                message=f"检测异常:{e}"), proc_dir_rel
+
+
 def handle_car_signal(ctx):
     """出车信号上升沿回调：记录全部车 → 仅(9X/8X 且 NO_Paint=0)拍照 → 落库+写追溯。
 
@@ -1126,7 +1167,8 @@ def handle_car_signal(ctx):
       否则不拍照（免检车 / 未接入车型）。
     所有车型用同一出车信号触发，避免拍照时机不一致导致照片错位。
 
-    本迭代【不跑检测】：拍照车用占位结果记录，检测等照片确认后再接。
+    本迭代已接入检测：拍照车跑真实检测（9X 命中 SealDetector；8X/未知占位），
+    结果 + 过程叠加图落库，供 ui/app.py 可视化。全程只读图，不碰相机/拍摄。
     全程只读 PLC；本函数不写任何 PLC 地址。
     ctx 为 plc_monitor.parse_context 的 dict（提前锁存的 DB230 上下文）。
     """
@@ -1173,19 +1215,14 @@ def handle_car_signal(ctx):
             capture_err = cap.get("primary_result", cap)
             print(f"[自动] 拍照失败（相机未出图/连接异常）: {capture_err}")
 
-    # 当前所有车型仅拍照存档，不跑检测——等算法就绪后再接入。
-    from common.interfaces import DetectionResult, Defect
-    det = DetectionResult(
-        car_model=model, ok=True,
-        defects=[Defect(0, 0, 0, 0, "pending", 0.0,
-                        meta={"reason": "拍照存档·算法未接入"})],
-        confidence=0.0,
-        message="拍照存档·算法未接入",
-    )
+    # —— 检测接入（核心打通）——
+    # 拍照后的图跑真实检测，替换原占位结果；检测只读图、不改任何相机/拍摄逻辑。
+    # 检测过程数据（mask/叠加图）落地到 data/process_data/<车>/，供可视化读取。
+    paths = [os.path.join(SAVE_DIR, f) for f in files]
+    det, proc_dir = _run_detection(model, key, paths, ts_dt)
 
     # 落库（含 skid/pin/no_paint/captured）；StorageService 内部按 日期/PIN 分层、
     # 去重移动、轮转，并返回该车文件夹路径
-    paths = [os.path.join(SAVE_DIR, f) for f in files]
     db_ok = False
     rec = None
     try:
@@ -1193,7 +1230,7 @@ def handle_car_signal(ctx):
         rec = get_service().save(model, det, paths,
                                  skid=skid, pin=pin, no_paint=no_paint,
                                  captured=captured, event_time=ts_dt,
-                                 model_key=key)
+                                 model_key=key, proc_dir=proc_dir)
         db_ok = True
     except Exception as e:
         print(f"[自动] 落库失败: {e}")

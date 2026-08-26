@@ -18,7 +18,7 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "data", "inspection.db")
 class Database:
     # records 表列顺序（用于 SELECT * 结果按名取值，兼容旧库缺列）
     _COLUMNS = ["id", "car_model", "ok", "image_refs", "defects", "timestamp",
-                "skid", "pin", "no_paint", "captured"]
+                "skid", "pin", "no_paint", "captured", "proc_dir"]
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
@@ -38,7 +38,8 @@ class Database:
             """)
             # 向后兼容：旧库可能没有追溯字段，按需加列（重复列忽略）
             for col, ctype in (("skid", "INTEGER"), ("pin", "TEXT"),
-                               ("no_paint", "INTEGER"), ("captured", "INTEGER")):
+                               ("no_paint", "INTEGER"), ("captured", "INTEGER"),
+                               ("proc_dir", "TEXT")):
                 try:
                     conn.execute(f"ALTER TABLE records ADD COLUMN {col} {ctype}")
                 except Exception:
@@ -49,8 +50,8 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO records "
-                "(car_model, ok, image_refs, defects, timestamp, skid, pin, no_paint, captured) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(car_model, ok, image_refs, defects, timestamp, skid, pin, no_paint, captured, proc_dir) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (rec.car_model,
                  int(rec.ok),
                  json.dumps(rec.image_refs),
@@ -59,7 +60,8 @@ class Database:
                  rec.skid,
                  rec.pin,
                  int(rec.no_paint),
-                 int(rec.captured))
+                 int(rec.captured),
+                 rec.proc_dir or "")
             )
             conn.commit()
         # 不在此 print：逐条打印既与 sidecar/UI 重复，又会被日志系统回灌成上下文噪声。
@@ -93,6 +95,7 @@ class Database:
                 pin=col("pin", ""),
                 no_paint=bool(col("no_paint", 0)),
                 captured=bool(col("captured", 0)),
+                proc_dir=col("proc_dir", ""),
             ))
         return out
 

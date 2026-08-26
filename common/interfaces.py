@@ -76,3 +76,4 @@ class InspectionRecord:
     no_paint: bool = False                # NO_Paint=1 表示免检（不拍照）
     captured: bool = False                # 是否拍照纳入检测流程（UI"是否检测"列依据）
     folder: str = ""                      # 该车照片所在目录（data/inspection/<日期>/<车>/），便于按文件夹检索
+    proc_dir: str = ""                    # 检测过程数据目录（相对 ROOT，含 mask/叠加图），供可视化读取；空=无

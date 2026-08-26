@@ -65,7 +65,8 @@ class StorageService:
 
     def save(self, model: str, det, images: list,
              skid=None, pin="", no_paint=False, captured=False,
-             event_time=None, cam_idx=0, model_key=None) -> InspectionRecord:
+             event_time=None, cam_idx=0, model_key=None,
+             proc_dir="") -> InspectionRecord:
         # 一台车一个自包含文件夹：data/inspection/<日期>/<车>/
         ev = event_time or datetime.datetime.now()
         date = ev.strftime("%Y-%m-%d")
@@ -95,6 +96,7 @@ class StorageService:
             no_paint=no_paint,
             captured=captured,
             folder=folder,
+            proc_dir=proc_dir or "",
         )
         self.db.save_record(rec)
         self._maybe_prune()
