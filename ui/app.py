@@ -101,7 +101,9 @@ def img(path: str = Query(..., description="相对 ROOT 的安全路径")):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    recs = _db.get_records(limit=50)
+    all_recs = _db.get_records(limit=50)
+    hidden = sum(1 for r in all_recs if not r.image_refs)
+    recs = [r for r in all_recs if r.image_refs]   # 仅显示实际拍照(有照片)的车，过滤免检跳过等无检测记录
     total = _db.count()
     ng = sum(1 for r in recs if not r.ok)
 
@@ -177,7 +179,7 @@ def index():
     </head>
     <body>
       <h2>车顶胶条检测 - 实时监控</h2>
-      <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示最近 {len(recs)} 条 ｜ NG：<b style="color:#d23b3b">{ng}</b></div>
+      <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条（已隐藏无检测 {hidden} 条）｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}
     </body></html>
     """
