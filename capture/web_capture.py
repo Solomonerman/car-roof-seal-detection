@@ -180,7 +180,7 @@ CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
 CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
 
 # ===================== 相机采集参数 =====================
-EXPOSURE_TIME_US = 4000      # 曝光时间（微秒），默认 4000（现场已上调）
+EXPOSURE_TIME_US = 2000      # 曝光时间（微秒），默认 2000（光源更换后现场设定）
 # 增益：设为 None = 沿用相机【当前值】、不修改。
 #   你在 pylon Viewer 里已设过增益（现场暗光、曝光锁 2000µs 的可用档），
 #   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
@@ -1433,7 +1433,7 @@ def index():
       <div style="font-size:14px;margin-bottom:8px;color:#9cf">相机参数（实时写入相机，预览立即生效）</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
         <label style="font-size:12px;color:#aaa">曝光(µs)<br>
-          <input id="exp" type="number" min="50" max="100000" step="50" value="4000"
+          <input id="exp" type="number" min="50" max="100000" step="50" value="2000"
                  style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
           <input id="delay" type="number" min="0" max="30" step="0.5" value="5"
