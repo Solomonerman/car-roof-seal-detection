@@ -161,10 +161,6 @@ AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 �
 AUTO_PRE_CAPTURE_DELAY = 3.5
 MANUAL_PRE_CAPTURE_DELAY = 5.0
 
-# 自动模式曝光（µs）：与手动模式 EXPOSURE_TIME_US 分开定义，默认 2500（更换光源后现场标定）。
-# 仅自动模式(PLC 触发/强制拍摄)使用；手动模式仍用 EXPOSURE_TIME_US(4000)，互不影响。
-AUTO_EXPOSURE_TIME_US = 2500
-
 # —— 检测帧范围（1-indexed，仅胶条所在位置）——
 # 自动连拍共 AUTO_TOTAL 张，其中第 1~4 张与第 11~13 张为车身/背景，非胶条位置，
 # 不纳入检测；仅第 5~10 张为胶条区域，跑真实检测。检测切片在 handle_car_signal
@@ -328,7 +324,6 @@ class CameraStreamer:
         #   故自愈重连后用本值把用户设定重新下发，避免手动曝光被静默清零）
         self._exposure_node = "ExposureTime"   # 启动时确认的实际生效节点名(ExposureTime/ExposureTimeAbs)
         self._gain_db = GAIN_DB
-        self.plc_auto = False     # 由 CameraHub.connect_all 传入，供 _configure 选自动/手动默认曝光
 
         self._latest = None
         self._latest_ts = 0.0        # _latest 最后刷新时刻(perf_counter)
@@ -445,11 +440,9 @@ class CameraStreamer:
                 n = nodemap.GetNode(name)
                 if n is None:
                     continue
-                exp_default = AUTO_EXPOSURE_TIME_US if self.plc_auto else EXPOSURE_TIME_US
-                n.SetValue(exp_default)
-                conf.append(f"曝光={exp_default}µs ({name})")
+                n.SetValue(EXPOSURE_TIME_US)
+                conf.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
                 self._exposure_node = name   # 记录实际生效的曝光节点，set_exposure 复用同一节点
-                self._exposure_us = exp_default   # 与连接写入一致，状态显示不串值
                 ok = True
                 break
             except Exception as e:
@@ -1066,7 +1059,6 @@ class CameraHub:
             raise RuntimeError("未配置相机 IP（CAMERA_IPS 为空）")
         self.streamers = [CameraStreamer(ip) for ip in self.ips]
         for s in self.streamers:
-            s.plc_auto = self.plc_auto   # 传入模式标志，供 _configure 选默认曝光
             s.connect()
         self.primary_ip = self.ips[0]
 
@@ -1492,19 +1484,6 @@ def index():
         三者满足后等本延时再连拍；本值仅作用自动模式，手动延时在“手动测试”面板单独设置（默认 5s）。
       </div>
     </div>
-    <div style="border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:12px;background:#161616">
-      <div style="font-size:14px;margin-bottom:8px;color:#9cf">自动曝光(µs)（仅自动模式生效，手动模式不受影响）</div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
-        <label style="font-size:12px;color:#aaa">曝光(µs)<br>
-          <input id="autoExp" type="number" min="50" max="100000" step="50" value="2500"
-                 style="width:110px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
-        <button onclick="applyAutoExposure()">应用参数</button>
-        <span id="autoExpState" class="meta"></span>
-      </div>
-      <div style="font-size:12px;color:#789;margin-top:8px">
-        说明：自动模式曝光默认 2500µs（更换光源后现场标定）；仅作用于自动模式，手动曝光在“手动测试”面板单独设置（默认 4000µs）。调整后立即写入相机并实时预览。
-      </div>
-    </div>
     <h3 style="font-size:14px;margin:18px 0 6px">最近车辆（PLC 触发）</h3>
     <table class="ctab"><thead><tr>
       <th>时间</th><th>车型</th><th>滑橇</th><th>PIN</th><th>NO_Paint</th><th>拍照</th><th>检测</th>
@@ -1582,26 +1561,6 @@ function applyAutoDelay(){{
       }}
       autoCamState.textContent=m||'已应用';
     }}).catch(e=>{{autoCamState.textContent='参数应用出错:'+e;}});
-}}
-
-function applyAutoExposure(){{
-  const e=parseFloat(document.getElementById('autoExp').value);
-  const body={{auto_exposure:isNaN(e)?null:e}};
-  autoExpState.textContent='应用中…';
-  fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
-    .then(r=>r.json()).then(res=>{{
-      let m='';
-      if(res.exposure){{            // 复用与手动相同的返回结构
-        const e=res.exposure;
-        if(e.ok){{
-          m+='曝光='+e.exposure_us+'µs ';
-          if(e.auto!==undefined) m+='[Auto='+e.auto+'] ';
-          if(e.readbacks){{ m+='[节点读回 '; for(const k in e.readbacks) m+=k+'='+e.readbacks[k]+' '; m+='] '; }}
-        }} else {{ m+='曝光失败:'+(e.error||'')+' '; }}
-      }}
-      if(res.auto_exposure!==undefined && res.auto_exposure!==null){{ document.getElementById('autoExp').value=res.auto_exposure; }}
-      autoExpState.textContent=m||'已应用';
-    }}).catch(e=>{{autoExpState.textContent='参数应用出错:'+e;}});
 }}
 
 function manualCapture(){{
@@ -1760,13 +1719,6 @@ def api_camera():
         global AUTO_PRE_CAPTURE_DELAY
         AUTO_PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["auto_delay"])))
         resp["auto_delay"] = round(AUTO_PRE_CAPTURE_DELAY, 2)
-    # 自动曝光（仅自动模式生效；实时写相机，不影响手动模式 EXPOSURE_TIME_US）
-    if data.get("auto_exposure") is not None:
-        global AUTO_EXPOSURE_TIME_US
-        AUTO_EXPOSURE_TIME_US = max(50, min(100000, int(round(float(data["auto_exposure"])))))
-        if hub.streamers:
-            resp["exposure"] = hub.streamers[0].set_exposure(AUTO_EXPOSURE_TIME_US)
-        resp["auto_exposure"] = AUTO_EXPOSURE_TIME_US
     if set(resp.keys()) <= {"ok"}:
         return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay）"})
     return jsonify(resp)
