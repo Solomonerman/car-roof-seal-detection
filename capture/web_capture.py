@@ -1479,6 +1479,13 @@ def index():
         <button onclick="applyAutoDelay()">应用参数</button>
         <span id="autoCamState" class="meta"></span>
       </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+        <label style="font-size:12px;color:#aaa">连拍帧率(张/秒)<br>
+          <input id="autoFps" type="number" min="0.5" max="6" step="0.25" value="2.75"
+                 style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <button onclick="applyAutoFps()">应用帧率</button>
+        <span id="autoFpsState" class="meta"></span>
+      </div>
       <div style="font-size:12px;color:#789;margin-top:8px">
         说明：自动触发条件 = 出车信号(DB130.DBX0.1)上升沿 + 车身同步信号(DB890.DBX225.2 与 225.3 同时为 1)。
         三者满足后等本延时再连拍；本值仅作用自动模式，手动延时在“手动测试”面板单独设置（默认 5s）。
@@ -1561,6 +1568,23 @@ function applyAutoDelay(){{
       }}
       autoCamState.textContent=m||'已应用';
     }}).catch(e=>{{autoCamState.textContent='参数应用出错:'+e;}});
+}}
+
+function applyAutoFps(){{
+  const f=parseFloat(document.getElementById('autoFps').value);
+  const body={{auto_fps:isNaN(f)?null:f}};
+  autoFpsState.textContent='应用中…';
+  fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(r=>r.json()).then(res=>{{
+      let m='';
+      if(res.auto_fps!==undefined && res.auto_fps!==null){{
+        document.getElementById('autoFps').value=res.auto_fps;
+        m+='自动帧率='+res.auto_fps+'fps ';
+      }} else if(res.error){{
+        m=res.error;
+      }}
+      autoFpsState.textContent=m||'已应用';
+    }}).catch(e=>{{autoFpsState.textContent='参数应用出错:'+e;}});
 }}
 
 function manualCapture(){{
@@ -1694,7 +1718,8 @@ def api_camera():
     - 帧率：仅改手动默认全局 FPS，不动 AUTO_FPS；同步重算 TOTAL 供自检/状态显示。
     - 手动拍照延时(delay)：改 MANUAL_PRE_CAPTURE_DELAY（仅手动测试/自检；不影响自动模式）。
     - 自动拍照延时(auto_delay)：改 AUTO_PRE_CAPTURE_DELAY（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
-    exposure_us / fps / delay / auto_delay 均可独立发送，按需只传需要改的项。
+    - 自动连拍帧率(auto_fps)：改 AUTO_FPS 并同步重算 AUTO_TOTAL（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
+    exposure_us / fps / delay / auto_delay / auto_fps 均可独立发送，按需只传需要改的项。
     """
     if not hub.running or not hub.streamers:
         return jsonify({"ok": False, "error": "相机未运行"})
@@ -1719,8 +1744,15 @@ def api_camera():
         global AUTO_PRE_CAPTURE_DELAY
         AUTO_PRE_CAPTURE_DELAY = max(0.0, min(30.0, float(data["auto_delay"])))
         resp["auto_delay"] = round(AUTO_PRE_CAPTURE_DELAY, 2)
+    # 自动连拍帧率（仅自动 PLC 触发/强制拍摄；不影响手动模式；同步重算总张数）
+    if data.get("auto_fps") is not None:
+        global AUTO_FPS, AUTO_TOTAL
+        AUTO_FPS = max(0.5, min(6.0, float(data["auto_fps"])))
+        AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)
+        resp["auto_fps"] = round(AUTO_FPS, 2)
+        resp["auto_total"] = AUTO_TOTAL
     if set(resp.keys()) <= {"ok"}:
-        return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay）"})
+        return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay/auto_fps）"})
     return jsonify(resp)
 
 
