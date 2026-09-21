@@ -149,16 +149,16 @@ DURATION_SEC = 7       # 连拍持续时长（秒）
 TOTAL = int(FPS * DURATION_SEC)   # 总张数 = 3×7 = 21 张
 
 # 自动监控连拍参数（PLC 触发 / 强制拍摄）：与手动测试模式解耦，单独配置。
-AUTO_FPS = 2.75                # 自动连拍帧率（张/秒）= 2秒5张
-AUTO_DURATION_SEC = 5         # 自动连拍持续时长（秒）
-AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 2.5×5≈12.5 → 取整 12 张
+AUTO_FPS = 3                   # 自动连拍帧率（张/秒）
+AUTO_DURATION_SEC = 4          # 自动连拍持续时长（秒）
+AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)   # 3×4 = 12 张
 
 # 拍摄前延迟（秒）：收到拍摄指令后，先等目标物移动到相机视野合适位置再开始连拍。
 # 自动(PLC触发)与手动(点击按钮)【分开定义、可在界面分别调整】，避免把"刚到位/刚点
 # 按钮"那一刻拍进去。request_capture 不再用单一全局，而由调用方显式传入对应延时。
-#   - 自动(AUTO)：默认 3.5s（出车信号+同步信号满足后，等车身到视野再拍）
+#   - 自动(AUTO)：默认 4s（出车信号+同步信号满足后，等车身到视野再拍）
 #   - 手动(MANUAL)：默认 5.0s（手动测试 / 自检之外的手动拍摄）
-AUTO_PRE_CAPTURE_DELAY = 3.5
+AUTO_PRE_CAPTURE_DELAY = 4
 MANUAL_PRE_CAPTURE_DELAY = 5.0
 
 # —— 检测帧范围（1-indexed，仅胶条所在位置）——
@@ -1474,17 +1474,24 @@ def index():
       <div style="font-size:14px;margin-bottom:8px;color:#9cf">自动拍照延时（仅自动 PLC 触发 / 强制拍摄生效，手动模式不受影响）</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
         <label style="font-size:12px;color:#aaa">拍照延时(秒)<br>
-          <input id="autoDelay" type="number" min="0" max="30" step="0.5" value="3.5"
+          <input id="autoDelay" type="number" min="0" max="30" step="0.5" value="4"
                  style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <button onclick="applyAutoDelay()">应用参数</button>
         <span id="autoCamState" class="meta"></span>
       </div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
         <label style="font-size:12px;color:#aaa">连拍帧率(张/秒)<br>
-          <input id="autoFps" type="number" min="0.5" max="6" step="0.25" value="2.75"
+          <input id="autoFps" type="number" min="0.5" max="6" step="0.25" value="3"
                  style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
         <button onclick="applyAutoFps()">应用帧率</button>
         <span id="autoFpsState" class="meta"></span>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+        <label style="font-size:12px;color:#aaa">连拍时长(秒)<br>
+          <input id="autoDur" type="number" min="1" max="30" step="0.5" value="4"
+                 style="width:90px;padding:6px;background:#000;color:#eee;border:1px solid #444"></label>
+        <button onclick="applyAutoDur()">应用时长</button>
+        <span id="autoDurState" class="meta"></span>
       </div>
       <div style="font-size:12px;color:#789;margin-top:8px">
         说明：自动触发条件 = 出车信号(DB130.DBX0.1)上升沿 + 车身同步信号(DB890.DBX225.2 与 225.3 同时为 1)。
@@ -1585,6 +1592,23 @@ function applyAutoFps(){{
       }}
       autoFpsState.textContent=m||'已应用';
     }}).catch(e=>{{autoFpsState.textContent='参数应用出错:'+e;}});
+}}
+
+function applyAutoDur(){{
+  const d=parseFloat(document.getElementById('autoDur').value);
+  const body={{auto_duration:isNaN(d)?null:d}};
+  autoDurState.textContent='应用中…';
+  fetch('/api/camera',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(r=>r.json()).then(res=>{{
+      let m='';
+      if(res.auto_duration!==undefined && res.auto_duration!==null){{
+        document.getElementById('autoDur').value=res.auto_duration;
+        m+='连拍时长='+res.auto_duration+'s ';
+      }} else if(res.error){{
+        m=res.error;
+      }}
+      autoDurState.textContent=m||'已应用';
+    }}).catch(e=>{{autoDurState.textContent='参数应用出错:'+e;}});
 }}
 
 function manualCapture(){{
@@ -1719,7 +1743,8 @@ def api_camera():
     - 手动拍照延时(delay)：改 MANUAL_PRE_CAPTURE_DELAY（仅手动测试/自检；不影响自动模式）。
     - 自动拍照延时(auto_delay)：改 AUTO_PRE_CAPTURE_DELAY（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
     - 自动连拍帧率(auto_fps)：改 AUTO_FPS 并同步重算 AUTO_TOTAL（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
-    exposure_us / fps / delay / auto_delay / auto_fps 均可独立发送，按需只传需要改的项。
+    - 自动连拍时长(auto_duration)：改 AUTO_DURATION_SEC 并同步重算 AUTO_TOTAL（仅自动 PLC 触发/强制拍摄；不影响手动模式）。
+    exposure_us / fps / delay / auto_delay / auto_fps / auto_duration 均可独立发送，按需只传需要改的项。
     """
     if not hub.running or not hub.streamers:
         return jsonify({"ok": False, "error": "相机未运行"})
@@ -1746,13 +1771,19 @@ def api_camera():
         resp["auto_delay"] = round(AUTO_PRE_CAPTURE_DELAY, 2)
     # 自动连拍帧率（仅自动 PLC 触发/强制拍摄；不影响手动模式；同步重算总张数）
     if data.get("auto_fps") is not None:
-        global AUTO_FPS, AUTO_TOTAL
+        global AUTO_FPS, AUTO_DURATION_SEC, AUTO_TOTAL
         AUTO_FPS = max(0.5, min(6.0, float(data["auto_fps"])))
         AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)
         resp["auto_fps"] = round(AUTO_FPS, 2)
         resp["auto_total"] = AUTO_TOTAL
+    # 自动连拍时长（仅自动 PLC 触发/强制拍摄；不影响手动模式；同步重算总张数）
+    if data.get("auto_duration") is not None:
+        AUTO_DURATION_SEC = max(1.0, min(30.0, float(data["auto_duration"])))
+        AUTO_TOTAL = int(AUTO_FPS * AUTO_DURATION_SEC)
+        resp["auto_duration"] = round(AUTO_DURATION_SEC, 2)
+        resp["auto_total"] = AUTO_TOTAL
     if set(resp.keys()) <= {"ok"}:
-        return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay/auto_fps）"})
+        return jsonify({"ok": False, "error": "未收到任何可调参数（exposure_us/fps/delay/auto_delay/auto_fps/auto_duration）"})
     return jsonify(resp)
 
 
