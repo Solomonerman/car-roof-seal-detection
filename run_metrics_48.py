@@ -103,7 +103,8 @@ def main():
             rows.append(dict(file=name, status="no_red_box"))
             continue
 
-        # ---- 模块④ 白线偏移（v15）：原始灰度 + 红框，拟合全局白线算各段偏移 ----
+        # ---- 模块④ 白线偏移（v15）：原始灰度 + 红框，拟合全局白线算各段偏移 + 逐列偏离判定 ----
+        off_recs = []
         off_by_seg = {}
         try:
             off_recs = OC.compute_offsets(gray, boxes, segment=S.segment, clean_mask=M.clean_mask)
@@ -143,6 +144,8 @@ def main():
             rec["offset_status"] = orec["status"] if orec else "error"
             rec["offset_white_pts"] = orec.get("white_pts") if orec else None
             rec["offset_inlier_pts"] = orec.get("inlier_pts") if orec else None
+            rec["offset_deviated"] = bool(orec["deviated"]) if orec else False
+            rec["offset_dev_runs"] = orec.get("dev_runs") if orec else []
 
             # ---- 该段黄线 GT 验证（ROI 坐标直接比对）----
             gt = parse_yellow_in_roi(bgr, box)
@@ -183,6 +186,12 @@ def main():
                     offset_mm=rec.get("offset_mm"),
                     offset_fit_mode=rec.get("offset_fit_mode"),
                     offset_status=rec.get("offset_status"),
+                    offset_deviated=rec.get("offset_deviated"),
+                    offset_dev_n=len(rec.get("offset_dev_runs") or []),
+                    offset_dev_hi_mm=(max((dr["hi_mm"] for dr in (rec.get("offset_dev_runs") or [])), default=None)
+                                      if rec.get("offset_dev_runs") else None),
+                    offset_dev_lo_mm=(min((dr["lo_mm"] for dr in (rec.get("offset_dev_runs") or [])), default=None)
+                                      if rec.get("offset_dev_runs") else None),
                     box=f"{box}",
                 )
             )
@@ -213,6 +222,15 @@ def main():
                 vis[np.round(gbot[np.isfinite(gbot)]).astype(int) + y, np.where(np.isfinite(gbot))[0] + x] = (0, 255, 255)
         cv2.imencode(".jpg", vis)[1].tofile(os.path.join(OUT, os.path.splitext(name)[0] + "_metric.jpg"))
 
+        # ---- 模块④ 偏移可视化：白线(红点)+逐列中心线(绿点)+超差段橙色高亮 ----
+        if off_recs:
+            try:
+                off_vis = OC.draw_offset_vis(bgr, boxes, off_recs)
+                cv2.imencode(".jpg", off_vis)[1].tofile(
+                    os.path.join(OUT, os.path.splitext(name)[0] + "_offset.jpg"))
+            except Exception as _e:
+                print("offset_vis error:", _e)
+
     # ---- 汇总输出 ----
     with open(os.path.join(OUT, "metrics.json"), "w", encoding="utf-8") as fo:
         json.dump(per_img, fo, ensure_ascii=False, indent=2, default=str)
@@ -220,7 +238,8 @@ def main():
     flds = [
         "file", "seg", "side", "status", "median_mm", "mean_mm", "p5_mm", "p95_mm",
         "min_mm", "max_mm", "in_spec_pct", "length_mm", "gt_median_mm",
-        "col_iou", "med_col_diff_mm", "offset_mm", "offset_fit_mode", "offset_status", "box",
+        "col_iou", "med_col_diff_mm", "offset_mm", "offset_fit_mode", "offset_status",
+        "offset_deviated", "offset_dev_n", "offset_dev_hi_mm", "offset_dev_lo_mm", "box",
     ]
     with open(os.path.join(OUT, "metrics.csv"), "w", newline="", encoding="utf-8") as fo:
         w = csv.DictWriter(fo, fieldnames=flds)

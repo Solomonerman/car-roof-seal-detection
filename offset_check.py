@@ -31,6 +31,13 @@ CURVE_OUTLIER_PX = 8.0     # 离群点残差阈值(px)：用于迭代剔除
 CURVE_MIN_INLIER = 0.4     # 内点率下限：低于=离群太多 -> 降级 RANSAC
 MIN_WHITE_PTS = 10         # 白线点最少数量，少于则判白线缺失
 
+RANSAC_SEED = 12345         # 固定种子：让 RANSAC 直线降级可复现（否则每次随机抽中不同内点，偏移乱跳）
+
+# ---------- 偏移公差带与偏离判定（用户拍板）----------
+OFFSET_SPEC_LO = 15.0      # 偏移下限(mm)：低于=胶条离白线过近
+OFFSET_SPEC_HI = 30.0      # 偏移上限(mm)：高于=胶条离白线过远
+OFFSET_MIN_RUN_COLS = 15   # 连续超差列数阈值：≥此值才判真实偏离；单点/少数噪点=误报
+
 
 # ---------- 基础拟合 ----------
 def fit_poly1(xs, ys):
@@ -54,7 +61,8 @@ def fit_poly2_reg(xs, ys, lam_a=CURVE_LAM_A):
     return float(theta[0]), float(theta[1]), float(theta[2])
 
 
-def ransac_line(xs, ys, max_iter=400, thresh_px=6.0, min_ratio=0.5):
+def ransac_line(xs, ys, max_iter=400, thresh_px=6.0, min_ratio=0.5, seed=RANSAC_SEED):
+    np.random.seed(seed)        # 固定种子：结果可复现
     xs = np.asarray(xs, float)
     ys = np.asarray(ys, float)
     n = len(xs)
@@ -110,7 +118,8 @@ def robust_curve(xs, ys, outlier_thresh_px=CURVE_OUTLIER_PX, max_iter=5,
         x_min = float(xs[mask].min())
         x_max = float(xs[mask].max())
         return "quad", (a, b, c), mask, x_min, x_max
-    # 降级：RANSAC 直线，抗离群更稳
+    # 降级直线：RANSAC（固定种子，可复现）收敛到点数最多的内点簇，
+    # 对双峰离群（如 idx47 的杂亮带）能稳定选中真实白线簇，偏移不再随机跳。
     a_l, b_l, inliers = ransac_line(xs, ys, thresh_px=outlier_thresh_px, min_ratio=min_inlier_ratio)
     mask_line = np.zeros(len(xs), dtype=bool)
     mask_line[inliers] = True
@@ -180,6 +189,70 @@ def centerline_fit(gray, box, segment=None, clean_mask=None):
     return float(a), float(b)
 
 
+def centerline_points(gray, box, segment=None, clean_mask=None):
+    """胶条段逐列中心线点 (x, y)：每列取上下边缘中点。保留真实 tilt（不拟合直线）。
+    返回 (xs ndarray, ys ndarray) 或 None。供逐点测距离用。
+    """
+    if segment is None or clean_mask is None:
+        raise RuntimeError("centerline_points 需传入 segment / clean_mask")
+    x, y, w, h = box
+    roi = gray[y:y + h, x:x + w]
+    mask, _ = segment(roi, (x, y), gray.shape)
+    cm = clean_mask(mask)
+    cols = np.any(cm > 0, axis=0)
+    xs = []
+    ys = []
+    for cx in range(w):
+        if not cols[cx]:
+            continue
+        rows = np.nonzero(cm[:, cx])[0]
+        if rows.size == 0:
+            continue
+        cy = y + int((rows.min() + rows.max()) / 2)
+        xs.append(x + cx)
+        ys.append(cy)
+    if len(xs) < 5:
+        return None
+    return np.array(xs, dtype=float), np.array(ys, dtype=float)
+
+
+def find_dev_runs(xs, d_mm, out_of_spec, min_run=OFFSET_MIN_RUN_COLS):
+    """在逐列 out_of_spec 布尔序列中找连续超差段；连续长度 ≥ min_run 才判真实偏离。
+    返回 (runs, deviated)。runs 每项:
+      {start_col,end_col,start_x,end_x,lo_mm,hi_mm,direction,run_cols}。
+    direction: 'low'(全段<下限) / 'high'(全段>上限) / 'both'。
+    说明：连续按"逐列测量点"计（胶条列基本连续，≈连续列）；单点/少数噪点不构成 run。
+    """
+    runs = []
+    n = len(out_of_spec)
+    i = 0
+    while i < n:
+        if out_of_spec[i]:
+            j = i
+            while j + 1 < n and out_of_spec[j + 1]:
+                j += 1
+            run_len = j - i + 1
+            if run_len >= min_run:
+                seg_xs = xs[i:j + 1]
+                seg_d = d_mm[i:j + 1]
+                if seg_d.max() < OFFSET_SPEC_LO:
+                    direction = "low"
+                elif seg_d.min() > OFFSET_SPEC_HI:
+                    direction = "high"
+                else:
+                    direction = "both"
+                runs.append(dict(
+                    start_col=int(i), end_col=int(j),
+                    start_x=int(round(float(seg_xs[0]))), end_x=int(round(float(seg_xs[-1]))),
+                    lo_mm=float(seg_d.min()), hi_mm=float(seg_d.max()),
+                    direction=direction, run_cols=run_len,
+                ))
+            i = j + 1
+        else:
+            i += 1
+    return runs, len(runs) > 0
+
+
 class WhiteLineModel:
     """拟合出的白线，可按 x 求 y。区间内用拟合；区间外 clamp 端点（不外推防崩溃）。"""
 
@@ -213,10 +286,19 @@ class WhiteLineModel:
 
 # ---------- 对外主接口 ----------
 def compute_offsets(gray, boxes, mm_per_px=MM_PER_PX, segment=None, clean_mask=None):
-    """对每张图的各胶条段算 白线->中心线 偏移。
-    返回 list[dict]: seg, side, offset_mm, fit_mode, white_pts, inlier_pts, coverage, status。
+    """对每张图的各胶条段算 白线->中心线 偏移，并逐点检测 Z 向旋转偏离。
+
+    返回 list[dict]:
+      seg, side, offset_mm(段中心列代表值), fit_mode, white_pts, inlier_pts, coverage, status,
+      per_col({xs, cl_y, white_y, d_mm} 或 None), deviated(bool), dev_runs(list of region dict)。
     status: ok / no_white_pts / no_centerline。
     白线为全局一条（所有 boxes 的点一起拟合），中心线每段各一。
+
+    偏离判定（用户需求）：
+      逐列算 距离(x) = (白线y − 中心线y) × MM_PER_PX；
+      落在区间 [OFFSET_SPEC_LO, OFFSET_SPEC_HI] 外 = 该点超差；
+      仅当连续超差列数 ≥ OFFSET_MIN_RUN_COLS 才判真实偏离(deviated=True)；
+      单点或少数噪点超差视为误报，不触发。
     """
     if segment is None or clean_mask is None:
         raise RuntimeError("compute_offsets 需传入 segment=seal_segment.segment, clean_mask=seal_metrics.clean_mask")
@@ -225,7 +307,8 @@ def compute_offsets(gray, boxes, mm_per_px=MM_PER_PX, segment=None, clean_mask=N
     wp, total_cols = detect_white_pts(gray, boxes, segment=segment, clean_mask=clean_mask)
     if wp is None:
         return [dict(seg=i, side=_side(n, i), offset_mm=None, fit_mode=None,
-                     white_pts=0, inlier_pts=0, coverage=0.0, status="no_white_pts") for i in range(n)]
+                     white_pts=0, inlier_pts=0, coverage=0.0, status="no_white_pts",
+                     per_col=None, deviated=False, dev_runs=[]) for i in range(n)]
     mode, params, mask, x_min, x_max = robust_curve(wp[:, 0], wp[:, 1])
     wmodel = WhiteLineModel(mode, params, x_min, x_max)
     n_inlier = int(mask.sum())
@@ -236,7 +319,8 @@ def compute_offsets(gray, boxes, mm_per_px=MM_PER_PX, segment=None, clean_mask=N
         cf = centerline_fit(gray, box, segment=segment, clean_mask=clean_mask)
         if cf is None:
             out.append(dict(seg=i, side=_side(n, i), offset_mm=None, fit_mode=mode,
-                            white_pts=n_total, inlier_pts=n_inlier, coverage=cov, status="no_centerline"))
+                            white_pts=n_total, inlier_pts=n_inlier, coverage=cov, status="no_centerline",
+                            per_col=None, deviated=False, dev_runs=[]))
             continue
         a_c, b_c = cf
         x, y, w, h = box
@@ -244,9 +328,66 @@ def compute_offsets(gray, boxes, mm_per_px=MM_PER_PX, segment=None, clean_mask=N
         wy = wmodel.y_at(xc)                  # 白线 y
         cy = a_c * xc + b_c                  # 中心线 y
         off = round((wy - cy) * mm_per_px, 2)
+
+        # ---- 逐列距离 + 偏离判定 ----
+        cpts = centerline_points(gray, box, segment=segment, clean_mask=clean_mask)
+        if cpts is None:
+            per_col = None
+            deviated = False
+            dev_runs = []
+        else:
+            cxs, cys = cpts
+            order = np.argsort(cxs)
+            cxs = cxs[order]
+            cys = cys[order]
+            wys = np.array([wmodel.y_at(float(v)) for v in cxs])
+            d_mm = (wys - cys) * mm_per_px
+            out_of_spec = (d_mm < OFFSET_SPEC_LO) | (d_mm > OFFSET_SPEC_HI)
+            dev_runs, deviated = find_dev_runs(cxs, d_mm, out_of_spec,
+                                               min_run=OFFSET_MIN_RUN_COLS)
+            per_col = dict(xs=cxs.tolist(), cl_y=cys.tolist(),
+                           white_y=wys.tolist(), d_mm=d_mm.tolist())
         out.append(dict(seg=i, side=_side(n, i), offset_mm=off, fit_mode=mode,
-                        white_pts=n_total, inlier_pts=n_inlier, coverage=cov, status="ok"))
+                        white_pts=n_total, inlier_pts=n_inlier, coverage=cov, status="ok",
+                        per_col=per_col, deviated=deviated, dev_runs=dev_runs))
     return out
+
+
+def draw_offset_vis(bgr, boxes, off_recs, mm_per_px=MM_PER_PX):
+    """偏移可视化：原图叠加 白线(红点) + 逐列中心线(绿点) + 超差段橙色高亮 + 段中心距离黄线。
+    返回 BGR 图。off_recs 为 compute_offsets 返回（需含 per_col / dev_runs），与 boxes 同序。
+    """
+    vis = bgr.copy()
+    for (x, y, w, h), r in zip(boxes, off_recs):
+        pc = r.get("per_col")
+        if not pc:
+            continue
+        xs = np.array(pc["xs"], float)
+        cl_y = np.array(pc["cl_y"], float)
+        w_y = np.array(pc["white_y"], float)
+        d_mm = np.array(pc["d_mm"], float)
+        # 绿点 = 逐列中心线（保留 tilt）；红点 = 白线
+        for xi, yi in zip(xs, cl_y):
+            vis[int(round(yi)), int(round(xi))] = (0, 255, 0)
+        for xi, yi in zip(xs, w_y):
+            vis[int(round(yi)), int(round(xi))] = (0, 0, 255)
+        # 橙色高亮：超差列画 中心线->白线 竖线（黄变橙）
+        oos = (d_mm < OFFSET_SPEC_LO) | (d_mm > OFFSET_SPEC_HI)
+        for xi, yi_c, yi_w in zip(xs[oos], cl_y[oos], w_y[oos]):
+            cv2.line(vis, (int(round(xi)), int(round(yi_c))),
+                     (int(round(xi)), int(round(yi_w))), (0, 165, 255), 2)
+        # 段中心列黄线（代表值，便于对照上一版）
+        xc = x + w // 2
+        if r.get("offset_mm") is not None and len(xs):
+            k = int(np.argmin(np.abs(xs - xc)))
+            cv2.line(vis, (int(round(xs[k])), int(round(cl_y[k]))),
+                     (int(round(xs[k])), int(round(w_y[k]))), (0, 255, 255), 2)
+        # 偏离段文字标注
+        if r.get("deviated"):
+            yy = int(round(min(cl_y.min(), w_y.min()))) - 10
+            cv2.putText(vis, "DEVIATED", (int(round(xs[0])), max(0, yy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+    return vis
 
 
 def _side(n, i):
