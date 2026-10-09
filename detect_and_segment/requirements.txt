@@ -1,0 +1,17 @@
+# GAD 胶条检测 —— 运行依赖
+#
+# ⚠️ ultralytics 的版本号**别动**：模型行为跟版本绑定，换版本结果会变，
+#    所有验收数据都是在 8.4.129 上量的。
+ultralytics==8.4.129
+
+# opencv 与 numpy 不锁死：不同机器的 torch 需要的 numpy 不一样。
+#   torch 2.1 那种老版本  -> numpy 必须留在 1.26（否则跑到一半报
+#                            "compiled using NumPy 1.x cannot be run in NumPy 2.x"）
+#   torch 2.x 近期版本    -> numpy 2.x 可以
+opencv-python
+numpy
+
+# torch 不在上面列：多数环境已经装了。没装的话按自己的机器选：
+#   只跑 CPU（够用，单张约 0.3s）：pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   有 NVIDIA 显卡：按 https://pytorch.org 给的命令装 CUDA 版
+# 注意：本包里的推理**硬编码走 CPU**，装了 CUDA 版 torch 也不会用到显卡。

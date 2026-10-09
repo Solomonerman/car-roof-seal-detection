@@ -162,11 +162,11 @@ AUTO_PRE_CAPTURE_DELAY = 4
 MANUAL_PRE_CAPTURE_DELAY = 5.0
 
 # —— 检测帧范围（1-indexed，仅胶条所在位置）——
-# 自动连拍共 AUTO_TOTAL 张，其中第 1~4 张与第 11~13 张为车身/背景，非胶条位置，
-# 不纳入检测；仅第 5~10 张为胶条区域，跑真实检测。检测切片在 handle_car_signal
+# 自动连拍共 AUTO_TOTAL 张，其中第 4~9 张为胶条区域，跑真实检测；
+# 其余（第 1~3、第 10~12 张）为车身/背景，不纳入检测。检测切片在 handle_car_signal
 # 传入 _run_detection 前完成；UI(5000/8000)按此范围切片展示原始照片。
 # 改这里即可整体调整“哪些张参与检测”，不影响拍摄/张数。
-DETECT_FRAME_FROM = 5      # 参与检测的首张（含）
+DETECT_FRAME_FROM = 4      # 参与检测的首张（含）
 DETECT_FRAME_TO = 9        # 参与检测的末张（含）
 
 # 自愈阈值：取流线程超过该秒数未取到任何新帧（造型相机 GigE 心跳超时/网口抖动
@@ -1129,8 +1129,8 @@ def _run_detection(model, key, image_paths, ts_dt):
     """拍照后跑真实检测，返回 (DetectionResult, proc_dir_rel)。
 
     设计约束：只“读图 + 算”，绝不碰相机/拍摄任何逻辑。
-      - key 经 router 命中检测器（当前 9X）→ SealDetector 跑真实检测；
-        未命中（8X/未知）→ 占位“算法未接入”，与之前行为一致（仅拍照存档）。
+      - key 经 router 命中检测器（当前 8X / NM 开头）→ SealOffsetDetector 跑真实检测；
+        未命中（9X/未知）→ 占位“算法未接入”，仅拍照存档。
       - proc_dir_rel 为相对 ROOT 的目录（data/process_data/<时间>_<key>），
         内含 detector 生成的 mask/叠加图，供 ui/app.py 可视化读取。
     检测异常不致命：捕获后回退占位，保证拍照/落库链路不中断。
@@ -1175,7 +1175,7 @@ def handle_car_signal(ctx):
       否则不拍照（免检车 / 未接入车型）。
     所有车型用同一出车信号触发，避免拍照时机不一致导致照片错位。
 
-    本迭代已接入检测：拍照车跑真实检测（9X 命中 SealDetector；8X/未知占位），
+    本迭代已接入检测：拍照车跑真实检测（8X / NM 开头命中 SealOffsetDetector；9X/未知占位），
     结果 + 过程叠加图落库，供 ui/app.py 可视化。全程只读图，不碰相机/拍摄。
     全程只读 PLC；本函数不写任何 PLC 地址。
     ctx 为 plc_monitor.parse_context 的 dict（提前锁存的 DB230 上下文）。
