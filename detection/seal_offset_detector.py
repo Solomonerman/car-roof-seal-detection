@@ -205,6 +205,10 @@ class SealOffsetDetector:
                 defects.append(Defect(x, y, w, h, "seal", 0.85,
                                      meta={"width_mm": ws.get("median_mm")}))
 
+            # 把宽度信息挂到 box_art，供结果图画宽度标注（与本地 detector.py 对齐）
+            box_art[idx]["width_mm"] = ws.get("median_mm")
+            box_art[idx]["width_in_spec"] = (not width_problem)
+
             # 偏移缺陷（核心漏水风险指标）：中度/漏水 或 连续偏离 → 计 NG
             lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
             dev = bool(orec.get("deviated"))
@@ -220,12 +224,19 @@ class SealOffsetDetector:
             try:
                 os.makedirs(process_dir, exist_ok=True)
                 base = os.path.splitext(os.path.basename(path))[0]
-                # mask overlay：青色=算法 mask，橙色框=检测区
+                # mask overlay：青色=算法 mask，橙色框=检测区；宽度文字标注（与本地 detector.py 对齐）
                 vis = cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)
                 for art in box_art.values():
                     cx, cy, cw, ch = art["x"], art["y"], art["w"], art["h"]
                     vis[cy:cy + ch, cx:cx + cw][art["cmask"] > 0] = (255, 255, 0)
                     cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (255, 128, 0), 3)
+                    # 宽度信息：中值宽度(mm) + 规格状态（绿=合格 红=超差）
+                    wmm = art.get("width_mm")
+                    if wmm is not None:
+                        in_spec = art.get("width_in_spec", True)
+                        col = (0, 200, 0) if in_spec else (0, 0, 255)
+                        cv2.putText(vis, f"W={wmm:.1f}mm", (cx, max(14, cy - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
                 cv2.imwrite(os.path.join(process_dir, base + "_mask.png"), vis)
                 # 橙色带偏移图（与 0921 验证一致）
                 if off_recs:
