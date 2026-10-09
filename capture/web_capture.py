@@ -180,7 +180,7 @@ CAMERA_IPS = ["172.30.173.249"]   # 现场左侧 Basler aca1920-48gm
 CAMERA_SERIAL = ""             # 留空则用上面列表的 IP；也可填序列号直连（单相机场景）
 
 # ===================== 相机采集参数 =====================
-EXPOSURE_TIME_US = 4000      # 曝光时间（微秒），默认 4000（现场已上调）
+EXPOSURE_TIME_US = 1600      # 曝光时间（微秒），默认 1600（现场确认；免每次网页手动设）
 # 增益：设为 None = 沿用相机【当前值】、不修改。
 #   你在 pylon Viewer 里已设过增益（现场暗光、曝光锁 2000µs 的可用档），
 #   关掉 pylon 跑本程序时会保留该设置，拍出的图不会变暗。
@@ -1066,6 +1066,32 @@ class CameraHub:
         for s in self.streamers:
             s.start()
 
+    def wait_until_ready(self, timeout=20.0, stable_frames=3, max_stale_sec=1.0):
+        """启动后阻塞等待主相机真正出图：帧号持续增长 + 最近一帧足够新。
+
+        避免开线头车因相机未热身/控制通道未开而拍照失败（首车拍照超时）。
+        返回 True=就绪；False=超时（仍继续运行，但首台车可能拍照失败）。
+        """
+        s = self.streamers[0] if self.streamers else None
+        if s is None:
+            return False
+        deadline = time.perf_counter() + timeout
+        prev_fno = s._frame_no
+        stable = 0
+        while time.perf_counter() < deadline:
+            time.sleep(0.2)
+            fno = s._frame_no
+            age = time.perf_counter() - s._latest_ts
+            # 帧号比上次多（相机在持续出图）且最近一帧足够新
+            if fno > prev_fno and age < max_stale_sec:
+                stable += 1
+                if stable >= stable_frames:
+                    return True
+            else:
+                stable = 0
+            prev_fno = fno
+        return False
+
     def stop_all(self):
         for s in self.streamers:
             s.stop()
@@ -1886,6 +1912,12 @@ def main():
 
     try:
         hub.start_all()
+        # 启动后等主相机真正出图再继续（避免开线头车因相机未热身而拍照失败）
+        print("[相机] 启动后等待首帧就绪 ...")
+        if hub.wait_until_ready(timeout=20.0):
+            print("[相机] 首帧已就绪，可正常拍照")
+        else:
+            print("[警告] 相机首帧等待超时（仍会继续运行，但首台车可能拍照失败）")
     except Exception as e:
         print(f"[错误] {e}")
         hub.stop_all()
