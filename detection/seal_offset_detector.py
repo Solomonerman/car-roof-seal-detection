@@ -237,13 +237,11 @@ class SealOffsetDetector:
                                   + np.array(SEAL_CYAN_BGR, np.float32) * SEAL_ALPHA).astype(np.uint8)
                     # 外框：红色，加粗一号
                     cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 5)
-                    # 宽度信息：中值宽度(mm) + 规格状态（绿=合格 红=超差）
+                    # 宽度信息：中值宽度(mm)，统一白色（与 _offset.png 一致，不区分合格/超差）
                     wmm = art.get("width_mm")
                     if wmm is not None:
-                        in_spec = art.get("width_in_spec", True)
-                        col = (0, 200, 0) if in_spec else (0, 0, 255)
                         OC._put_text_plate(vis, f"W={wmm:.1f}mm", cx, max(20, cy - 8),
-                                          scale=OC.FONT_WIDTH, color=col, thickness=2)
+                                          scale=OC.FONT_WIDTH, color=(255, 255, 255), thickness=2)
                 cv2.imwrite(os.path.join(process_dir, base + "_mask.png"), vis)
                 # 橙色带偏移图（与 0921 验证一致）
                 if off_recs:
