@@ -224,12 +224,19 @@ class SealOffsetDetector:
             try:
                 os.makedirs(process_dir, exist_ok=True)
                 base = os.path.splitext(os.path.basename(path))[0]
-                # mask overlay：青色=算法 mask，橙色框=检测区；宽度文字标注（与本地 detector.py 对齐）
+                # mask overlay：淡紫半透明=算法 mask(可透出原图)，红框=检测区；宽度文字标注（与本地 detector.py 对齐）
                 vis = cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)
+                SEAL_PURPLE_BGR = (220, 160, 200)  # 淡紫（BGR：R≈200 G≈160 B≈220）
+                SEAL_ALPHA = 0.45                   # 半透明：0=全透 1=不透明（越小越透）
                 for art in box_art.values():
                     cx, cy, cw, ch = art["x"], art["y"], art["w"], art["h"]
-                    vis[cy:cy + ch, cx:cx + cw][art["cmask"] > 0] = (255, 255, 0)
-                    cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (255, 128, 0), 3)
+                    # 淡紫半透明：把紫色按 alpha 混到原图(灰度转BGR)上，保留底层亮度，看着更舒服
+                    _reg = vis[cy:cy + ch, cx:cx + cw]
+                    _mpx = art["cmask"] > 0
+                    _reg[_mpx] = (_reg[_mpx].astype(np.float32) * (1 - SEAL_ALPHA)
+                                  + np.array(SEAL_PURPLE_BGR, np.float32) * SEAL_ALPHA).astype(np.uint8)
+                    # 外框：红色，加粗一号
+                    cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 5)
                     # 宽度信息：中值宽度(mm) + 规格状态（绿=合格 红=超差）
                     wmm = art.get("width_mm")
                     if wmm is not None:
