@@ -242,8 +242,8 @@ class SealOffsetDetector:
                     if wmm is not None:
                         in_spec = art.get("width_in_spec", True)
                         col = (0, 200, 0) if in_spec else (0, 0, 255)
-                        cv2.putText(vis, f"W={wmm:.1f}mm", (cx, max(14, cy - 8)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+                        OC._put_text_plate(vis, f"W={wmm:.1f}mm", cx, max(20, cy - 8),
+                                          scale=OC.FONT_WIDTH, color=col, thickness=2)
                 cv2.imwrite(os.path.join(process_dir, base + "_mask.png"), vis)
                 # 橙色带偏移图（与 0921 验证一致）
                 if off_recs:
