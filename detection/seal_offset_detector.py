@@ -37,10 +37,30 @@ SPEC = (15.0, 30.0)                        # 宽度规格 20±5mm
 WIDTH_SPEC_LO = 15.0
 WIDTH_SPEC_HI = 30.0
 WIDTH_MIN_RUN_COLS = 15                    # 宽度连续超差列数阈值（抗单列噪点）
-# 偏移报警：中度(level=2)/漏水(level=3) 或连续偏离(deviated) 即判 offset 缺陷并计 NG
-OFFSET_NG_LEVEL = 2
+# 偏移报警：仅『漏水风险』(level=3) 才判 offset 缺陷并计 NG；中度/轻微仅展示、不判NG
+OFFSET_NG_LEVEL = 3
 
 NG_LABELS = {"missing", "break", "overspray", "width", "offset"}
+
+
+def pick_worst_offset(off_recs, boxes):
+    """从一张照片的多个胶条段里挑『偏移最严重』(offset_level 最大) 的一段。
+
+    一张照片可能有多段胶条；其外框颜色 / 表格偏移列应以最严重段为准，而非首段。
+    无胶条(missing)/丢失(status!=ok) 的段不计入；全部未知时返回 None。
+    """
+    worst_idx = None
+    worst_lv = OC.OFFSET_LEVEL_UNKNOWN          # -1 起始，任何有效段都能覆盖
+    for i in range(len(boxes)):
+        orec = off_recs[i] if i < len(off_recs) else None
+        if not orec or orec.get("status") != "ok":
+            continue
+        lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
+        if lv is None or lv <= worst_lv:
+            continue
+        worst_lv = lv
+        worst_idx = i
+    return off_recs[worst_idx] if worst_idx is not None else None
 
 
 def find_width_runs(wp, lo=WIDTH_SPEC_LO, hi=WIDTH_SPEC_HI, min_run=WIDTH_MIN_RUN_COLS):
@@ -106,14 +126,21 @@ class SealOffsetDetector:
     def detect(self, car_model: str, images: list, process_dir: str = None,
                roi: tuple = None) -> DetectionResult:
         all_defects = []
+        per_photo = []
         for path in images:
             try:
-                defects = self._detect_one(path, process_dir)
+                defects, summ = self._detect_one(path, process_dir)
             except Exception as e:
                 print(f"[SealOffset] 处理异常 {os.path.basename(path)}: {e}")
                 defects = [Defect(0, 0, 0, 0, "missing", 0.9,
                                  meta={"reason": f"处理异常:{e}"})]
+                summ = {"name": os.path.splitext(os.path.basename(path))[0],
+                        "width_mm": None, "width_in_spec": False, "offset_mm": None,
+                        "offset_level": OC.OFFSET_LEVEL_UNKNOWN,
+                        "offset_level_name": OC.OFFSET_LEVEL_UNKNOWN_NAME,
+                        "deviated": False, "status": "error", "ok": False}
             all_defects.extend(defects)
+            per_photo.append(summ)
 
         ng = [d for d in all_defects if d.label in NG_LABELS]
         ok = len(ng) == 0
@@ -130,6 +157,18 @@ class SealOffsetDetector:
         omsg = " 偏移(mm)=" + "/".join(f"{v:.1f}" for v in offs) if offs else ""
         msg = (f"检测 {len(images)} 张图，胶条段={n_seg} "
                f"缺陷(NG)={len(ng)}{wmsg}{omsg}")
+
+        # 逐图汇总 JSON（供看板页底部数据表格读取；仅写 proc_dir，不改库、不影响已有过程图）
+        if process_dir:
+            try:
+                import json as _json
+                _sp = os.path.join(process_dir, "summary.json")
+                with open(_sp, "w", encoding="utf-8") as _f:
+                    _json.dump({"per_photo": per_photo, "ok": ok, "message": msg},
+                               _f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[SealOffset] 逐图汇总写入失败 {process_dir}: {e}")
+
         return DetectionResult(
             car_model=car_model,
             ok=ok,
@@ -142,8 +181,13 @@ class SealOffsetDetector:
         defects = []
         bgr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
-            return [Defect(0, 0, 0, 0, "missing", 0.9,
-                           meta={"reason": "图像读取失败"})]
+            d = Defect(0, 0, 0, 0, "missing", 0.9, meta={"reason": "图像读取失败"})
+            summary = {"name": os.path.splitext(os.path.basename(path))[0],
+                       "width_mm": None, "width_in_spec": False, "offset_mm": None,
+                       "offset_level": OC.OFFSET_LEVEL_UNKNOWN,
+                       "offset_level_name": OC.OFFSET_LEVEL_UNKNOWN_NAME,
+                       "deviated": False, "status": "no_image", "ok": False}
+            return [d], summary
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         boxes = self._loc.locate(bgr)
@@ -191,28 +235,27 @@ class SealOffsetDetector:
             box_art[idx] = dict(cmask=cmask, top=top, bot=bot, xs=xs, mid=mid,
                                 x=x, y=y, w=w, h=h, gt=None)
 
-            # 宽度缺陷（主体分布超差 或 连续超差列）
-            body_out = bool((ws.get("p5_mm", 999) < WIDTH_SPEC_LO) or
-                            (ws.get("p95_mm", -1) > WIDTH_SPEC_HI))
-            width_runs, run_out = find_width_runs(wp, WIDTH_SPEC_LO, WIDTH_SPEC_HI,
-                                                  WIDTH_MIN_RUN_COLS)
-            width_problem = bool(body_out or run_out)
+            # 宽度缺陷：仅当『代表宽度(中值)超出规格 15~30mm』才判 NG（按需求：区间内值如 26.8 不报NG）
+            wmedian = ws.get("median_mm")
+            width_out = (wmedian is not None) and (
+                wmedian < WIDTH_SPEC_LO or wmedian > WIDTH_SPEC_HI)
+            width_problem = bool(width_out)
             if width_problem:
                 defects.append(Defect(x, y, w, h, "width", 0.85,
-                                     meta={"width_mm": ws.get("median_mm"),
+                                     meta={"width_mm": wmedian,
                                            "in_spec_pct": ws.get("in_spec_pct")}))
             else:
                 defects.append(Defect(x, y, w, h, "seal", 0.85,
-                                     meta={"width_mm": ws.get("median_mm")}))
+                                     meta={"width_mm": wmedian}))
 
             # 把宽度信息挂到 box_art，供结果图画宽度标注（与本地 detector.py 对齐）
-            box_art[idx]["width_mm"] = ws.get("median_mm")
+            box_art[idx]["width_mm"] = wmedian
             box_art[idx]["width_in_spec"] = (not width_problem)
 
-            # 偏移缺陷（核心漏水风险指标）：中度/漏水 或 连续偏离 → 计 NG
+            # 偏移缺陷（核心漏水风险指标）：仅『漏水风险』(level=3) 计 NG；中度/轻微仅展示不判NG
             lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
             dev = bool(orec.get("deviated"))
-            if orec.get("status") == "ok" and (lv >= OFFSET_NG_LEVEL or dev):
+            if orec.get("status") == "ok" and lv >= OFFSET_NG_LEVEL:
                 defects.append(Defect(x, y, w, h, "offset", 0.9,
                                      meta={"offset_mm": orec.get("offset_mm"),
                                            "offset_level": lv,
@@ -253,4 +296,31 @@ class SealOffsetDetector:
             except Exception as e:
                 print(f"[SealOffset] 过程图生成失败 {os.path.basename(path)}: {e}")
 
-        return defects
+        # ---- 逐图汇总（供看板页底部数据表格；不入库）----
+        summary = {
+            "name": os.path.splitext(os.path.basename(path))[0],
+            "width_mm": None,
+            "width_in_spec": True,
+            "offset_mm": None,
+            "offset_level": OC.OFFSET_LEVEL_UNKNOWN,
+            "offset_level_name": OC.OFFSET_LEVEL_UNKNOWN_NAME,
+            "deviated": False,
+            "status": "ok",
+            "ok": not any(d.label in NG_LABELS for d in defects),
+        }
+        present = [i for i in range(len(boxes)) if i in box_art]
+        if present:
+            summary["width_mm"] = box_art[present[0]].get("width_mm")
+            summary["width_in_spec"] = all(box_art[i].get("width_in_spec", True)
+                                           for i in present)
+        # 偏移代表：取『偏移最严重』(offset_level 最大) 的一段作为该照片外框/表格依据
+        # （一张照片可能有多段胶条，外框颜色按最严重段计，而非首段）
+        rep_off = pick_worst_offset(off_recs, boxes)
+        if rep_off is not None:
+            summary["offset_mm"] = rep_off.get("offset_mm")
+            summary["offset_level"] = rep_off.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
+            summary["offset_level_name"] = rep_off.get("offset_level_name",
+                                                      OC.OFFSET_LEVEL_UNKNOWN_NAME)
+            summary["deviated"] = rep_off.get("deviated", False)
+            summary["status"] = rep_off.get("status", "ok")
+        return defects, summary
