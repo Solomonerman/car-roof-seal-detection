@@ -207,16 +207,22 @@ class SealOffsetDetector:
         n = len(boxes)
         off_recs = []
         box_art = {}
+        photo_name = os.path.splitext(os.path.basename(path))[0]   # 照片名(用于总览区分每段胶条)
         for idx, box in enumerate(boxes):
             x, y, w, h = box
             side = f"S{idx}"
             roi = clean[y:y + h, x:x + w]
             mask, notes = S.segment(roi, (x, y), gray.shape)
             if mask is None:
-                defects.append(Defect(x, y, w, h, "missing", 0.9,
-                                     meta={"reason": "no_strip"}))
                 orec = OC.segment_offset(box, wl, None, n, idx)
                 off_recs.append(orec)
+                _lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
+                defects.append(Defect(x, y, w, h, "missing", 0.9,
+                                     meta={"reason": "no_strip",
+                                           "photo": photo_name, "seg": side,
+                                           "offset_mm": orec.get("offset_mm"),
+                                           "offset_level": _lv,
+                                           "offset_level_name": orec.get("offset_level_name", OC.OFFSET_LEVEL_UNKNOWN_NAME)}))
                 continue
 
             cmask = M.clean_mask(mask)
@@ -232,6 +238,15 @@ class SealOffsetDetector:
             orec = OC.segment_offset(box, wl, (sxs_g, smid_g), n, idx)
             off_recs.append(orec)
 
+            # 偏移代表量（每段都记录，供总览『每段胶条偏移』展示；与结果图等级一致）
+            lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
+            dev = bool(orec.get("deviated"))
+            off_mm = orec.get("offset_mm")
+            off_name = orec.get("offset_level_name", OC.OFFSET_LEVEL_UNKNOWN_NAME)
+            seg_meta = {"photo": photo_name, "seg": side,
+                        "offset_mm": off_mm, "offset_level": lv,
+                        "offset_level_name": off_name, "deviated": dev}
+
             box_art[idx] = dict(cmask=cmask, top=top, bot=bot, xs=xs, mid=mid,
                                 x=x, y=y, w=w, h=h, gt=None)
 
@@ -243,24 +258,27 @@ class SealOffsetDetector:
             if width_problem:
                 defects.append(Defect(x, y, w, h, "width", 0.85,
                                      meta={"width_mm": wmedian,
-                                           "in_spec_pct": ws.get("in_spec_pct")}))
+                                           "in_spec_pct": ws.get("in_spec_pct"),
+                                           **seg_meta}))
             else:
                 defects.append(Defect(x, y, w, h, "seal", 0.85,
-                                     meta={"width_mm": wmedian}))
+                                     meta={"width_mm": wmedian,
+                                           **seg_meta}))
 
             # 把宽度信息挂到 box_art，供结果图画宽度标注（与本地 detector.py 对齐）
             box_art[idx]["width_mm"] = wmedian
             box_art[idx]["width_in_spec"] = (not width_problem)
 
-            # 偏移缺陷（核心漏水风险指标）：仅『漏水风险』(level=3) 计 NG；中度/轻微仅展示不判NG
-            lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
-            dev = bool(orec.get("deviated"))
+            # 偏移缺陷（核心漏水风险指标）：仅『漏水风险』(level=3) 才单独置 NG；
+            # 中度/轻微仅展示（已挂在上面 seal/width 的 offset_* 字段），不判NG。
+            # 该独立 offset 缺陷仅用于驱动整记录/整图 NG（总览显示时跳过，避免与上面重复）。
             if orec.get("status") == "ok" and lv >= OFFSET_NG_LEVEL:
                 defects.append(Defect(x, y, w, h, "offset", 0.9,
-                                     meta={"offset_mm": orec.get("offset_mm"),
+                                     meta={"offset_mm": off_mm,
                                            "offset_level": lv,
-                                           "offset_level_name": orec.get("offset_level_name"),
-                                           "deviated": dev}))
+                                           "offset_level_name": off_name,
+                                           "deviated": dev,
+                                           "photo": photo_name, "seg": side}))
 
         # —— 过程图（存到 web_capture 传入的 process_dir）——
         if process_dir:

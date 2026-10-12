@@ -53,45 +53,67 @@ _LABEL_CN = {
 _NG_LABELS = {"missing", "break", "overspray", "width"}
 
 
+def _seg_tag(meta) -> str:
+    """段标识前缀：每段胶条标注 照片·段号（如 [04·S0]），便于在总览里区分每段。"""
+    if not meta:
+        return ""
+    ph = meta.get("photo")
+    sg = meta.get("seg")
+    if ph is None and sg is None:
+        return ""
+    return f"[{ph or ''}·{sg or ''}] "
+
+
+def _offset_text(meta) -> str:
+    """把偏移量 + 等级渲染成文本（与结果图等级一致；-1 未检出也展示）。"""
+    off = meta.get("offset_mm")
+    lv_name = meta.get("offset_level_name") or ""
+    if off is not None:
+        return f" · 偏移 {off:.2f}mm（{lv_name}）"
+    return f" · 偏移 {lv_name or '未检出'}"
+
+
 def _defect_text(d) -> str:
-    """把一条 Defect 渲染成可读文本（宽度按 15~30mm 标准展示，偏移显示 mm 和等级）。"""
+    """把一条 Defect 渲染成可读文本。
+
+    每段胶条都带 照片·段号 前缀；偏移量 + 等级随每段展示（正常/轻微/中度/漏水/未检出），
+    宽度按 15~30mm 标准展示。
+    """
     label = d.label
     meta = d.meta or {}
     cn = _LABEL_CN.get(label, label)
+    tag = _seg_tag(meta)
     if label == "width":
         w = meta.get("width_mm")
         if w is None:
-            return cn
+            return f"{tag}{cn}"
         spec = f"（标准{_WIDTH_SPEC_LO:.0f}~{_WIDTH_SPEC_HI:.0f}mm）"
         if _WIDTH_SPEC_LO <= w <= _WIDTH_SPEC_HI:
-            return f"胶条宽度 {w:.2f}mm{spec}"
-        return f"宽度超差 {w:.2f}mm{spec}"
+            return f"{tag}胶条宽度 {w:.2f}mm{spec}{_offset_text(meta)}"
+        return f"{tag}宽度超差 {w:.2f}mm{spec}{_offset_text(meta)}"
     if label == "missing":
-        return "胶条缺失（ROI内无胶条）"
+        return f"{tag}胶条缺失（ROI内无胶条）{_offset_text(meta)}"
     if label == "break":
         if meta.get("type") == "纵向空洞":
-            return f"断胶·纵向空洞 面积{meta.get('hole_area_px')}px"
+            return f"{tag}断胶·纵向空洞 面积{meta.get('hole_area_px')}px"
         if "gap_mm" in meta:
-            return f"断胶·段间间隙 {meta['gap_mm']}mm（常态{meta.get('typical_gap_mm')}mm）"
-        return "断胶"
+            return f"{tag}断胶·段间间隙 {meta['gap_mm']}mm（常态{meta.get('typical_gap_mm')}mm）"
+        return f"{tag}断胶"
     if label == "overspray":
-        return f"过喷 面积{meta.get('area_px')}px"
+        return f"{tag}过喷 面积{meta.get('area_px')}px"
     if label == "seal":
         w = meta.get("width_mm")
-        off = meta.get("offset_mm")
-        lv_name = meta.get("offset_level_name") or ""
-        base = f"胶条 OK {w}mm" if w is not None else "胶条 OK"
-        if off is not None:
-            return f"{base} · 偏移 {off:.2f}mm（{lv_name}）"
-        return base
+        base = f"胶条 OK {w:.2f}mm" if w is not None else "胶条 OK"
+        return f"{tag}{base}{_offset_text(meta)}"
     if label == "offset":
+        # 该独立缺陷仅驱动 NG；总览显示时已在 seal/width 行展示偏移，整条跳过渲染
         off = meta.get("offset_mm")
         lv_name = meta.get("offset_level_name") or ""
         if off is not None:
-            return f"偏移 {off:.2f}mm（{lv_name}）"
-        return cn
+            return f"{tag}偏移 {off:.2f}mm（{lv_name}）"
+        return f"{tag}{cn}"
     # pending / 其他
-    return meta.get("reason") or cn
+    return f"{tag}{meta.get('reason') or cn}"
 
 
 def _is_ng_defect(d) -> bool:
@@ -187,7 +209,11 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         if r.defects:
             defects_html = "<ul class='defects'>"
             for d in r.defects:
-                cls = "ng" if _is_ng_defect(d) else "ok"
+                if d.label == "offset":
+                    continue   # 独立 offset 缺陷仅驱动 NG，已在 seal/width 行展示偏移，避免重复
+                ng = _is_ng_defect(d)
+                lv = (d.meta or {}).get("offset_level", 0)
+                cls = "ng" if ng else ("unknown" if lv == -1 else "ok")
                 defects_html += f"<li class='{cls}'>● {_defect_text(d)}</li>"
             defects_html += "</ul>"
         else:
@@ -264,6 +290,7 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         .defects {{ margin:4px 0; padding-left:18px; }}
         .defects li.ok {{ color:#2e9e4f; }}
         .defects li.ng {{ color:#d23b3b; font-weight:bold; }}
+        .defects li.unknown {{ color:#888; }}
         .muted {{ color:#999; font-size:13px; }}
       </style>
     </head>
