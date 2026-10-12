@@ -36,6 +36,10 @@ DET_FRAME_FROM = 5
 DET_FRAME_TO = 9
 
 
+# 宽度规格（与 detection/seal_offset_detector.py 保持一致）
+_WIDTH_SPEC_LO = 15.0
+_WIDTH_SPEC_HI = 30.0
+
 # ---- 缺陷标签 → 中文 + 明细文本 ----
 _LABEL_CN = {
     "seal": "胶条",
@@ -50,13 +54,18 @@ _NG_LABELS = {"missing", "break", "overspray", "width"}
 
 
 def _defect_text(d) -> str:
-    """把一条 Defect 渲染成可读文本。"""
+    """把一条 Defect 渲染成可读文本（宽度按 15~30mm 标准展示，偏移显示 mm 和等级）。"""
     label = d.label
     meta = d.meta or {}
     cn = _LABEL_CN.get(label, label)
     if label == "width":
         w = meta.get("width_mm")
-        return f"{cn} {w}mm（标准20±5）" if w is not None else cn
+        if w is None:
+            return cn
+        spec = f"（标准{_WIDTH_SPEC_LO:.0f}~{_WIDTH_SPEC_HI:.0f}mm）"
+        if _WIDTH_SPEC_LO <= w <= _WIDTH_SPEC_HI:
+            return f"胶条宽度 {w:.2f}mm{spec}"
+        return f"宽度超差 {w:.2f}mm{spec}"
     if label == "missing":
         return "胶条缺失（ROI内无胶条）"
     if label == "break":
@@ -69,9 +78,35 @@ def _defect_text(d) -> str:
         return f"过喷 面积{meta.get('area_px')}px"
     if label == "seal":
         w = meta.get("width_mm")
-        return f"胶条 OK {w}mm" if w is not None else "胶条 OK"
+        off = meta.get("offset_mm")
+        lv_name = meta.get("offset_level_name") or ""
+        base = f"胶条 OK {w}mm" if w is not None else "胶条 OK"
+        if off is not None:
+            return f"{base} · 偏移 {off:.2f}mm（{lv_name}）"
+        return base
+    if label == "offset":
+        off = meta.get("offset_mm")
+        lv_name = meta.get("offset_level_name") or ""
+        if off is not None:
+            return f"偏移 {off:.2f}mm（{lv_name}）"
+        return cn
     # pending / 其他
     return meta.get("reason") or cn
+
+
+def _is_ng_defect(d) -> bool:
+    """按当前标准重新判断一条 defect 是否应显示为 NG。"""
+    if d.label in {"missing", "break", "overspray"}:
+        return True
+    if d.label == "width":
+        w = (d.meta or {}).get("width_mm")
+        if w is None:
+            return True
+        return not (_WIDTH_SPEC_LO <= w <= _WIDTH_SPEC_HI)
+    if d.label == "offset":
+        # 只有 offset_level >= 3（漏水风险）才判 NG
+        return (d.meta or {}).get("offset_level", 0) >= 3
+    return False
 
 
 def _img_url(ref: str) -> str:
@@ -144,13 +179,15 @@ def index(skid: str = Query("", description="滑橇号筛选"),
 
     cards = []
     for r in recs:
-        badge = ('<span class="badge ok">OK</span>' if r.ok
+        # 按当前标准重新判定 OK/NG（宽度 15~30mm、偏移仅漏水风险才判 NG）
+        rec_ok = not any(_is_ng_defect(d) for d in (r.defects or []))
+        badge = ('<span class="badge ok">OK</span>' if rec_ok
                  else '<span class="badge ng">NG</span>')
         # 缺陷明细
         if r.defects:
             defects_html = "<ul class='defects'>"
             for d in r.defects:
-                cls = "ng" if d.label in _NG_LABELS else "ok"
+                cls = "ng" if _is_ng_defect(d) else "ok"
                 defects_html += f"<li class='{cls}'>● {_defect_text(d)}</li>"
             defects_html += "</ul>"
         else:
