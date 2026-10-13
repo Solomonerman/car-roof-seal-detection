@@ -438,7 +438,18 @@ def _build_mosaic(proc_dir_rel):
         out.append(arr)
     ncols = 3
     rows = [np.hstack(out[i:i + ncols]) for i in range(0, len(out), ncols)]
-    mosaic = np.vstack(rows)
+    # 方案②：在拼接大图内显式区分『宽度检测组』与『偏移检测组』——加组标题条 + 红色分隔条
+    Wtotal = rows[0].shape[1]
+    label_h = max(26, int(H * 0.24))
+    div_h = max(10, int(H * 0.07))
+    nmask = sum(1 for k in kinds if k == "mask")
+    mask_rows = (nmask + ncols - 1) // ncols
+    top_label = _make_label_strip("宽度检测组（mask，按帧 04→09）", Wtotal, label_h)
+    bot_label = _make_label_strip("偏移检测组（offset，按帧 04→09）", Wtotal, label_h)
+    divider = _make_divider_strip(Wtotal, div_h)
+    top_block = [top_label] + rows[:mask_rows]
+    bot_block = [divider, bot_label] + rows[mask_rows:]
+    mosaic = np.vstack(top_block + bot_block)
     ok, buf = cv2.imencode(".png", mosaic)
     return buf.tobytes() if ok else None
 
@@ -490,6 +501,32 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
     cv2.rectangle(vis, (cx - 10, yb - 10), (cx + tw + 10, yb + th + 10), (0, 0, 0), -1)
     cv2.putText(vis, text, (cx, yb + th), cv2.FONT_HERSHEY_SIMPLEX,
                 scale, color, thick)
+
+
+def _make_label_strip(text: str, width: int, height: int):
+    """生成一行组标题条（深底白字、居中），嵌入拼接大图用于区分检测组。"""
+    strip = np.full((height, width, 3), (55, 41, 31), np.uint8)  # 与顶栏同色 #1f2937(BGR)
+    scale = max(0.5, height / 70.0)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    cx = max(4, (width - tw) // 2)
+    cy = (height + th) // 2
+    cv2.putText(strip, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2)
+    return strip
+
+
+def _make_divider_strip(width: int, height: int):
+    """生成一条红色虚线风格分隔条，隔开『宽度检测组』与『偏移检测组』。"""
+    strip = np.zeros((height, width, 3), np.uint8)
+    y = height // 2
+    thick = max(2, height // 4)
+    seg = max(14, width // 36)
+    gap = max(8, seg // 2)
+    x = 0
+    while x < width:
+        x2 = min(x + seg, width)
+        cv2.line(strip, (x, y), (x2, y), (60, 60, 220), thick)  # 红(BGR)
+        x += seg + gap
+    return strip
 
 
 def _board_cell(fn: int, label: str, url: str) -> str:
