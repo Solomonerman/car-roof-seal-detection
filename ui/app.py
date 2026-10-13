@@ -31,8 +31,8 @@ app = FastAPI(title="车顶胶条检测 - 监控")
 _db = Database()
 
 # 检测帧范围（1-indexed，与 capture/web_capture.py 的 DETECT_FRAME_FROM/TO 保持一致）：
-# web_capture.py 设定 DETECT_FRAME_FROM=4 / DETECT_FRAME_TO=9（共 6 张），UI 与其对齐。
-DET_FRAME_FROM = 4
+# 连拍 13 张中仅第 5~9 张为胶条位置、参与检测；UI 仅展示这些帧的原始照片与叠加图。
+DET_FRAME_FROM = 5
 DET_FRAME_TO = 9
 
 
@@ -243,8 +243,8 @@ def index(skid: str = Query("", description="滑橇号筛选"),
             {badge}
             <span class="meta">滑橇={r.skid} PIN={r.pin} NO_Paint={'是' if r.no_paint else '否'}</span>
           </div>
-          <div class="sec"><b>原始照片（第{DET_FRAME_FROM}~{DET_FRAME_TO}张，共{DET_FRAME_TO - DET_FRAME_FROM + 1}张）：</b><div class="row">{raw_imgs}</div></div>
-          <div class="sec hi"><b>检测结果（第{DET_FRAME_FROM}~{DET_FRAME_TO}张，共{DET_FRAME_TO - DET_FRAME_FROM + 1}张 · 胶条位置）：</b><div class="row">{ov_imgs}</div></div>
+          <div class="sec"><b>原始照片（第{DET_FRAME_FROM}~{DET_FRAME_TO}张）：</b><div class="row">{raw_imgs}</div></div>
+          <div class="sec hi"><b>检测结果（第{DET_FRAME_FROM}~{DET_FRAME_TO}张 · 胶条位置）：</b><div class="row">{ov_imgs}</div></div>
           <div class="sec"><b>缺陷判定：</b>{defects_html}</div>
         </div>
         """)
@@ -305,7 +305,7 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         <a class="reset" href="/">重置</a>
         <a class="reset" href="/board">全屏看板</a>
       </form>
-      <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（共{DET_FRAME_TO - DET_FRAME_FROM + 1}张，胶条位置），原始照片与检测叠加图同尺寸放大展示供工人目视检查。</div>
+      <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），原始照片与检测叠加图同尺寸放大展示供工人目视检查。</div>
       <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}
     </body></html>
@@ -320,11 +320,6 @@ def _frame_no(name: str) -> int:
     """从文件名/基名提取帧号（如 '04__PIN...' -> 4）。"""
     m = _re.match(r"(\d{2})", os.path.basename(str(name)))
     return int(m.group(1)) if m else 0
-
-
-def _in_detect_range(fn: int) -> bool:
-    """帧号是否落在参与检测的范围内（与 web_capture.py 对齐）。"""
-    return DET_FRAME_FROM <= fn <= DET_FRAME_TO
 
 
 def _photo_base(fname: str) -> str:
@@ -347,10 +342,8 @@ def _board_pairs(proc_dir_rel: str):
     d = os.path.join(ROOT, proc_dir_rel)
     if not os.path.isdir(d):
         return []
-    masks = {_photo_base(f): f for f in os.listdir(d)
-             if f.endswith("_mask.png") and _in_detect_range(_frame_no(f))}
-    offs = {_photo_base(f): f for f in os.listdir(d)
-            if f.endswith("_offset.png") and _in_detect_range(_frame_no(f))}
+    masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
+    offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
     bases = sorted(set(masks) | set(offs), key=_frame_no)
     summ_map = {}
     sj = os.path.join(d, "summary.json")
@@ -387,10 +380,8 @@ def _build_mosaic(proc_dir_rel):
     d = os.path.join(ROOT, proc_dir_rel)
     if not os.path.isdir(d):
         return None
-    masks = {_photo_base(f): f for f in os.listdir(d)
-             if f.endswith("_mask.png") and _in_detect_range(_frame_no(f))}
-    offs = {_photo_base(f): f for f in os.listdir(d)
-            if f.endswith("_offset.png") and _in_detect_range(_frame_no(f))}
+    masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
+    offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
     bases = sorted(set(masks) | set(offs), key=_frame_no)
     if not bases:
         return None
@@ -403,11 +394,9 @@ def _build_mosaic(proc_dir_rel):
                 summ_map[p.get("name")] = p
         except Exception:
             pass
-    tiles, kinds, oks, levels, wis, fns = [], [], [], [], [], []
-    # 按帧号顺序：每帧先宽度(mask)再偏移(offset)，便于工人对应同一张照片
-    for b in bases:
-        fn = _frame_no(b)
-        for kind, getter in (("mask", masks), ("offset", offs)):
+    tiles, kinds, oks, levels, wis = [], [], [], [], []
+    for kind, getter in (("mask", masks), ("offset", offs)):
+        for b in bases:
             f = getter.get(b)
             if f:
                 fp = os.path.join(d, f)
@@ -416,7 +405,6 @@ def _build_mosaic(proc_dir_rel):
                 arr = None
             tiles.append(arr)
             kinds.append(kind)
-            fns.append(fn)
             s = summ_map.get(b)
             oks.append(bool((s or {}).get("ok", True)))
             levels.append(int((s or {}).get("offset_level", 0) or 0))
@@ -425,19 +413,20 @@ def _build_mosaic(proc_dir_rel):
     if not valid:
         return None
     H, W = valid[0].shape[:2]
+    n = len(bases)
     out = []
-    for arr, kind, fn, ok, lv, wi in zip(tiles, kinds, fns, oks, levels, wis):
+    for idx, (arr, kind, ok, lv, wi) in enumerate(zip(tiles, kinds, oks, levels, wis)):
         if arr is None or arr.size == 0:
             arr = np.zeros((H, W, 3), np.uint8)
         elif arr.shape[:2] != (H, W):
             arr = cv2.resize(arr, (W, H))
-        label = ("宽度检测（帧%02d）" if kind == "mask" else "偏移检测（帧%02d）") % fn
+        nn = (idx % n) + 1
+        label = ("宽度检测（第%d张）" if kind == "mask" else "偏移检测（第%d张）") % nn
         _draw_caption(arr, label)
         # 宽度检测图用宽度合格/不合格上色；偏移检测图用偏移等级上色
         _draw_status(arr, ok, lv, mask=(kind == "mask"), width_in_spec=wi)
         out.append(arr)
-    # 12 张图 = 6 帧 × 2 类型；4 列 × 3 行：每行 2 帧（宽度+偏移），顺序 4/5/6/7/8/9
-    ncols = 4
+    ncols = 3
     rows = [np.hstack(out[i:i + ncols]) for i in range(0, len(out), ncols)]
     mosaic = np.vstack(rows)
     ok, buf = cv2.imencode(".png", mosaic)
@@ -445,20 +434,13 @@ def _build_mosaic(proc_dir_rel):
 
 
 def _draw_caption(vis, text):
-    """在图左上角画放大后的标题（带黑底板，保证清晰）。"""
-    H, W = vis.shape[:2]
-    scale = 3.84   # 0.48 * 8，按需求字体放大 8 倍
-    # 防溢出：标题超宽时等比缩小，绝不被裁切
-    while True:
-        thick = max(2, int(scale * 0.6))
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
-        if (tw <= W - 16 and th <= H - 16) or scale <= 0.4:
-            break
-        scale *= 0.9
+    """在图左上角画缩小后的标题（带黑底板，保证清晰）。"""
+    scale = 0.48   # 0.6 * 0.8（整体缩小20%）
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
     x0, y0 = 8, 8
     cv2.rectangle(vis, (x0, y0), (x0 + tw + 10, y0 + th + 10), (0, 0, 0), -1)
     cv2.putText(vis, text, (x0 + 5, y0 + th + 5), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (255, 255, 255), thick)
+                scale, (255, 255, 255), 2)
 
 
 def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
@@ -469,7 +451,7 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
           宽度合格 → 绿框 / 底部 OK；宽度不合格 → 红框 / 底部 NG
           （不再跟随偏移等级，避免合格宽度却被轻微/中度偏移染黄/橙）
       - 偏移检测图（mask=False）：
-          NG（任何 NG，含宽度超差/缺失/漏水风险）或 offset_level==3 → 红色
+          NG（任何 NG，含宽度超差/缺失/漏水风险）→ 红色
           OK → 跟随偏移等级配色（与照片一致）：正常=绿 / 轻微=黄 / 中度=橙
     底部 OK/NG 大字颜色与外框保持一致。
     """
@@ -480,19 +462,17 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
         color = (0, 0, 255) if ng else (0, 255, 0)   # 红 / 绿
         text = "NG" if ng else "OK"
     else:
-        # 偏移检测图：漏水风险(level 3) 强制 NG/红色；其它 NG 也红色
-        if not ok or offset_level == 3:
+        if not ok:
             color = (0, 0, 255)                          # 红
-            text = "NG"
         else:
             # 偏移等级配色（BGR，与 offset_check_v7._LEVEL_COLOR 一致）
             color = {0: (0, 255, 0),                     # 正常=绿
                      1: (0, 255, 255),                   # 轻微=黄
                      2: (0, 165, 255)}.get(offset_level, (0, 255, 0))  # 中度=橙；未知兜底绿
-            text = "OK"
+        text = "OK" if ok else "NG"
     bt = max(6, int(min(h, w) * 0.012))              # 粗边框线宽
     cv2.rectangle(vis, (0, 0), (w - 1, h - 1), color, bt)
-    scale = 4.0                                      # 还原为原尺寸（用户要求 OK/NG 不要用放大版）
+    scale = 4.0                                      # 5.0 * 0.8（整体缩小20%）
     thick = 4                                        # 加粗
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
     cx = max(4, (w - tw) // 2)

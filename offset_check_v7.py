@@ -452,11 +452,11 @@ WHITE_LINE_RADIUS = 3
 # 偏移代表线（段中心列）：青色，避开与"轻微偏移"黄色框撞色
 REP_LINE_COLOR = (255, 255, 0)
 REP_LINE_THICK = 2
-# 文字字号：按需求『检测结果的照片字体放大 8 倍』
-# 2026-10-12：在现有字号基础上 ×8，确保工控机大屏/远距离目视清晰。
-FONT_LEVEL = 35.04    # 4.38 * 8
-FONT_WIDTH = 30.0     # 3.75 * 8
-FONT_OFFSET = 30.0    # 3.75 * 8
+# 文字字号：按需求『检测结果的照片字体放大』——在原始(0.938)基础上放大约 5 倍
+# （10 倍会让文字超出图片边界被裁切，取最大不溢出值；要更大可再调）
+FONT_LEVEL = 4.38     # 5.47 * 0.8（整体缩小20%）
+FONT_WIDTH = 3.75     # 4.69 * 0.8
+FONT_OFFSET = 3.75    # 4.69 * 0.8
 # 胶条检测外轮廓（亮蓝，加粗）：保留算法检出的胶条范围，区别于报警框线/橙带；
 # 亮蓝(255,0,0) 与现有 绿/黄/橙/红框线、淡紫白线、青代表线、橙带均不重合
 SEAL_CONTOUR_COLOR = (255, 128, 0)
@@ -464,21 +464,8 @@ SEAL_CONTOUR_THICK = 3
 
 
 def _put_text_plate(vis, text, x, y, scale=0.6, color=(255, 255, 255), thickness=2):
-    """带黑色底板的文字：保证在任何背景上都清晰，且压在最上层不被覆盖。原地修改 vis。
-
-    自适应防溢出：若按给定 scale 画出的文字会超出图像边界（真实图仅 1920 宽，
-    而 ×8 级别文字可达 4000+px），则自动按比例缩小 scale，直至完整落在图内——
-    杜绝『字号调大后文字被裁切』的偏差（沙箱用假图易漏检，故此处强制自校验）。
-    """
-    H, W = vis.shape[:2]
-    max_w = W - 8
-    max_h = H - 8
-    # 先按原始 scale 量一遍，必要时等比缩小（每次 0.92），直到放得下
-    while True:
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-        if (tw <= max_w and th <= max_h) or scale <= 0.3:
-            break
-        scale *= 0.92
+    """带黑色底板的文字：保证在任何背景上都清晰，且压在最上层不被覆盖。原地修改 vis。"""
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
     pad = 4
     x0 = int(x)
     y0 = int(y) - th - pad
