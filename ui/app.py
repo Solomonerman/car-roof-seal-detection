@@ -580,13 +580,11 @@ def _board_tablerow(fn: int, s) -> str:
     lvn = s.get("offset_level_name") or "-"
     # 偏移(mm) 与 偏移等级 两列：按照片同款配色（0绿/1黄/2橙/3红），与结果图框色一致
     lvcls = {0: "lv0", 1: "lv1", 2: "lv2", 3: "lv3"}.get(lv, "")
-    dev = s.get("deviated")
     pok = s.get("ok", True)
     return (f"<tr><td>{fn:02d}</td>"
             f"<td class='{'ok' if wok else 'ng'}'>{wtxt}</td>"
             f"<td class='{'ok' if wok else 'ng'}'>{'合格' if wok else '超差'}</td>"
             f"<td class='{lvcls}'>{otxt}</td><td class='{lvcls}'>{lvn}</td>"
-            f"<td>{'是' if dev else '否'}</td>"
             f"<td class='{'ok' if pok else 'ng'}'>{'OK' if pok else 'NG'}</td></tr>")
 
 
@@ -706,7 +704,7 @@ def render_board(rec, img_url_fn=lambda u: u, live=False) -> str:
         <table>
           <thead><tr>
             <th>帧号</th><th>宽度(mm)</th><th>宽度判定</th>
-            <th>偏移(mm)</th><th>偏移等级</th><th>是否偏离</th><th>单图判定</th>
+            <th>偏移(mm)</th><th>偏移等级</th><th>单图判定</th>
           </tr></thead>
           <tbody>{tabrows}</tbody>
         </table>
