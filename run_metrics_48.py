@@ -42,9 +42,9 @@ if WORKERS < 1:
 _LOC = None  # 进程内 YOLO 定位器（worker 初始化时创建）
 SUB_REPORTS = os.path.join(OUT, "reports")
 MM = 0.30466
-SPEC = (15.0, 30.0)  # 20±5mm
-WIDTH_SPEC_LO = 15.0  # 宽度下限(mm)：段内存在 <此值 即宽度异常
-WIDTH_SPEC_HI = 30.0  # 宽度上限(mm)：段内存在 >此值 即宽度异常
+SPEC = (16.0, 32.0)  # 24±8mm
+WIDTH_SPEC_LO = 16.0  # 宽度下限(mm)：段内存在 <此值 即宽度异常
+WIDTH_SPEC_HI = 32.0  # 宽度上限(mm)：段内存在 >此值 即宽度异常
 WIDTH_MIN_RUN_COLS = 15  # 宽度连续超差列数阈值：≥此值才判真实宽度异常(抗单列噪点，与偏移偏离同思路)
 
 

@@ -37,8 +37,8 @@ DET_FRAME_TO = 9
 
 
 # 宽度规格（与 detection/seal_offset_detector.py 保持一致）
-_WIDTH_SPEC_LO = 15.0
-_WIDTH_SPEC_HI = 30.0
+_WIDTH_SPEC_LO = 16.0
+_WIDTH_SPEC_HI = 32.0
 
 # ---- 缺陷标签 → 中文 + 明细文本 ----
 _LABEL_CN = {
@@ -77,7 +77,7 @@ def _defect_text(d) -> str:
     """把一条 Defect 渲染成可读文本。
 
     每段胶条都带 照片·段号 前缀；偏移量 + 等级随每段展示（正常/轻微/中度/漏水/未检出），
-    宽度按 15~30mm 标准展示。
+    宽度按 16~32mm 标准展示。
     """
     label = d.label
     meta = d.meta or {}
@@ -201,7 +201,7 @@ def index(skid: str = Query("", description="滑橇号筛选"),
 
     cards = []
     for r in recs:
-        # 按当前标准重新判定 OK/NG（宽度 15~30mm、偏移仅漏水风险才判 NG）
+        # 按当前标准重新判定 OK/NG（宽度 16~32mm、偏移仅漏水风险才判 NG）
         rec_ok = not any(_is_ng_defect(d) for d in (r.defects or []))
         badge = ('<span class="badge ok">OK</span>' if rec_ok
                  else '<span class="badge ng">NG</span>')

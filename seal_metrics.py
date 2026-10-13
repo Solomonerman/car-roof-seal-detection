@@ -118,10 +118,10 @@ def per_column_width_mm(top, bot, mm_per_px: float = MM_PER_PX) -> np.ndarray:
     return (bot - top) * mm_per_px
 
 
-def width_stats(widths_mm: np.ndarray, spec=(15.0, 30.0)) -> dict:
+def width_stats(widths_mm: np.ndarray, spec=(16.0, 32.0)) -> dict:
     """宽度统计：中位数/均值/标准差/P5/P95/极值/公差带内占比。
 
-    spec 默认 20±5mm；in_spec_pct = 落在 [spec_low, spec_high] 的列占比(%)。
+    spec 默认 24±8mm；in_spec_pct = 落在 [spec_low, spec_high] 的列占比(%)。
     """
     v = widths_mm[np.isfinite(widths_mm)]
     if v.size == 0:

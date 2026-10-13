@@ -33,9 +33,9 @@ import offset_check_v7 as OC
 
 # ===================== 量算参数（与 run_metrics_48 一致） =====================
 MM = 0.30466
-SPEC = (15.0, 30.0)                        # 宽度规格 20±5mm
-WIDTH_SPEC_LO = 15.0
-WIDTH_SPEC_HI = 30.0
+SPEC = (16.0, 32.0)                        # 宽度规格 24±8mm
+WIDTH_SPEC_LO = 16.0
+WIDTH_SPEC_HI = 32.0
 WIDTH_MIN_RUN_COLS = 15                    # 宽度连续超差列数阈值（抗单列噪点）
 # 偏移报警：仅『漏水风险』(level=3) 才判 offset 缺陷并计 NG；中度/轻微仅展示、不判NG
 OFFSET_NG_LEVEL = 3
@@ -250,7 +250,7 @@ class SealOffsetDetector:
             box_art[idx] = dict(cmask=cmask, top=top, bot=bot, xs=xs, mid=mid,
                                 x=x, y=y, w=w, h=h, gt=None)
 
-            # 宽度缺陷：仅当『代表宽度(中值)超出规格 15~30mm』才判 NG（按需求：区间内值如 26.8 不报NG）
+            # 宽度缺陷：仅当『代表宽度(中值)超出规格 16~32mm』才判 NG（按需求：区间内值如 26.8 不报NG）
             wmedian = ws.get("median_mm")
             width_out = (wmedian is not None) and (
                 wmedian < WIDTH_SPEC_LO or wmedian > WIDTH_SPEC_HI)
