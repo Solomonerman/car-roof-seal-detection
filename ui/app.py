@@ -375,14 +375,13 @@ def _board_pairs(proc_dir_rel: str):
 
 
 def _build_mosaic(proc_dir_rel):
-    """把 12 张结果图拼成一张无缝大图（3 列 × 4 行）：上 2 行=宽度/胶条，下 2 行=偏移。
+    """把 12 张结果图拼成一张无缝大图：左半=宽度检测 2 列×3 行，右半=偏移检测 2 列×3 行。
 
-    零像素间隙；每张图：
-      - 左上角缩小标题（宽度检测（第N张）/偏移检测（第N张））
-      - 整图粗边框：
-        宽度检测图：宽度合格=绿 / 不合格=红（只看宽度，不跟随偏移等级）
-        偏移检测图：NG=红；OK=跟随偏移等级配色（正常=绿/轻微=黄/中度=橙）
-      - 底部居中 OK/NG 大字（与外框同色、加粗，字号缩小20%）
+    按 1920×1080 21 寸显示器为目标：
+      - 总宽度固定 1920，水平 4 列（每列≈478px），中间留 8px 红色分隔条
+      - 高度方向按原图比例缩放，尽量撑满剩余屏幕（给顶部信息栏+底部表格留空）
+      - 每张小图先统一缩放到相同 cell 尺寸，零黑边、零间隙
+    每张图仍保留：左上角标题、整图粗边框、底部居中 OK/NG 大字。
     返回 PNG 字节；无图返回 None。
     """
     if not proc_dir_rel:
@@ -395,6 +394,7 @@ def _build_mosaic(proc_dir_rel):
     bases = sorted(set(masks) | set(offs), key=_frame_no)
     if not bases:
         return None
+
     # 读 summary.json 拿逐图 OK / 偏移等级（用于边框与底部大字颜色）
     summ_map = {}
     sj = os.path.join(d, "summary.json")
@@ -404,52 +404,82 @@ def _build_mosaic(proc_dir_rel):
                 summ_map[p.get("name")] = p
         except Exception:
             pass
-    tiles, kinds, oks, levels, wis = [], [], [], [], []
-    for kind, getter in (("mask", masks), ("offset", offs)):
-        for b in bases:
-            f = getter.get(b)
-            if f:
-                fp = os.path.join(d, f)
-                arr = cv2.imdecode(np.fromfile(fp, dtype=np.uint8), cv2.IMREAD_COLOR)
-            else:
-                arr = None
-            tiles.append(arr)
-            kinds.append(kind)
-            s = summ_map.get(b)
-            oks.append(bool((s or {}).get("ok", True)))
-            levels.append(int((s or {}).get("offset_level", 0) or 0))
-            wis.append(bool((s or {}).get("width_in_spec", True)))
-    valid = [t for t in tiles if t is not None and t.size]
+
+    def _tile(b, kind, getter):
+        """读取单张结果图并附带汇总信息。"""
+        f = getter.get(b)
+        if f:
+            fp = os.path.join(d, f)
+            arr = cv2.imdecode(np.fromfile(fp, dtype=np.uint8), cv2.IMREAD_COLOR)
+        else:
+            arr = None
+        s = summ_map.get(b)
+        ok = bool((s or {}).get("ok", True))
+        lv = int((s or {}).get("offset_level", 0) or 0)
+        wi = bool((s or {}).get("width_in_spec", True))
+        return arr, kind, ok, lv, wi, b
+
+    mask_tiles = [_tile(b, "mask", masks) for b in bases]
+    offset_tiles = [_tile(b, "offset", offs) for b in bases]
+
+    valid = [t[0] for t in mask_tiles + offset_tiles if t[0] is not None and t[0].size]
     if not valid:
         return None
-    H, W = valid[0].shape[:2]
-    n = len(bases)
-    out = []
-    for idx, (arr, kind, ok, lv, wi) in enumerate(zip(tiles, kinds, oks, levels, wis)):
+    H0, W0 = valid[0].shape[:2]
+
+    # 目标： mosaic 宽度 1920，水平 4 列 + 中间 8px 分隔条
+    TARGET_W = 1920
+    DIV_W = 8
+    CELL_W = (TARGET_W - DIV_W) // 4          # 478
+    # 高度方向：尽量撑满剩余屏幕（topbar≈60px，底部表格≈16vh≈170px，留约 850px）
+    MAX_MOSAIC_H = 850
+    CELL_H = min(int(CELL_W * H0 / W0), MAX_MOSAIC_H // 3)
+    if CELL_H < 120:
+        CELL_H = MAX_MOSAIC_H // 3           # 保底，避免异常比例导致图太小
+
+    def _process(tile):
+        arr, kind, ok, lv, wi, b = tile
         if arr is None or arr.size == 0:
-            arr = np.zeros((H, W, 3), np.uint8)
-        elif arr.shape[:2] != (H, W):
-            arr = cv2.resize(arr, (W, H))
+            arr = np.zeros((CELL_H, CELL_W, 3), np.uint8)
+        else:
+            arr = cv2.resize(arr, (CELL_W, CELL_H))
         fn = _frame_no(b)
         label = ("宽度检测（帧%02d）" if kind == "mask" else "偏移检测（帧%02d）") % fn
         _draw_caption(arr, label)
-        # 宽度检测图用宽度合格/不合格上色；偏移检测图用偏移等级上色
         _draw_status(arr, ok, lv, mask=(kind == "mask"), width_in_spec=wi)
-        out.append(arr)
-    ncols = 3
-    rows = [np.hstack(out[i:i + ncols]) for i in range(0, len(out), ncols)]
-    # 方案②：在拼接大图内显式区分『宽度检测组』与『偏移检测组』——加组标题条 + 红色分隔条
-    Wtotal = rows[0].shape[1]
-    label_h = max(26, int(H * 0.24))
-    div_h = max(10, int(H * 0.07))
-    nmask = sum(1 for k in kinds if k == "mask")
-    mask_rows = (nmask + ncols - 1) // ncols
-    top_label = _make_label_strip("宽度检测组（mask，按帧 04→09）", Wtotal, label_h)
-    bot_label = _make_label_strip("偏移检测组（offset，按帧 04→09）", Wtotal, label_h)
-    divider = _make_divider_strip(Wtotal, div_h)
-    top_block = [top_label] + rows[:mask_rows]
-    bot_block = [divider, bot_label] + rows[mask_rows:]
-    mosaic = np.vstack(top_block + bot_block)
+        return arr
+
+    mask_imgs = [_process(t) for t in mask_tiles]
+    offset_imgs = [_process(t) for t in offset_tiles]
+
+    def _group_block(imgs, title):
+        """把 6 张图排成 2 列×3 行，并在最下方加组标题条。"""
+        rows = []
+        for i in range(0, len(imgs), 2):
+            row_imgs = imgs[i:i + 2]
+            while len(row_imgs) < 2:
+                row_imgs.append(np.zeros((CELL_H, CELL_W, 3), np.uint8))
+            rows.append(np.hstack(row_imgs))
+        label_h = max(26, int(CELL_H * 0.22))
+        title_strip = _make_label_strip(title, CELL_W * 2, label_h)
+        return np.vstack(rows + [title_strip])
+
+    mask_block = _group_block(mask_imgs, f"宽度检测（标准 {_WIDTH_SPEC_LO:.0f}~{_WIDTH_SPEC_HI:.0f}mm）")
+    offset_block = _group_block(offset_imgs, "偏移检测（正常 / 轻微 / 中度 / 漏水）")
+
+    # 中间竖向红色虚线分隔条
+    block_h = mask_block.shape[0]
+    divider = np.zeros((block_h, DIV_W, 3), np.uint8)
+    cx = DIV_W // 2
+    seg = max(14, block_h // 36)
+    gap = max(8, seg // 2)
+    y = 0
+    while y < block_h:
+        y2 = min(y + seg, block_h)
+        cv2.line(divider, (cx, y), (cx, y2), (60, 60, 220), max(2, DIV_W // 3))
+        y += seg + gap
+
+    mosaic = np.hstack([mask_block, divider, offset_block])
     ok, buf = cv2.imencode(".png", mosaic)
     return buf.tobytes() if ok else None
 
@@ -649,7 +679,7 @@ def render_board(rec, img_url_fn=lambda u: u, live=False) -> str:
                        align-items:center; justify-content:center; padding:0; }}
         .mosaicwrap img {{ width:100%; height:100%; object-fit:contain; display:block; background:#000; }}
         .mosaicwrap .ph {{ color:#888; font-size:16px; }}
-        .tablewrap {{ flex:0 0 18vh; overflow:auto; background:#fff; }}
+        .tablewrap {{ flex:0 0 16vh; overflow:auto; background:#fff; }}
         .tablewrap h3 {{ margin:6px 12px; font-size:14px; color:#333; }}
         table {{ width:100%; border-collapse:collapse; font-size:13px; }}
         th, td {{ border:1px solid #ddd; padding:4px 8px; text-align:center; }}
