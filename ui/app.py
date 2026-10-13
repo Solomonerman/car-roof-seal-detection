@@ -571,11 +571,21 @@ def _board_tablerow(fn: int, s) -> str:
     if not s:
         return (f"<tr><td>{fn:02d}</td><td colspan='5' class='muted'>"
                 f"无逐图数据</td></tr>")
-    w = s.get("width_mm")
-    wtxt = f"{w:.1f}" if w is not None else "-"
+    # 宽度列：优先展示『所有检测到的胶条段』(逗号隔开)；旧数据无该字段时回退代表值
+    ws_all = s.get("widths_all_mm") or []
+    if ws_all:
+        wtxt = ", ".join(f"{v:.1f}" for v in ws_all)
+    else:
+        w = s.get("width_mm")
+        wtxt = f"{w:.1f}" if w is not None else "-"
     wok = s.get("width_in_spec", True)
-    om = s.get("offset_mm")
-    otxt = f"{om:.1f}" if om is not None else "-"
+    # 偏移列：同理，展示所有段(逗号隔开)，无字段时回退代表值
+    offs_all = s.get("offsets_all_mm") or []
+    if offs_all:
+        otxt = ", ".join(f"{v:.1f}" for v in offs_all)
+    else:
+        om = s.get("offset_mm")
+        otxt = f"{om:.1f}" if om is not None else "-"
     lv = s.get("offset_level", -1)
     lvn = s.get("offset_level_name") or "-"
     # 偏移(mm) 与 偏移等级 两列：按照片同款配色（0绿/1黄/2橙/3红），与结果图框色一致

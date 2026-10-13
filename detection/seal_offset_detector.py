@@ -341,4 +341,11 @@ class SealOffsetDetector:
                                                       OC.OFFSET_LEVEL_UNKNOWN_NAME)
             summary["deviated"] = rep_off.get("deviated", False)
             summary["status"] = rep_off.get("status", "ok")
+        # 所有段宽度/偏移列表：供看板表格『宽度/偏移』列逗号展示全部胶条数据
+        summary["widths_all_mm"] = [box_art[i].get("width_mm")
+                                   for i in present
+                                   if box_art[i].get("width_mm") is not None]
+        summary["offsets_all_mm"] = [r.get("offset_mm")
+                                    for r in off_recs
+                                    if r.get("offset_mm") is not None]
         return defects, summary
