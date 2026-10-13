@@ -37,7 +37,7 @@ class Defect:
 
     label 取值：
       seal      : 正常检出的胶条段（信息，不计入 NG）
-      width     : 宽度超出 20±5mm
+      width     : 宽度超出 16~32mm（24±8）
       missing   : ROI 内整段无胶条
       break     : 断胶（纵向空洞 / 段间间隙离群）
       overspray : 过喷（主胶条附近离散暗斑）

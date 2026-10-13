@@ -9,7 +9,7 @@
   Step4.5 形态学开闭运算：闭运算填充胶条内部反光孔洞，开运算平滑边缘
 
 缺陷判定（用户定义）：
-  - 宽度 width   : 每段胶条横向厚度，mm；超出 20±5mm 报警
+  - 宽度 width   : 每段胶条横向厚度，mm；超出 16~32mm（24±8）报警
   - 缺失 missing : ROI 内整段无胶条
   - 断胶 break   : 胶条内部纵向空洞，或段间间隙显著大于本图常态（离群）
   - 过喷 overspray: 主胶条附近的离散暗斑（非连续的额外喷胶）
@@ -76,8 +76,8 @@ DEFAULT_MM_PER_PIXEL = 0.30466   # 兜底：标定文件缺失时使用（左侧
 
 SEAL_WIDTH_NOMINAL_MM = 20.0
 SEAL_WIDTH_TOL_MM = 5.0
-SEAL_WIDTH_MIN_MM = SEAL_WIDTH_NOMINAL_MM - SEAL_WIDTH_TOL_MM   # 15
-SEAL_WIDTH_MAX_MM = SEAL_WIDTH_NOMINAL_MM + SEAL_WIDTH_TOL_MM   # 25
+SEAL_WIDTH_MIN_MM = 16.0   # 宽度报警下限(mm)，与 seal_offset_detector.WIDTH_SPEC_LO 保持一致（原 15）
+SEAL_WIDTH_MAX_MM = 32.0   # 宽度报警上限(mm)，与 seal_offset_detector.WIDTH_SPEC_HI 保持一致（原 25）
 
 # ===================== 缺陷判定参数 =====================
 MAIN_LINE_MIN_WIDTH_PX = 40     # 横向跨度 > 此值（px）视为主胶条段，否则可能是过喷/噪声
