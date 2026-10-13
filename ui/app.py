@@ -147,7 +147,7 @@ def _overlay_urls(proc_dir: str) -> list:
     d = os.path.join(ROOT, proc_dir)
     if not os.path.isdir(d):
         return []
-    return sorted(glob.glob(os.path.join(d, "*_overlay.png")))
+    return sorted(glob.glob(os.path.join(d, "*_overlay.png")), reverse=True)
 
 
 @app.get("/api/records")
@@ -344,7 +344,7 @@ def _board_pairs(proc_dir_rel: str):
         return []
     masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
     offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
-    bases = sorted(set(masks) | set(offs), key=_frame_no)
+    bases = sorted(set(masks) | set(offs), key=_frame_no, reverse=True)
     summ_map = {}
     sj = os.path.join(d, "summary.json")
     if os.path.isfile(sj):
@@ -382,7 +382,7 @@ def _build_mosaic(proc_dir_rel):
         return None
     masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
     offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
-    bases = sorted(set(masks) | set(offs), key=_frame_no)
+    bases = sorted(set(masks) | set(offs), key=_frame_no, reverse=True)
     if not bases:
         return None
     # 读 summary.json 拿逐图 OK / 偏移等级（用于边框与底部大字颜色）
@@ -590,14 +590,14 @@ def render_board(rec, img_url_fn=lambda u: u, live=False) -> str:
         html, body {{ margin:0; height:100%; }}
         body {{ display:flex; flex-direction:column; height:100vh;
                font-family: Arial, "Microsoft YaHei", sans-serif; background:#111; }}
-        .topbar {{ flex:0 0 auto; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-                  padding:8px 14px; background:#1f2937; color:#fff; font-size:14px; }}
-        .topbar .model {{ background:#374151; padding:2px 10px; border-radius:4px; }}
-        .topbar .meta {{ color:#9ca3af; font-size:12px; }}
-        .topbar .badge {{ padding:2px 12px; border-radius:12px; color:#fff; font-weight:bold; }}
+        .topbar {{ flex:0 0 auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+                  padding:10px 16px; background:#1f2937; color:#fff; font-size:28px; }}
+        .topbar .model {{ background:#374151; padding:4px 14px; border-radius:6px; }}
+        .topbar .meta {{ color:#9ca3af; }}
+        .topbar .badge {{ padding:5px 18px; border-radius:14px; color:#fff; font-weight:bold; }}
         .topbar .badge.ok {{ background:#2e9e4f; }}
         .topbar .badge.ng {{ background:#d23b3b; }}
-        .topbar a {{ color:#60a5fa; font-size:13px; margin-left:auto; text-decoration:none; }}
+        .topbar a {{ color:#60a5fa; margin-left:auto; text-decoration:none; }}
         .mosaicwrap {{ flex:1 1 auto; min-height:0; background:#000; display:flex;
                        align-items:center; justify-content:center; padding:0; }}
         .mosaicwrap img {{ width:100%; height:100%; object-fit:contain; display:block; background:#000; }}
