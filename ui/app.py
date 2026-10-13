@@ -147,7 +147,7 @@ def _overlay_urls(proc_dir: str) -> list:
     d = os.path.join(ROOT, proc_dir)
     if not os.path.isdir(d):
         return []
-    return sorted(glob.glob(os.path.join(d, "*_overlay.png")), reverse=True)
+    return sorted(glob.glob(os.path.join(d, "*_overlay.png")), key=_frame_no)
 
 
 @app.get("/api/records")
@@ -344,7 +344,7 @@ def _board_pairs(proc_dir_rel: str):
         return []
     masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
     offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
-    bases = sorted(set(masks) | set(offs), key=_frame_no, reverse=True)
+    bases = sorted(set(masks) | set(offs), key=_frame_no)
     summ_map = {}
     sj = os.path.join(d, "summary.json")
     if os.path.isfile(sj):
@@ -382,7 +382,7 @@ def _build_mosaic(proc_dir_rel):
         return None
     masks = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_mask.png")}
     offs = {_photo_base(f): f for f in os.listdir(d) if f.endswith("_offset.png")}
-    bases = sorted(set(masks) | set(offs), key=_frame_no, reverse=True)
+    bases = sorted(set(masks) | set(offs), key=_frame_no)
     if not bases:
         return None
     # 读 summary.json 拿逐图 OK / 偏移等级（用于边框与底部大字颜色）
