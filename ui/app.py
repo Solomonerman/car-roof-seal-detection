@@ -31,8 +31,8 @@ app = FastAPI(title="车顶胶条检测 - 监控")
 _db = Database()
 
 # 检测帧范围（1-indexed，与 capture/web_capture.py 的 DETECT_FRAME_FROM/TO 保持一致）：
-# 连拍 13 张中仅第 5~9 张为胶条位置、参与检测；UI 仅展示这些帧的原始照片与叠加图。
-DET_FRAME_FROM = 5
+# 连拍 13 张中第 4~9 张为胶条位置、参与检测；UI 仅展示这些帧的原始照片与叠加图。
+DET_FRAME_FROM = 4
 DET_FRAME_TO = 9
 
 
@@ -420,8 +420,8 @@ def _build_mosaic(proc_dir_rel):
             arr = np.zeros((H, W, 3), np.uint8)
         elif arr.shape[:2] != (H, W):
             arr = cv2.resize(arr, (W, H))
-        nn = (idx % n) + 1
-        label = ("宽度检测（第%d张）" if kind == "mask" else "偏移检测（第%d张）") % nn
+        fn = _frame_no(b)
+        label = ("宽度检测（帧%02d）" if kind == "mask" else "偏移检测（帧%02d）") % fn
         _draw_caption(arr, label)
         # 宽度检测图用宽度合格/不合格上色；偏移检测图用偏移等级上色
         _draw_status(arr, ok, lv, mask=(kind == "mask"), width_in_spec=wi)
@@ -517,6 +517,23 @@ def _board_state_key(rec) -> str:
     """当前车的唯一标识（时间|滑橇|PIN|过程目录），用于判断『是否换了一台新车』。"""
     return "|".join([str(rec.timestamp or ""), str(rec.skid or ""),
                      str(rec.pin or ""), str(rec.proc_dir or "")])
+
+
+def _latest_board_record(limit: int = 100):
+    """返回最近一台『已检测车辆』(captured=True 且有过程目录) 的记录，供看板展示。
+
+    关键：免检 / 未接入车型(captured=False)不产生检测结果，看板【不展示、也不覆盖】
+    当前已检测车辆；仅当下一台车也是『需要检测的车辆』(captured=True) 且其检测【全部完成】
+    后才允许覆盖。
+
+    实现依据：web_capture 在检测全部完成（写出 _mask/_offset.png 与 summary.json）之后才落库，
+    故 captured=True 的记录天然满足『结果已全部生成』——看板切换到的必是完整结果，
+    不会出现『半截结果』覆盖正在看的车。
+    """
+    for r in _db.get_records(limit=limit):
+        if r.captured and r.proc_dir:
+            return r
+    return None
 
 
 def render_board(rec, img_url_fn=lambda u: u, live=False) -> str:
@@ -624,11 +641,14 @@ def render_board(rec, img_url_fn=lambda u: u, live=False) -> str:
 
 @app.get("/board_state")
 def board_state():
-    """轻量状态接口：返回当前最新车的标识，供看板前端判断是否『换新车』（仅在车完成时才覆盖）。"""
-    recs = _db.get_records(limit=1)
-    if not recs:
+    """轻量状态接口：返回当前最新『已检测车辆』的标识，供看板前端判断是否『换新车』。
+
+    仅对 captured=True 的车返回 key；免检 / 未接入车被跳过——看板维持上一台已检测车辆、不被覆盖。
+    仅在下一台检测车全部检测完成（落库后）其 key 才会变化，进而触发前端重载覆盖。
+    """
+    rec = _latest_board_record()
+    if rec is None:
         return {"has": False, "key": ""}
-    rec = recs[0]
     return {"has": True, "key": _board_state_key(rec),
             "timestamp": rec.timestamp, "model": rec.car_model,
             "skid": rec.skid, "pin": rec.pin}
@@ -636,9 +656,10 @@ def board_state():
 
 @app.get("/board", response_class=HTMLResponse)
 def board():
-    recs = _db.get_records(limit=1)
-    if not recs:
+    # 仅展示最近一台『已检测车辆』；免检 / 未接入车(captured=False)不展示、不覆盖当前结果
+    rec = _latest_board_record()
+    if rec is None:
         return HTMLResponse("<html><body style='font-family:sans-serif;padding:20px'>"
                            "暂无检测记录</body></html>")
-    # live=True：注入轮询脚本，仅新车完成才重新加载（避免定时刷新覆盖正在看的车）
-    return HTMLResponse(render_board(recs[0], live=True))
+    # live=True：注入轮询脚本，仅『下一台检测车完成』才重新加载（避免覆盖正在看的车）
+    return HTMLResponse(render_board(rec, live=True))
