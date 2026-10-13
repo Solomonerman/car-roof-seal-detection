@@ -317,8 +317,16 @@ _BOARD_REFRESH_SEC = 5   # 看板轮询间隔(秒)：仅用于检测『是否换
 
 
 def _frame_no(name: str) -> int:
-    """从文件名/基名提取帧号（如 '04__PIN...' -> 4）。"""
-    m = _re.match(r"(\d{2})", os.path.basename(str(name)))
+    """从文件名/基名提取帧号（按 web_capture._format_filename 的真实格式）。
+
+    真实文件名：{prefix}_{idx:02d}__p{VERSION}__{时间戳}.png
+      例：'Image_04__p20261013__2026-10-13__11-12-50-123.png' -> 4
+    帧号位于 prefix 之后、首个 '__' 之前；用"下划线+两位数字+双下划线"精确提取，
+    避免误匹配时间戳（如 '__2026'）里的数字。
+    （旧实现用"开头两位数字"匹配，而真实文件名以 prefix 开头，
+     导致永远匹配失败、帧号恒为 0、排序退化为 listdir 任意顺序——即照片乱序且不稳定。）
+    """
+    m = _re.search(r"_(\d{2})__", os.path.basename(str(name)))
     return int(m.group(1)) if m else 0
 
 
