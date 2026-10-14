@@ -1151,14 +1151,59 @@ class CameraHub:
 
 
 # ===================== PLC 自动触发回调（仅 --plc-auto）=====================
-def _run_detection(model, key, image_paths, ts_dt):
+def _safe_name(s):
+    """把任意字符串变成文件名安全片段（PIN/滑橇可能含特殊字符）。"""
+    s = "" if s is None else str(s)
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", s).strip("_")
+    return s[:40] or "x"
+
+
+def _mark_proc_dir(proc_dir_rel, det):
+    """检测结论已知后，给 process_data 文件夹追加结果后缀，便于现场按名找 NG 车。
+
+    - det.ok == False（真实检测出缺陷）→ 追加 _NG
+    - 否则若含 loc_warn 缺陷（c640701：定位/白线拟合失败，虽不判 NG 但不可靠）→ 追加 _RECHECK
+    - 正常车不加后缀
+    仅改文件夹名并返回（可能更新后的）相对路径；不动任何文件内容。
+    调用方拿到返回的新名后写库，看板据此路径读取，完全安全可逆。
+    """
+    if not proc_dir_rel or det is None:
+        return proc_dir_rel
+    abs_path = os.path.join(ROOT, proc_dir_rel)
+    if not os.path.isdir(abs_path):
+        return proc_dir_rel
+    # 已带结果后缀（重跑/重复信号）则幂等返回，避免 _NG_NG 之类的叠加
+    if os.path.basename(proc_dir_rel).endswith(("_NG", "_RECHECK")):
+        return proc_dir_rel
+    if not det.ok:
+        suffix = "_NG"
+    elif any(getattr(d, "label", "") == "loc_warn"
+             for d in (det.defects or [])):
+        suffix = "_RECHECK"
+    else:
+        return proc_dir_rel
+    new_abs = abs_path + suffix
+    new_rel = proc_dir_rel + suffix
+    if os.path.exists(new_abs):          # 已标记过（重跑等），直接返回新名
+        return new_rel
+    try:
+        os.rename(abs_path, new_abs)
+        return new_rel
+    except Exception as e:
+        print(f"[命名] 结果标记重命名失败(保留原名): {e}")
+        return proc_dir_rel
+
+
+def _run_detection(model, key, image_paths, ts_dt, skid=None, pin=""):
     """拍照后跑真实检测，返回 (DetectionResult, proc_dir_rel)。
 
     设计约束：只“读图 + 算”，绝不碰相机/拍摄任何逻辑。
       - key 经 router 命中检测器（当前 8X / NM 开头）→ SealOffsetDetector 跑真实检测；
         未命中（9X/未知）→ 占位“算法未接入”，仅拍照存档。
-      - proc_dir_rel 为相对 ROOT 的目录（data/process_data/<时间>_<key>），
-        内含 detector 生成的 mask/叠加图，供 ui/app.py 可视化读取。
+      - proc_dir_rel 为相对 ROOT 的目录
+        （data/process_data/<时间>_<车型>_<滑橇>_<PIN>），
+        内含 detector 生成的 mask/叠加图，供 ui/app.py 可视化读取；
+        检测完成、结论已知后由 _mark_proc_dir 追加 _NG / _RECHECK 后缀。
     检测异常不致命：捕获后回退占位，保证拍照/落库链路不中断。
     """
     from detection.router import get_detector
@@ -1177,8 +1222,12 @@ def _run_detection(model, key, image_paths, ts_dt):
                                                 meta={"reason": "算法未接入"})],
                                 confidence=0.0, message="拍照存档·算法未接入"), ""
 
-    proc_dir_rel = os.path.join("data", "process_data",
-                                 f"{ts_dt.strftime('%Y%m%d_%H%M%S')}_{key}")
+    parts = [ts_dt.strftime("%Y%m%d_%H%M%S"), _safe_name(key)]
+    if skid:
+        parts.append(_safe_name(skid))
+    if pin:
+        parts.append(_safe_name(pin))
+    proc_dir_rel = os.path.join("data", "process_data", "_".join(parts))
     proc_dir_abs = os.path.join(ROOT, proc_dir_rel)
     try:
         det = detector.detect(car_model=model, images=image_paths,
@@ -1257,7 +1306,11 @@ def handle_car_signal(ctx):
     paths = [os.path.join(SAVE_DIR, f) for f in files]
     detect_paths = paths[DETECT_FRAME_FROM - 1: DETECT_FRAME_TO] \
         if len(paths) >= DETECT_FRAME_FROM else []
-    det, proc_dir = _run_detection(model, key, detect_paths, ts_dt)
+    det, proc_dir = _run_detection(model, key, detect_paths, ts_dt,
+                                  skid=skid, pin=pin)
+    # 检测结论已出：给 process_data 文件夹追加 _NG / _RECHECK 后缀（便于现场按名找 NG 车）；
+    # 返回的新路径随后写库，看板据此读取，完全安全可逆。
+    proc_dir = _mark_proc_dir(proc_dir, det)
 
     # 落库（含 skid/pin/no_paint/captured）；StorageService 内部按 日期/PIN 分层、
     # 去重移动、轮转，并返回该车文件夹路径
