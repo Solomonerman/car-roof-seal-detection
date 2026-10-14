@@ -89,7 +89,10 @@ def _classify(name):
 
 
 def _db_lookup(old_rel):
-    """按旧 proc_dir（兼容 / 与 \\ 两种分隔）反查 timestamp/skid/pin。
+    """按旧 proc_dir（兼容 / 与 \\ 两种分隔，以及数据库里可能存的绝对路径）反查 timestamp/skid/pin。
+    工控机历史记录里 proc_dir 可能存成绝对路径（E:\\dev\\...\\data\\process_data\\车名），
+    而迁移脚本传入的是相对路径（data/process_data/车名），因此必须把相对路径也换算成
+    基于 ROOT 的绝对路径一并匹配，否则查不到 -> 新名退化成原样、看起来“没改”。
     若旧名含 PIN（pin_车型），再退一步用 pin 反查（取最新一条）。
     返回 (timestamp_iso, skid, pin)，取不到的字段为 None。
     """
@@ -97,12 +100,16 @@ def _db_lookup(old_rel):
         return None, None, None
     old_fwd = old_rel.replace("\\", "/")
     old_bwd = old_rel.replace("/", "\\")
+    # 绝对路径两种分隔：基于 ROOT 推算
+    abs_fwd = os.path.abspath(os.path.join(ROOT, old_fwd)).replace("\\", "/")
+    abs_bwd = os.path.abspath(os.path.join(ROOT, old_fwd)).replace("/", "\\")
+    forms = [old_fwd, old_bwd, abs_fwd, abs_bwd]
     try:
         with sqlite3.connect(DB_PATH) as conn:
             row = conn.execute(
                 "SELECT timestamp, skid, pin FROM records "
-                "WHERE proc_dir=? OR proc_dir=?",
-                (old_fwd, old_bwd)).fetchone()
+                "WHERE proc_dir IN (%s)" % ",".join("?" * len(forms)),
+                forms).fetchone()
             if row and (row[0] or row[1] or row[2]):
                 return row[0], row[1], row[2]
             m = PINKEY_RE.match(os.path.basename(old_fwd))
@@ -236,12 +243,15 @@ def main():
             continue
         old_rel_fwd = os.path.join("data", "process_data", name).replace("\\", "/")
         old_rel_bwd = old_rel_fwd.replace("/", "\\")
+        old_abs_fwd = os.path.abspath(os.path.join(ROOT, "data", "process_data", name)).replace("\\", "/")
+        old_abs_bwd = os.path.abspath(os.path.join(ROOT, "data", "process_data", name)).replace("/", "\\")
         new_rel_fwd = os.path.join("data", "process_data", new_name).replace("\\", "/")
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE records SET proc_dir=? WHERE proc_dir=? OR proc_dir=?",
-                    (new_rel_fwd, old_rel_fwd, old_rel_bwd))
+                    "UPDATE records SET proc_dir=? "
+                    "WHERE proc_dir IN (?,?,?,?)",
+                    (new_rel_fwd, old_rel_fwd, old_rel_bwd, old_abs_fwd, old_abs_bwd))
                 conn.commit()
         except Exception as e:
             print("   [警告] 数据库 proc_dir 更新失败（文件夹已改名）: %s" % e)
