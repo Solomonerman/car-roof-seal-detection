@@ -138,12 +138,14 @@ class SealOffsetDetector:
                         "width_mm": None, "width_in_spec": False, "offset_mm": None,
                         "offset_level": OC.OFFSET_LEVEL_UNKNOWN,
                         "offset_level_name": OC.OFFSET_LEVEL_UNKNOWN_NAME,
-                        "deviated": False, "status": "error", "ok": False}
+                        "deviated": False, "status": "error", "ok": False,
+                        "loc_ok": False, "wl_ok": False, "reliable": False}
             all_defects.extend(defects)
             per_photo.append(summ)
 
         ng = [d for d in all_defects if d.label in NG_LABELS]
         ok = len(ng) == 0
+        loc_ok = not any(d.label == "loc_warn" for d in all_defects)  # 全部帧定位/白线均成功
         conf = round(float(np.mean([d.confidence for d in all_defects]))
                      if all_defects else 0.9, 3)
         # 有效检出段数：成功分割出胶条(mask 非空)的 ROI 段，
@@ -164,7 +166,8 @@ class SealOffsetDetector:
                 import json as _json
                 _sp = os.path.join(process_dir, "summary.json")
                 with open(_sp, "w", encoding="utf-8") as _f:
-                    _json.dump({"per_photo": per_photo, "ok": ok, "message": msg},
+                    _json.dump({"per_photo": per_photo, "ok": ok,
+                                "loc_ok": loc_ok, "message": msg},
                                _f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f"[SealOffset] 逐图汇总写入失败 {process_dir}: {e}")
@@ -186,15 +189,20 @@ class SealOffsetDetector:
                        "width_mm": None, "width_in_spec": False, "offset_mm": None,
                        "offset_level": OC.OFFSET_LEVEL_UNKNOWN,
                        "offset_level_name": OC.OFFSET_LEVEL_UNKNOWN_NAME,
-                       "deviated": False, "status": "no_image", "ok": False}
+                       "deviated": False, "status": "no_image", "ok": False,
+                       "loc_ok": False, "wl_ok": False, "reliable": False}
             return [d], summary
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        ih, iw = gray.shape[:2]
         boxes = self._loc.locate(bgr)
-        if not boxes:
+        loc_failed = (len(boxes) == 0)     # YOLO/红框未定位到任何胶条框
+        if loc_failed:
             # 无定位框：整图兜底为单一 ROI（现场无标注框 / 定位失败时不致整图漏检）
-            h, w = gray.shape[:2]
-            boxes = [(0, 0, w, h)]
+            # 注意：整图兜底结果不可靠，下面不再据此自动判 NG，仅打标+日志交由人工复核
+            print(f"[SealOffset][WARN] 帧 {os.path.basename(path)} "
+                  f"未定位到胶条框，退回整图兜底(结果不可靠, 不判NG)")
+            boxes = [(0, 0, iw, ih)]
 
         clean = _inpaint_frames(bgr)
         try:
@@ -203,6 +211,10 @@ class SealOffsetDetector:
         except Exception as e:
             print(f"[SealOffset] fit_white_line 失败: {e}")
             wl = None
+        wl_failed = (wl is None)        # 白线拟合失败 → 偏移量不可靠
+        if wl_failed:
+            print(f"[SealOffset][WARN] 帧 {os.path.basename(path)} "
+                  f"白线拟合失败, 偏移量不可靠(不判offset NG)")
 
         n = len(boxes)
         off_recs = []
@@ -251,10 +263,11 @@ class SealOffsetDetector:
                                 x=x, y=y, w=w, h=h, gt=None)
 
             # 宽度缺陷：仅当『代表宽度(中值)超出规格 16~32mm』才判 NG（按需求：区间内值如 26.8 不报NG）
+            # 若本帧定位失败(整图兜底)，宽度量无意义，不据此判 NG（交由人工复核）
             wmedian = ws.get("median_mm")
             width_out = (wmedian is not None) and (
                 wmedian < WIDTH_SPEC_LO or wmedian > WIDTH_SPEC_HI)
-            width_problem = bool(width_out)
+            width_problem = bool(width_out) and (not loc_failed)
             if width_problem:
                 defects.append(Defect(x, y, w, h, "width", 0.85,
                                      meta={"width_mm": wmedian,
@@ -263,22 +276,32 @@ class SealOffsetDetector:
             else:
                 defects.append(Defect(x, y, w, h, "seal", 0.85,
                                      meta={"width_mm": wmedian,
+                                           "loc_unreliable": loc_failed,
                                            **seg_meta}))
 
             # 把宽度信息挂到 box_art，供结果图画宽度标注（与本地 detector.py 对齐）
             box_art[idx]["width_mm"] = wmedian
-            box_art[idx]["width_in_spec"] = (not width_problem)
+            # 定位失败(整图兜底)时宽度不可信，过程图不标红(避免误导)，靠 loc_warn 提示不可靠
+            box_art[idx]["width_in_spec"] = (not width_problem) and (not loc_failed)
 
             # 偏移缺陷（核心漏水风险指标）：仅『漏水风险』(level=3) 才单独置 NG；
             # 中度/轻微仅展示（已挂在上面 seal/width 的 offset_* 字段），不判NG。
             # 该独立 offset 缺陷仅用于驱动整记录/整图 NG（总览显示时跳过，避免与上面重复）。
-            if orec.get("status") == "ok" and lv >= OFFSET_NG_LEVEL:
+            # 若本帧定位失败或白线拟合失败，偏移量不可靠，不据此判 NG。
+            if (not loc_failed and not wl_failed
+                    and orec.get("status") == "ok" and lv >= OFFSET_NG_LEVEL):
                 defects.append(Defect(x, y, w, h, "offset", 0.9,
                                      meta={"offset_mm": off_mm,
                                            "offset_level": lv,
                                            "offset_level_name": off_name,
                                            "deviated": dev,
                                            "photo": photo_name, "seg": side}))
+
+        # 定位失败/白线拟合失败：追加『不可靠』标记(非NG)，供看板/日志提示需人工复核
+        if loc_failed or wl_failed:
+            defects.append(Defect(0, 0, iw, ih, "loc_warn", 0.95,
+                                 meta={"reason": "定位失败" if loc_failed else "白线拟合失败",
+                                       "loc_failed": loc_failed, "wl_failed": wl_failed}))
 
         # —— 过程图（存到 web_capture 传入的 process_dir）——
         if process_dir:
@@ -325,6 +348,9 @@ class SealOffsetDetector:
             "deviated": False,
             "status": "ok",
             "ok": not any(d.label in NG_LABELS for d in defects),
+            "loc_ok": not loc_failed,
+            "wl_ok": not wl_failed,
+            "reliable": not (loc_failed or wl_failed),
         }
         present = [i for i in range(len(boxes)) if i in box_art]
         if present:
