@@ -131,13 +131,50 @@ def _is_ng_defect(d) -> bool:
     return False
 
 
-def _img_url(ref: str) -> str:
-    """把 storage 返回的 ref（seal-images/...）转成 /img 可读取的相对路径。"""
-    if ref.startswith("seal-images/"):
-        rel = ref[len("seal-images/"):]
-    else:
-        rel = ref
-    return "/img?path=" + INSPECTION_LOCAL.replace("\\", "/") + "/" + rel.replace("\\", "/")
+def _ref_to_rel(ref: str, proc_dir_rel: str = "") -> str:
+    """把 storage 返回的 image_refs 转成『相对 ROOT 的安全相对路径』(含 data/ 前缀)。
+
+    兼容历史上出现过的多种存法，避免旧车照片在 / 页面黑框：
+      - 当前/历史标准：seal-images/<日期>/<车>/<名>  -> data/inspection/<...>
+      - 已含项目相对前缀：data/inspection/...          -> 原样(防重复前缀)
+      - 绝对项目路径：E:\\dev\\...\\data\\inspection\\... -> 切回 data/inspection/...
+      - 裸文件名等无法定位的：返回 None(由 _img_url 降级为图片占位)
+    斜杠统一为 '/'；绝不产生跳出 ROOT 的路径（防目录穿越）。
+    """
+    if not ref:
+        return None
+    s = ref.replace("\\", "/").strip()
+    if s.startswith("seal-images/"):
+        return "data/inspection/" + s[len("seal-images/"):]
+    if s.startswith("data/"):
+        return s
+    # 绝对路径（含 Windows 盘符 或 os.path.isabs）
+    if s[1:2] == ":" or os.path.isabs(s):
+        norm = os.path.normpath(s)
+        root_norm = os.path.normpath(ROOT)
+        if norm.startswith(root_norm):
+            rel = os.path.relpath(norm, root_norm).replace("\\", "/")
+            return rel if rel.startswith("data/") else "data/inspection/" + rel
+        # 不在 ROOT 内，但含已知数据基目录，则截取尾部（如 E:\dev\...\data\inspection\...）
+        low = s.lower()
+        for base in ("data/inspection/", "data/process_data/"):
+            i = low.find(base)
+            if i >= 0:
+                return s[i:]
+        return None
+    # 其它（裸文件名等）：返回 None，由 _img_url 降级
+    return None
+
+
+def _img_url(ref: str, proc_dir_rel: str = "") -> str:
+    """把 storage 返回的 ref 转成 /img 可读取的相对路径（兼容历史多种存法）。"""
+    rel = _ref_to_rel(ref, proc_dir_rel)
+    if not rel:
+        # 降级：保持旧行为，避免未知格式直接崩；尽量落到 data/inspection 下
+        rel = ref.replace("\\", "/")
+        if not rel.startswith("data/"):
+            rel = INSPECTION_LOCAL.replace("\\", "/") + "/" + rel
+    return "/img?path=" + rel
 
 
 def _overlay_urls(proc_dir: str) -> list:
