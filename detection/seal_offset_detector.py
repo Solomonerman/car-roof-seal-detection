@@ -321,11 +321,22 @@ class SealOffsetDetector:
                                   + np.array(SEAL_CYAN_BGR, np.float32) * SEAL_ALPHA).astype(np.uint8)
                     # 外框：红色，加粗一号
                     cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 5)
-                    # 宽度信息：中值宽度(mm)，统一白色（与 _offset.png 一致，不区分合格/超差）
+                    # 宽度信息：中值宽度(mm)；16~32mm 规格内白色，超出规格红色
                     wmm = art.get("width_mm")
                     if wmm is not None:
-                        OC._put_text_plate(vis, f"W={wmm:.1f}mm", cx, max(20, cy - 8),
-                                          scale=OC.FONT_WIDTH, color=(255, 255, 255), thickness=2)
+                        _w_in = 16.0 <= wmm <= 32.0
+                        _w_color = (255, 255, 255) if _w_in else (0, 0, 255)
+                        _w_txt = f"W={wmm:.1f}mm"
+                        _w_y = max(20, cy - 8)
+                        if not _w_in:
+                            # 紧邻上方标注『宽度异常』(红，字体=宽度字体50%)
+                            (_w_tw, _w_th), _ = cv2.getTextSize(
+                                _w_txt, cv2.FONT_HERSHEY_SIMPLEX, OC.FONT_WIDTH, 2)
+                            OC._put_text_plate(
+                                vis, "宽度异常", cx, _w_y - _w_th - 6,
+                                scale=OC.FONT_WIDTH * 0.5, color=(0, 0, 255), thickness=2)
+                        OC._put_text_plate(vis, _w_txt, cx, _w_y,
+                                          scale=OC.FONT_WIDTH, color=_w_color, thickness=2)
                 cv2.imwrite(os.path.join(process_dir, base + "_mask.png"), vis)
                 # 橙色带偏移图（与 0921 验证一致）
                 if off_recs:

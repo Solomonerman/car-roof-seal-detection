@@ -577,10 +577,19 @@ def draw_offset_vis(bgr, boxes, off_recs, mm_per_px=MM_PER_PX, seg_arts=None):
                 txt += f" {wip:.0f}%"
             if r.get("width_problem"):
                 txt += " 宽异"
+            _w_in = 16.0 <= wm <= 32.0
+            _w_color = (255, 255, 255) if _w_in else (0, 0, 255)
             ty = y + h + 18
             if ty + 6 > H:          # 框贴底：文字改到框上方，避免被裁切/被盖
                 ty = y - 30
-            _put_text_plate(vis, txt, x, ty, scale=FONT_WIDTH, color=(255, 255, 255), thickness=2)
+            _put_text_plate(vis, txt, x, ty, scale=FONT_WIDTH, color=_w_color, thickness=2)
+            if not _w_in:
+                # 紧邻上方标注『宽度异常』(红，字体=宽度字体50%)
+                (_w_tw, _w_th), _ = cv2.getTextSize(
+                    txt, cv2.FONT_HERSHEY_SIMPLEX, FONT_WIDTH, 2)
+                _w_label_y = ty - _w_th - 6
+                _put_text_plate(vis, "宽度异常", x, _w_label_y,
+                                scale=FONT_WIDTH * 0.5, color=(0, 0, 255), thickness=2)
     return vis
 
 
