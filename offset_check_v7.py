@@ -40,6 +40,18 @@ WHITE_DEPTH_MAX = 150      # 扫描终止深度(px)
 WHITE_DEPTH_LO = 15        # v6：有效白线深度下限(px)。稳定点出现过浅(贴胶条底沿)=该列不可靠，丢弃
 WHITE_DEPTH_HI = 110       # v6：有效白线深度上限(px)。稳定点出现过深=误抓远处车身亮带，丢弃
 
+# ---------- 安全条件锚定（仅针对 04 类"浅稳定带误报"症状）----------
+# 思路：纯第一类在"胶条下方多了一截浅稳定带"的图片上会把白线锁浅 -> 偏移偏小误报。
+# 症状=存在某段白线深度<SHALLOW_THR 且另一段>RELIABLE_THR 且差距>MIN_GAP。
+# 触发时只借"可靠段"(列多且深度稳)的点拟合全局线，修正浅段高度；
+# 但先用"第二根白线验证"确认浅段下方确实存在真实白线(在可靠段深度附近有稳定带)，
+# 才借线——否则该段白线确实是真浅(真实缺陷)就不借，保留第一类判定(不掩盖真实漏水)。
+WHITE_SAFE_SHALLOW_THR = 45.0   # 段白线中位深度 < 此值 = 疑似浅稳定带
+WHITE_SAFE_RELIABLE_THR = 50.0  # 段白线中位深度 > 此值 = 候选可靠段
+WHITE_SAFE_MIN_GAP = 15.0       # 浅段与可靠段深度差 > 此值 才判症状
+WHITE_SAFE_DEEP_TOL = 25.0      # 第二根白线验证：在 可靠段深度±TOL 窗口内搜稳定带
+WHITE_SAFE_DEEP_FRAC = 0.50     # 浅段内有此比例以上列在窗口内找到稳定带 = 确认存在真实白线
+
 RANSAC_SEED = 12345         # 固定种子：让 RANSAC 直线降级可复现（否则每次随机抽中不同内点，偏移乱跳）
 
 # ---------- 偏移公差带与偏离判定（用户拍板）----------
@@ -231,7 +243,8 @@ def detect_white_pts(gray, boxes, search_h=WHITE_SEARCH_H, min_peak=WHITE_MIN_PE
             if not (WHITE_DEPTH_LO <= depth <= WHITE_DEPTH_HI):
                 continue
             yp = y0 + d
-            pts.append((x + cx, yp))
+            # v安全锚定：额外返回每列胶条底沿 sb，供 fit_white_line 计算段白线深度
+            pts.append((x + cx, yp, sb))
     if len(pts) >= MIN_WHITE_PTS:
         return np.array(pts, dtype=float), total_cols
     return None, total_cols
@@ -319,9 +332,93 @@ class WhiteLineModel:
 
 
 # ---------- 对外主接口 ----------
+def _deep_band_fraction(gray, box, segment, clean_mask, target_depth, tol=WHITE_SAFE_DEEP_TOL):
+    """第二根白线验证：检查 box 内各列在 深度≈target_depth±tol 窗口内是否存在稳定带。
+
+    返回 命中列占比(0~1)。用于区分『浅稳定带是误报(下方还有真实白线)』与
+    『白线确实浅(真实缺陷)』：前者窗口内能找到稳定带(真实白线)→占比高；后者找不到→占比低。
+    """
+    x, y, w, h = box
+    H, W = gray.shape
+    roi = gray[y:y + h, x:x + w]
+    mask, _ = segment(roi, (x, y), gray.shape)
+    cm = clean_mask(mask)
+    cols = np.any(cm > 0, axis=0)
+    total = 0
+    hit = 0
+    for cx in range(w):
+        if not cols[cx]:
+            continue
+        total += 1
+        rows = np.nonzero(cm[:, cx])[0]
+        sb = y + int(rows.max())
+        y0 = sb + 1
+        y1 = min(sb + 1 + WHITE_PROFILE_LEN, H)
+        if y1 - y0 < 80:
+            continue
+        prof = gray[y0:y1, x + cx].astype(float)
+        L = prof.shape[0]
+        lo = max(WHITE_DEPTH_MIN, int(round(target_depth - tol)))
+        hi = min(L - WHITE_STAB_WIN, int(round(target_depth + tol)))
+        if hi <= lo:
+            continue
+        win = np.lib.stride_tricks.sliding_window_view(prof, WHITE_STAB_WIN)
+        stds = win.std(axis=1)
+        dd = np.arange(lo, hi)
+        if dd.size and bool((stds[dd] < WHITE_STAB_STD).any()):
+            hit += 1
+    return (hit / total) if total else 0.0
+
+
+def _safe_anchor_decision(gray, wp, boxes, segment, clean_mask):
+    """判断本图是否触发安全条件锚定。返回 dict：
+    use_anchor: 是否借可靠段定高；symptom: 是否检出 04 类症状；
+    anchor_box/anchor_std: 可靠段索引与深度std；real_defect_box: 真实缺陷段(若有)。
+    """
+    # 逐段白线统计（深度=白线y - 胶条底沿sb）
+    stats = []
+    for (x, y, w, h) in boxes:
+        sub = wp[(wp[:, 0] >= x) & (wp[:, 0] < x + w)]
+        if len(sub) < MIN_WHITE_PTS:
+            stats.append(None)
+            continue
+        stats.append(dict(
+            count=len(sub),
+            depth=float(np.median(sub[:, 1] - sub[:, 2])),
+            median_y=float(np.median(sub[:, 1])),
+            std=float(np.std(sub[:, 1])),
+        ))
+    cand = [i for i, s in enumerate(stats) if s is not None]
+    if not cand:
+        return dict(use_anchor=False, symptom=False)
+    shallow = [i for i in cand if stats[i]["depth"] < WHITE_SAFE_SHALLOW_THR]
+    reliable = [i for i in cand if stats[i]["depth"] > WHITE_SAFE_RELIABLE_THR]
+    if not shallow or not reliable:
+        return dict(use_anchor=False, symptom=False)
+    max_gap = max(stats[r]["depth"] - stats[s]["depth"] for s in shallow for r in reliable)
+    if max_gap < WHITE_SAFE_MIN_GAP:
+        return dict(use_anchor=False, symptom=False)
+    # 选可靠段（列多且深度稳者最可靠）
+    bi = max(reliable, key=lambda i: stats[i]["count"] / (1.0 + stats[i]["std"]))
+    # 对每段浅带做"第二根白线验证"：其下方是否真有真实白线(在可靠段深度附近)
+    for i in shallow:
+        frac = _deep_band_fraction(gray, boxes[i], segment, clean_mask, stats[bi]["depth"])
+        if frac < WHITE_SAFE_DEEP_FRAC:
+            # 浅带下方没有真实白线 -> 白线确实浅(真实缺陷) -> 不借线，保留第一类判定
+            return dict(use_anchor=False, symptom=True, real_defect_box=i)
+    # 所有浅带下方都有真实白线 -> 确认是"浅稳定带误报"，借可靠段定高
+    return dict(use_anchor=True, symptom=True, anchor_box=bi,
+                anchor_std=round(stats[bi]["std"], 2))
+
+
 def fit_white_line(gray, boxes, segment=None, clean_mask=None):
     """拟合全局白线（所有 boxes 的白线点一起拟合）。返回 dict 或 None(白线缺失)。
-    返回: mode, params, x_min, x_max, white_pts, inlier_pts, coverage。
+    返回: mode, params, x_min, x_max, white_pts, inlier_pts, coverage；
+          额外字段 safe_anchor/symptom/anchor_box/anchor_std 供调试。
+
+    流程：先 detect_white_pts 取白线点；再判是否 04 类"浅稳定带误报"症状——
+    是且验证浅段下方确有真实白线 -> 只借可靠段的点拟合全局线(修正浅段高度)；
+    否则 -> 纯第一类全局拟合(不动，不掩盖真实缺陷)。
     白线点检测用原图灰度 gray(与V15一致)，避免 inpaint 把标注框填补后亮度偏移误抓。
     """
     if segment is None or clean_mask is None:
@@ -329,10 +426,22 @@ def fit_white_line(gray, boxes, segment=None, clean_mask=None):
     wp, total_cols = detect_white_pts(gray, boxes, segment=segment, clean_mask=clean_mask)
     if wp is None:
         return None
+    decision = _safe_anchor_decision(gray, wp, boxes, segment, clean_mask)
+    if decision["use_anchor"]:
+        bi = decision["anchor_box"]
+        sub = wp[(wp[:, 0] >= boxes[bi][0]) & (wp[:, 0] < boxes[bi][0] + boxes[bi][2])]
+        mode, params, mask, x_min, x_max = robust_curve(sub[:, 0], sub[:, 1])
+        return dict(mode=mode, params=params, x_min=x_min, x_max=x_max,
+                    white_pts=len(sub), inlier_pts=int(mask.sum()),
+                    coverage=round(len(sub) / max(1, boxes[bi][2]), 3),
+                    safe_anchor=True, symptom=True, anchor_box=bi,
+                    anchor_std=decision.get("anchor_std"))
+    # 正常图 / 真实缺陷图：纯第一类全局拟合
     mode, params, mask, x_min, x_max = robust_curve(wp[:, 0], wp[:, 1])
     return dict(mode=mode, params=params, x_min=x_min, x_max=x_max,
                 white_pts=len(wp), inlier_pts=int(mask.sum()),
-                coverage=round(len(wp) / max(1, total_cols), 3))
+                coverage=round(len(wp) / max(1, total_cols), 3),
+                safe_anchor=False, symptom=decision["symptom"])
 
 
 def fit_white_lines_perbox(gray, boxes, segment=None, clean_mask=None):
