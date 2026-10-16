@@ -444,6 +444,49 @@ def fit_white_line(gray, boxes, segment=None, clean_mask=None):
                 safe_anchor=False, symptom=decision["symptom"])
 
 
+def fit_white_line_anchored(gray, boxes, segment=None, clean_mask=None):
+    """v优化(2026-10-15)：全局白线只锚定『最可靠段』，避免某段被反光整体抬高后
+    把整条全局线拽偏、误判偏移。
+
+    背景取证：生产原 fit_white_line 把所有胶条段的白线点一起拟合一条线。当某段
+    （尤其短胶条）正下方是强反光均匀亮斑时，detect_white_pts 的『稳定性边界法』
+    会把亮斑顶沿当成白线(深度被压到 WHITE_DEPTH_LO)，该段白线点整体偏上；这些
+    点参与全局拟合会把整条线在右半区抬高，导致长胶条右端+短胶条都坐在这条偏高
+    线上，offset 偏小误报『漏水风险』。
+
+    做法：逐段统计白线有效列数 count 与深度 std；可靠度 = count/(1+std)（列多且
+    深度稳者最可靠）。只取可靠度最高的那一段的白线点拟合全局线；其余段不参与拟合，
+    但仍用这条线算各自 offset。正常图各段都稳、且白线共线，锚定任一段与全局拟合
+    结果一致，零回归。
+    """
+    if segment is None or clean_mask is None:
+        raise RuntimeError("fit_white_line_anchored 需传入 segment=seal_segment.segment, clean_mask=seal_metrics.clean_mask")
+    wp, total_cols = detect_white_pts(gray, boxes, segment=segment, clean_mask=clean_mask)
+    if wp is None:
+        return None
+    stats = []
+    for (x, y, w, h) in boxes:
+        sub = wp[(wp[:, 0] >= x) & (wp[:, 0] < x + w)]
+        if len(sub) < MIN_WHITE_PTS:
+            stats.append(None)
+            continue
+        ys = sub[:, 1]
+        stats.append((len(sub), float(np.median(ys)), float(np.std(ys))))
+    cand = [i for i, s in enumerate(stats) if s is not None]
+    if not cand:
+        mode, params, mask, x_min, x_max = robust_curve(wp[:, 0], wp[:, 1])
+        return dict(mode=mode, params=params, x_min=x_min, x_max=x_max,
+                    white_pts=len(wp), inlier_pts=int(mask.sum()),
+                    coverage=round(len(wp) / max(1, total_cols), 3))
+    bi = max(cand, key=lambda i: stats[i][0] / (1 + stats[i][2]))
+    sub = wp[(wp[:, 0] >= boxes[bi][0]) & (wp[:, 0] < boxes[bi][0] + boxes[bi][2])]
+    mode, params, mask, x_min, x_max = robust_curve(sub[:, 0], sub[:, 1])
+    return dict(mode=mode, params=params, x_min=x_min, x_max=x_max,
+                white_pts=len(sub), inlier_pts=int(mask.sum()),
+                coverage=round(len(sub) / max(1, boxes[bi][2]), 3),
+                anchor_box=bi, anchor_std=round(stats[bi][2], 2))
+
+
 def fit_white_lines_perbox(gray, boxes, segment=None, clean_mask=None):
     """v5 核心改动：每个红框段单独拟合一条白线（不再用全局一条曲线覆盖左右两段）。
 
