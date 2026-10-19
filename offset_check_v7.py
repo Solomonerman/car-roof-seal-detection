@@ -207,6 +207,8 @@ def detect_white_pts(gray, boxes, search_h=WHITE_SEARCH_H, min_peak=WHITE_MIN_PE
     for (x, y, w, h) in boxes:
         roi = gray[y:y + h, x:x + w]
         mask, _ = segment(roi, (x, y), gray.shape)
+        if mask is None:
+            continue
         cm = clean_mask(mask)
         cols = np.any(cm > 0, axis=0)
         for cx in range(w):
@@ -342,6 +344,8 @@ def _deep_band_fraction(gray, box, segment, clean_mask, target_depth, tol=WHITE_
     H, W = gray.shape
     roi = gray[y:y + h, x:x + w]
     mask, _ = segment(roi, (x, y), gray.shape)
+    if mask is None:
+        return 0.0
     cm = clean_mask(mask)
     cols = np.any(cm > 0, axis=0)
     total = 0
