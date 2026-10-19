@@ -37,6 +37,7 @@ SPEC = (16.0, 32.0)                        # 宽度规格 24±8mm
 WIDTH_SPEC_LO = 16.0
 WIDTH_SPEC_HI = 32.0
 WIDTH_MIN_RUN_COLS = 15                    # 宽度连续超差列数阈值（抗单列噪点）
+SMALL_BOX_AREA_RATIO = 0.02                 # 小框面积占比阈值: 面积 < 此值*整图面积 且 框内无胶条 → 视为误检丢弃(按OK), 避免角落假框制造假NG
 # 偏移报警：仅『漏水风险』(level=3) 才判 offset 缺陷并计 NG；中度/轻微仅展示、不判NG
 OFFSET_NG_LEVEL = 3
 
@@ -226,6 +227,11 @@ class SealOffsetDetector:
             roi = clean[y:y + h, x:x + w]
             mask, notes = S.segment(roi, (x, y), gray.shape)
             if mask is None:
+                # 小框(面积占比过小)里没胶条 → 判定为误检, 直接放弃该框, 不记 missing(按 OK 处理)
+                if w * h < SMALL_BOX_AREA_RATIO * iw * ih:
+                    print(f"[SealOffset][WARN] 帧 {photo_name} 小框(面积 {w*h}px < "
+                          f"{int(SMALL_BOX_AREA_RATIO * iw * ih)}px) 无胶条, 视为误检丢弃, 不判NG")
+                    continue
                 orec = OC.segment_offset(box, wl, None, n, idx)
                 off_recs.append(orec)
                 _lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
