@@ -206,7 +206,7 @@ class SealOffsetDetector:
 
         clean = _inpaint_frames(bgr)
         try:
-            wl = OC.fit_white_line_anchored(gray, boxes, segment=S.segment,
+            wl = OC.fit_white_line(gray, boxes, segment=S.segment,
                                    clean_mask=M.clean_mask)
         except Exception as e:
             print(f"[SealOffset] fit_white_line 失败: {e}")
