@@ -206,20 +206,13 @@ class SealOffsetDetector:
             boxes = [(0, 0, iw, ih)]
 
         clean = _inpaint_frames(bgr)
-        # 双模型: 全局白线(含安全锚定, 治第一类浅带误报) + 逐段白线(治第二类右段钳位)
         try:
-            wl_global = OC.fit_white_line(gray, boxes, segment=S.segment,
-                                          clean_mask=M.clean_mask)
+            wl = OC.fit_white_line(gray, boxes, segment=S.segment,
+                                   clean_mask=M.clean_mask)
         except Exception as e:
             print(f"[SealOffset] fit_white_line 失败: {e}")
-            wl_global = None
-        try:
-            wls_perbox = OC.fit_white_lines_perbox(gray, boxes, segment=S.segment,
-                                                  clean_mask=M.clean_mask)
-        except Exception as e:
-            print(f"[SealOffset] fit_white_lines_perbox 失败: {e}")
-            wls_perbox = [None] * len(boxes)
-        wl_failed = (wl_global is None) and all(w is None for w in wls_perbox)
+            wl = None
+        wl_failed = (wl is None)        # 白线拟合失败 → 偏移量不可靠
         if wl_failed:
             print(f"[SealOffset][WARN] 帧 {os.path.basename(path)} "
                   f"白线拟合失败, 偏移量不可靠(不判offset NG)")
@@ -230,17 +223,6 @@ class SealOffsetDetector:
         photo_name = os.path.splitext(os.path.basename(path))[0]   # 照片名(用于总览区分每段胶条)
         for idx, box in enumerate(boxes):
             x, y, w, h = box
-            # 白线模型选择:
-            #  - 第一类(安全锚定激活): 全局已借可靠段修正浅带误报, 两段都用全局(保持原行为, 防退化)
-            #  - 第二类(非锚定): 框落在全局拟合范围内用全局; 框在全局范围外(右段贴图像右缘被钳位)用逐段拟合
-            xr1 = x + w
-            if (wl_global is not None and wl_global.get("safe_anchor")):
-                wl_i = wl_global
-            elif (wl_global is not None and x >= wl_global.get("x_min", -1)
-                  and xr1 <= wl_global.get("x_max", -1)):
-                wl_i = wl_global
-            else:
-                wl_i = wls_perbox[idx] if (idx < len(wls_perbox) and wls_perbox[idx] is not None) else wl_global
             side = f"S{idx}"
             roi = clean[y:y + h, x:x + w]
             mask, notes = S.segment(roi, (x, y), gray.shape)
@@ -250,7 +232,7 @@ class SealOffsetDetector:
                     print(f"[SealOffset][WARN] 帧 {photo_name} 小框(面积 {w*h}px < "
                           f"{int(SMALL_BOX_AREA_RATIO * iw * ih)}px) 无胶条, 视为误检丢弃, 不判NG")
                     continue
-                orec = OC.segment_offset(box, wl_i, None, n, idx)
+                orec = OC.segment_offset(box, wl, None, n, idx)
                 off_recs.append(orec)
                 _lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
                 defects.append(Defect(x, y, w, h, "missing", 0.9,
@@ -271,7 +253,7 @@ class SealOffsetDetector:
             # 偏移（白线 → 中心线）
             sxs_g = (xs + x).astype(float)
             smid_g = (mid + y).astype(float)
-            orec = OC.segment_offset(box, wl_i, (sxs_g, smid_g), n, idx)
+            orec = OC.segment_offset(box, wl, (sxs_g, smid_g), n, idx)
             off_recs.append(orec)
 
             # 偏移代表量（每段都记录，供总览『每段胶条偏移』展示；与结果图等级一致）
