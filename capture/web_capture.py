@@ -121,6 +121,22 @@ elif _STAMP_HASH:
 else:
     VERSION_TAG = RUN_TAG
     _VER_SRC = "run"
+
+# ---------- 修复 Windows GBK 编码崩溃(导致相机"无法启动") ----------
+# 子进程继承父进程日志 fd 后, Python 按系统 locale(中文 Windows 默认 GBK) 重初始化 sys.stdout;
+# 一旦 print 含 µ(微符号 U+00B5)等非 GBK 字符即抛 UnicodeEncodeError 使进程退出, 表现为
+# web_capture 在"连接相机"阶段崩溃、而看板(uvicorn 独立进程)照常存活故 UI 正常。
+# 强制把 stdout/stderr 重包装为 utf-8 + errors=replace: 任何字符都能安全写入(日志本就是 utf-8),
+# 不再因编码问题崩溃。纯输出层容错, 不改动任何业务/相机/PLC/检测逻辑。
+import io as _io
+for _sn in ("stdout", "stderr"):
+    _sf = getattr(sys, _sn, None)
+    if _sf is not None and hasattr(_sf, "buffer"):
+        try:
+            setattr(sys, _sn, _io.TextIOWrapper(_sf.buffer, encoding="utf-8", errors="replace"))
+        except Exception:
+            pass
+
 print(f"[web_capture.py] VERSION={VERSION}  PUSH={VERSION_TAG}  (source={_VER_SRC}, run={RUN_TAG})")
 
 
@@ -441,7 +457,7 @@ class CameraStreamer:
                 if n is None:
                     continue
                 n.SetValue(EXPOSURE_TIME_US)
-                conf.append(f"曝光={EXPOSURE_TIME_US}µs ({name})")
+                conf.append(f"曝光={EXPOSURE_TIME_US}us ({name})")
                 self._exposure_node = name   # 记录实际生效的曝光节点，set_exposure 复用同一节点
                 ok = True
                 break
@@ -812,7 +828,7 @@ class CameraStreamer:
             self._exposure_user = actual   # 记录用户期望曝光，自愈重连后据此重新下发
             diag["exposure_us"] = actual
             diag["node"] = node_name
-            print(f"[相机] 曝光请求 {us}µs → 实际 {actual}µs 节点 {node_name} "
+            print(f"[相机] 曝光请求 {us}us → 实际 {actual}us 节点 {node_name} "
                   f"auto={diag.get('auto')} mode={diag.get('mode')} readbacks={readbacks}")
             return diag
         except Exception as e:
@@ -834,7 +850,7 @@ class CameraStreamer:
             n = self.cam.GetNodeMap().GetNode(node)
             if n is not None:
                 n.SetValue(int(round(us)))
-                print(f"[相机] 重连后重发曝光={int(round(us))}µs (节点 {node})")
+                print(f"[相机] 重连后重发曝光={int(round(us))}us (节点 {node})")
         except Exception as e:
             print(f"[相机] 重连后重发曝光失败(下个周期重试): {e}")
 
