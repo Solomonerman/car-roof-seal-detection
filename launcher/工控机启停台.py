@@ -87,6 +87,13 @@ class LauncherApp:
         if not py:
             self.log("[错误] 未配置可用的 Python 解释器, 已取消启动")
             return
+        # 防呆1: 本 launcher 若仍残留未停止的子进程, 先停掉再起
+        if any(p and p.poll() is None for p in self.procs.values()):
+            self.log("[防呆] 本启停台仍有未停止的子进程, 先停止...")
+            self.on_stop()
+        # 防呆2: 清理占用相机的旧 web_capture(别的启停台/手动 cmd 拉的),
+        # 防止双开撞锁(报错 The device is controlled by another application)
+        self._cleanup_strays()
         self.log(f"[信息] 使用解释器: {py}")
         started = 0
         for item in C.LAUNCH_ITEMS:
@@ -108,6 +115,23 @@ class LauncherApp:
             self.log(f"[{'已停止' if ok else '强杀兜底'} ] {name} (PID={p.pid})")
         self.procs.clear()
         self._set_stopped()
+
+    def _cleanup_strays(self):
+        """防呆: 启动前扫描系统里是否已有别的 web_capture.py 占着相机, 有则先优雅停掉。"""
+        my_pid = os.getpid()
+        exclude = {my_pid}
+        for p in self.procs.values():
+            if p and p.pid:
+                exclude.add(p.pid)
+        strays = PM.find_stray_web_capture(exclude)
+        if not strays:
+            return
+        self.log(f"[防呆] 检测到相机已被其他进程占用: PID={strays}, 先优雅停止释放相机...")
+        ok = PM.stop_pids(strays)
+        if ok:
+            self.log("[防呆] 旧进程已释放相机, 可继续启动")
+        else:
+            self.log("[防呆] 旧进程未能完全停止, 若仍报'被另一程序控制'请到任务管理器结束 python.exe")
 
     def _set_running(self):
         self.status_var.set("运行中")
