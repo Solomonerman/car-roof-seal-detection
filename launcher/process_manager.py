@@ -32,14 +32,16 @@ def start_item(py, item, repo_root):
     log_path = os.path.join(repo_root, item["log"])
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     logf = open(log_path, "a", encoding="utf-8")
-    # CREATE_NEW_PROCESS_GROUP: 子进程独立进程组, 便于单独发 Ctrl+C
-    p = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=logf,
-        stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if _HAS_WIN else 0,
-    )
+    kwargs = dict(cwd=repo_root, stdout=logf, stderr=subprocess.STDOUT)
+    if _HAS_WIN:
+        # 完全隐藏子进程控制台窗口(SW_HIDE): 不进任务栏、桌面不可见, 不会被误关;
+        # 但控制台对象仍存在 -> [停止] 仍可 AttachConsole 发 Ctrl+Break 优雅退出释放相机。
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    p = subprocess.Popen(cmd, **kwargs)
     return p, log_path
 
 
