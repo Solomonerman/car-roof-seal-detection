@@ -6,7 +6,9 @@
 关闭机制说明(不改主程序 web_capture.py):
   web_capture.py 现有退出逻辑 = except KeyboardInterrupt -> finally: 释放相机/PLC。
   Windows 下 subprocess 子进程默认收不到 Ctrl+C, 故用 AttachConsole + GenerateConsoleCtrlEvent
-  向子进程控制台发 Ctrl+C, 触发其 finally 干净释放。Linux 直接 os.kill(pid, SIGINT)。
+  向子进程控制台发 Ctrl+Break(比 Ctrl+C 跨进程组送达更可靠; Python 的 console 控制处理会把
+  BREAK 也转成 KeyboardInterrupt, 同样触发 finally 干净释放)。发送前用 SetConsoleCtrlHandler
+  关掉 launcher 自身处理, 避免 BREAK 误伤 launcher。Linux 直接 os.kill(pid, SIGINT)。
   等 ~8s 仍存活再 taskkill /T /F 兜底(极端才用; 进程退出后 pylon 由内核回收相机句柄)。
 """
 import os
@@ -40,14 +42,19 @@ def start_item(py, item, repo_root):
 
 
 def _send_ctrl_c(pid):
-    """向子进程发 Ctrl+C(优雅退出)。Windows 用 AttachConsole 技巧; 其他平台 os.kill。"""
+    """向子进程发 Ctrl+Break(优雅退出)。Windows 用 AttachConsole + GenerateConsoleCtrlEvent
+    发 CTRL_BREAK_EVENT(比 CTRL_C 跨进程组送达更可靠), Python 会将其转成 KeyboardInterrupt
+    从而触发 web_capture 的 finally 干净释放。发送前关掉 launcher 自身 Ctrl 处理以免误伤。
+    其他平台直接 os.kill(pid, SIGINT)。"""
     if _HAS_WIN:
         try:
             k = ctypes.windll.kernel32
-            k.AttachConsole(pid)
-            k.GenerateConsoleCtrlEvent(signal.CTRL_C_EVENT, pid)
-            k.FreeConsole()
-            return
+            if k.AttachConsole(pid):
+                # 关掉本进程(launcher)自己的 Ctrl 处理, 避免 BREAK 事件误伤 launcher
+                k.SetConsoleCtrlHandler(None, 1)
+                k.GenerateConsoleCtrlEvent(signal.CTRL_BREAK_EVENT, pid)
+                k.FreeConsole()
+                return
         except Exception:
             pass
     try:
