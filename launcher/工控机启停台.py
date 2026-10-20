@@ -12,6 +12,7 @@
 """
 import os
 import sys
+import ctypes
 import webbrowser
 import tkinter as tk
 from tkinter import messagebox, filedialog, scrolledtext
@@ -154,7 +155,22 @@ class LauncherApp:
         self.root.destroy()
 
 
+def _hide_own_console():
+    """若本 GUI 进程是被控制台解释器(python.exe/py.exe)拉起的, 启动时隐藏自身控制台窗口,
+    保证无论怎么启动 GUI 都无黑框。用 pythonw 启动时无控制台, GetConsoleWindow 返回 0 自动跳过。"""
+    if sys.platform != "win32":
+        return
+    try:
+        k = ctypes.windll.kernel32
+        hwnd = k.GetConsoleWindow()
+        if hwnd:
+            k.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+    except Exception:
+        pass
+
+
 def main():
+    _hide_own_console()
     root = tk.Tk()
     LauncherApp(root)
     root.mainloop()
