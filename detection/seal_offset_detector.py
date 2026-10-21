@@ -220,6 +220,11 @@ class SealOffsetDetector:
         n = len(boxes)
         off_recs = []
         box_art = {}
+        # 仅收集『真正产出 off_rec 的框』，与 off_recs 严格按序对齐。
+        # 小框被丢弃时不进此列表 → 避免下面 draw_offset_vis 按原始 boxes 位置 zip 错位
+        # （错位表现：右段级别标签/色框被画到被丢弃的小框位置上）。
+        draw_boxes = []
+        draw_idx = []
         photo_name = os.path.splitext(os.path.basename(path))[0]   # 照片名(用于总览区分每段胶条)
         for idx, box in enumerate(boxes):
             x, y, w, h = box
@@ -234,6 +239,8 @@ class SealOffsetDetector:
                     continue
                 orec = OC.segment_offset(box, wl, None, n, idx)
                 off_recs.append(orec)
+                draw_boxes.append(box)
+                draw_idx.append(idx)
                 _lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
                 defects.append(Defect(x, y, w, h, "missing", 0.9,
                                      meta={"reason": "no_strip",
@@ -255,6 +262,8 @@ class SealOffsetDetector:
             smid_g = (mid + y).astype(float)
             orec = OC.segment_offset(box, wl, (sxs_g, smid_g), n, idx)
             off_recs.append(orec)
+            draw_boxes.append(box)
+            draw_idx.append(idx)
 
             # 偏移代表量（每段都记录，供总览『每段胶条偏移』展示；与结果图等级一致）
             lv = orec.get("offset_level", OC.OFFSET_LEVEL_UNKNOWN)
@@ -346,10 +355,12 @@ class SealOffsetDetector:
                 cv2.imwrite(os.path.join(process_dir, base + "_mask.png"), vis)
                 # 橙色带偏移图（与 0921 验证一致）
                 if off_recs:
-                    seg_arts = [box_art.get(i) for i in range(len(boxes))]
+                    # 用与 off_recs 严格对齐的 draw_boxes / draw_idx，
+                    # 不再用原始 boxes（丢弃小框后仍含它 → 位置错位）。
+                    seg_arts = [box_art.get(i) for i in draw_idx]
                     off_vis = OC.draw_offset_vis(
                         cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR),
-                        boxes, off_recs, seg_arts=seg_arts)
+                        draw_boxes, off_recs, seg_arts=seg_arts)
                     cv2.imwrite(os.path.join(process_dir, base + "_offset.png"), off_vis)
             except Exception as e:
                 print(f"[SealOffset] 过程图生成失败 {os.path.basename(path)}: {e}")
