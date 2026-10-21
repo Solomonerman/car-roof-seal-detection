@@ -40,6 +40,23 @@ WHITE_DEPTH_MAX = 150      # 扫描终止深度(px)
 WHITE_DEPTH_LO = 15        # v6：有效白线深度下限(px)。稳定点出现过浅(贴胶条底沿)=该列不可靠，丢弃
 WHITE_DEPTH_HI = 110       # v6：有效白线深度上限(px)。稳定点出现过深=误抓远处车身亮带，丢弃
 
+# ---------- v8 段内深度共识（治"浅稳定带误锁"——绿线真值标定 2026-10-21）----------
+# 真白线 = 亮反光带(197~255)的下边界；反光消失的列上白线无对比度，逐列"首个稳定带"
+# 会锁到胶条下方暗区->灰区交界的假边界(浅 20~40px)，真线在亮带下边界(60~80px)，
+# 同段点云呈双峰。真缺陷(白线真浅)整段一致锁浅=单峰，不触发。安全锚定看段中位数，对本场景失明。
+WHITE_CONS_BIN_PX = 4        # 深度直方图 bin 宽(px)
+WHITE_CONS_MIN_SEP = 24.0    # 双峰最小间隔(px)
+WHITE_CONS_VALLEY = 0.25     # 峰谷/较小峰 低于此值 = 真双峰（可分裂保留深侧簇）
+WHITE_CONS_SECOND = 6.0      # 第二峰最矮高度(平滑后每bin点数)，滤除噪声小峰
+WHITE_CONS_RATIO = 0.15      # 第二峰/主峰高度比下限
+
+# ---------- v8 段覆盖守卫（治"全局拟合整簇剔除非覆盖段后 y_at 平线外推"）----------
+# 全局稳健拟合可能把某段干净点整簇当离群(如 316837 右段 x[1664,1920) 被拒，拟合止于1356)，
+# y_at 对该段平线外推造成 ±6mm 偏差。守卫：某段点数充足但相对全局模型中位残差过大时，
+# 用该段自身点局部补拟合(仅该段 x 范围生效，非 perbox 全面替换，安全锚定路径不启用)。
+WL_ZONE_MIN_PTS = 50     # 段内点数下限，低于此不补拟合(交由原逻辑/复核)
+WL_ZONE_RESID_PX = 10.0  # 段内点相对全局模型中位残差 > 此值(px≈3mm) = 该段被拟合拒绝
+
 # ---------- 安全条件锚定（仅针对 04 类"浅稳定带误报"症状）----------
 # 思路：纯第一类在"胶条下方多了一截浅稳定带"的图片上会把白线锁浅 -> 偏移偏小误报。
 # 症状=存在某段白线深度<SHALLOW_THR 且另一段>RELIABLE_THR 且差距>MIN_GAP。
@@ -185,6 +202,41 @@ def robust_curve(xs, ys, outlier_thresh_px=CURVE_OUTLIER_PX, max_iter=5,
 
 
 # ---------- 白线点检测 (v4：稳定性边界法) ----------
+def _bimodal_deep_cut(ds):
+    """v8 段内深度共识：检测段内白线深度双峰，返回分裂深度(保留深侧簇)；非双峰返回 None。
+
+    ds: 该段各列白线深度列表(depth = yp - sb)。平滑直方图后找主峰与第二峰：
+    间隔>=WHITE_CONS_MIN_SEP、峰谷<较小峰*WHITE_CONS_VALLEY、第二峰高度足够 → 真双峰。
+    """
+    ds = np.asarray(list(ds), float)
+    n = len(ds)
+    if n < 20:
+        return None
+    hist, edges = np.histogram(ds, bins=np.arange(0, 132, WHITE_CONS_BIN_PX))
+    k = np.ones(5) / 5.0
+    sm = np.convolve(hist, k, mode="same")
+    p1 = int(np.argmax(sm))
+    min_bins = int(WHITE_CONS_MIN_SEP / WHITE_CONS_BIN_PX)
+    bi, bv = -1, -1.0
+    for i in range(len(sm)):
+        if abs(i - p1) < min_bins:
+            continue
+        if sm[i] > bv:
+            bv, bi = sm[i], i
+    if bi < 0:
+        return None
+    if bv < max(WHITE_CONS_SECOND, WHITE_CONS_RATIO * sm[p1]):
+        return None
+    a, b = min(p1, bi), max(p1, bi)
+    seg = sm[a:b + 1]
+    valley = float(seg.min())
+    smaller = float(min(sm[p1], sm[bi]))
+    if valley > WHITE_CONS_VALLEY * smaller:
+        return None
+    v = a + int(np.argmin(seg))
+    return float(edges[v])
+
+
 def detect_white_pts(gray, boxes, search_h=WHITE_SEARCH_H, min_peak=WHITE_MIN_PEAK,
                      segment=None, clean_mask=None,
                      stab_win=WHITE_STAB_WIN, stab_std=WHITE_STAB_STD):
@@ -211,6 +263,7 @@ def detect_white_pts(gray, boxes, search_h=WHITE_SEARCH_H, min_peak=WHITE_MIN_PE
             continue
         cm = clean_mask(mask)
         cols = np.any(cm > 0, axis=0)
+        box_pts = []
         for cx in range(w):
             if not cols[cx]:
                 continue
@@ -246,7 +299,13 @@ def detect_white_pts(gray, boxes, search_h=WHITE_SEARCH_H, min_peak=WHITE_MIN_PE
                 continue
             yp = y0 + d
             # v安全锚定：额外返回每列胶条底沿 sb，供 fit_white_line 计算段白线深度
-            pts.append((x + cx, yp, sb))
+            box_pts.append((x + cx, yp, sb))
+        # v8 段内深度共识：浅稳定带误锁使段内点云双峰(浅假边界 vs 亮带下边界真线)，
+        # 保留深侧簇；单峰(含真缺陷整段一致锁浅)不触发。
+        cut = _bimodal_deep_cut([p[1] - p[2] for p in box_pts])
+        if cut is not None:
+            box_pts = [p for p in box_pts if (p[1] - p[2]) >= cut]
+        pts.extend(box_pts)
     if len(pts) >= MIN_WHITE_PTS:
         return np.array(pts, dtype=float), total_cols
     return None, total_cols
@@ -442,10 +501,23 @@ def fit_white_line(gray, boxes, segment=None, clean_mask=None):
                     anchor_std=decision.get("anchor_std"))
     # 正常图 / 真实缺陷图：纯第一类全局拟合
     mode, params, mask, x_min, x_max = robust_curve(wp[:, 0], wp[:, 1])
+    gmodel = WhiteLineModel(mode, params, x_min, x_max)
+    # v8 段覆盖守卫：全局拟合把某段干净点整簇当离群剔除时，y_at 对该段平线外推造成
+    # 数 mm 偏差(316837 右段实测 -6.1mm)。段内点充足但中位残差过大 -> 段内局部补拟合。
+    zones = []
+    for (bx, by, bw, bh) in boxes:
+        sub = wp[(wp[:, 0] >= bx) & (wp[:, 0] < bx + bw)]
+        if len(sub) < WL_ZONE_MIN_PTS:
+            continue
+        resid = np.abs(sub[:, 1] - np.array([gmodel.y_at(float(v)) for v in sub[:, 0]]))
+        if float(np.median(resid)) <= WL_ZONE_RESID_PX:
+            continue
+        lmode, lparams, _lmask, lx_min, lx_max = robust_curve(sub[:, 0], sub[:, 1])
+        zones.append((float(bx), float(bx + bw), lmode, lparams, lx_min, lx_max))
     return dict(mode=mode, params=params, x_min=x_min, x_max=x_max,
                 white_pts=len(wp), inlier_pts=int(mask.sum()),
                 coverage=round(len(wp) / max(1, total_cols), 3),
-                safe_anchor=False, symptom=decision["symptom"])
+                safe_anchor=False, symptom=decision["symptom"], zones=zones)
 
 
 def fit_white_lines_perbox(gray, boxes, segment=None, clean_mask=None):
@@ -482,6 +554,27 @@ def fit_white_lines_perbox(gray, boxes, segment=None, clean_mask=None):
     return out
 
 
+def _build_wmodel(wl):
+    """由 fit_white_line 结果构建 y_at 模型；含段覆盖守卫 zones 时返回混合模型
+    （段 x 范围内用段内补拟合模型，否则用全局模型）。"""
+    gm = WhiteLineModel(wl["mode"], wl["params"], wl["x_min"], wl["x_max"])
+    zones = wl.get("zones")
+    if not zones:
+        return gm
+    subs = [(z[0], z[1], WhiteLineModel(z[2], z[3], z[4], z[5])) for z in zones]
+
+    class _HybridModel:
+        @staticmethod
+        def y_at(x):
+            xv = float(x)
+            for z0, z1, zm in subs:
+                if z0 <= xv < z1:
+                    return zm.y_at(xv)
+            return gm.y_at(xv)
+
+    return _HybridModel()
+
+
 def segment_offset(box, wl, skeleton_pts, n, seg_idx, mm_per_px=MM_PER_PX, end_trim=SEAL_END_TRIM):
     """算单段 白线->中心线 距离(偏移) + 逐点偏离判定。
 
@@ -512,7 +605,7 @@ def segment_offset(box, wl, skeleton_pts, n, seg_idx, mm_per_px=MM_PER_PX, end_t
     order = np.argsort(sxs)
     sxs = sxs[order]
     smid = smid[order]
-    wmodel = WhiteLineModel(wl["mode"], wl["params"], wl["x_min"], wl["x_max"])
+    wmodel = _build_wmodel(wl)
     wys = np.array([wmodel.y_at(float(v)) for v in sxs])
     d_mm = (wys - smid) * mm_per_px
     # 全量逐列（用于画图）；代表值与偏离判定仅用中段 80%（去掉首尾 10%）
