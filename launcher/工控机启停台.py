@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-工控机一键启停台(GUI, tkinter, Python 自带零额外依赖)
-现场人员: 双击桌面"启动启停台"快捷方式 -> 点 [启动] / [停止]。
+工控机一键启停台（GUI, tkinter, Python 自带零额外依赖）  —— 推倒重做版
 
-说明:
-- 启停台本身用 pythonw 运行(纯 GUI 无黑框); 拉起的 web_capture/ui.app 用 python.exe
-  (控制台窗口已设为完全隐藏 SW_HIDE: 不进任务栏、桌面不可见、不会被误关; 控制台对象仍保留,
-  以便[停止]发 Ctrl+Break 优雅退出释放相机; 日志全部重定向进文件, 无需看黑框)。
-- 关闭窗口会先询问是否停止程序, 避免误关导致子进程遗留。
-- 仅管进程启停, 绝不读写 PLC(web_capture 本身只读)。
+现场人员：双击桌面"启动启停台"快捷方式 -> 点 [▶ 启动] / [■ 停止]。
+
+设计要点（针对过去反馈逐个根治）：
+1) 窗口一定弹到最前面：root.lift() + 短暂 -topmost，杜绝"进程在、窗口看不见"。
+2) 解释器单一来源：bat 已用仓库 .venv 的解释器拉起本 GUI；本 GUI 派生子进程时，
+   直接用"与 GUI 同目录的 python.exe"，保证子进程与 GUI 同一环境（不再出现
+   bat 用系统 pyw、子进程用 venv 的不一致）。
+3) 实时日志面板：过去"看不到 log"——现在 GUI 直接尾巴读取 web_capture / 看板的日志文件，
+   实时显示在面板里，不必开 Terminal；日志文件同时落盘，可事后查看。
+4) 无黑框：GUI 用 _hide_own_console() 隐藏自身控制台窗口；子进程控制台也设为 SW_HIDE。
+5) 优雅停止：发 Ctrl+Break 触发 web_capture 的 finally 释放相机/PLC，超时再 taskkill 兜底。
+6) 防双开：启动前扫描并清理占用相机的旧 web_capture，避免"The device is controlled by
+   another application"。
+7) 仅管进程启停，绝不读写 PLC（web_capture 本身只读）。
 """
 import os
 import sys
-import ctypes
 import webbrowser
 import tkinter as tk
-from tkinter import messagebox, filedialog, scrolledtext
+from tkinter import messagebox, scrolledtext
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launch_config as C
@@ -28,20 +34,42 @@ class LauncherApp:
     def __init__(self, root):
         self.root = root
         self.root.title("车顶胶条检测 - 工控机启停台")
-        self.root.geometry("480x440")
-        self.procs = {}  # name -> Popen
+        self.root.geometry("640x560")
+        # 强制窗口弹到最前面（根治"进程在、窗口看不见"）
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(1200, lambda: self.root.attributes("-topmost", False))
 
-        # 状态灯 + 文字
-        frm = tk.Frame(root)
-        frm.pack(pady=10)
-        self.lamp = tk.Label(frm, text="●", font=("Arial", 26), fg="gray")
-        self.lamp.pack(side=tk.LEFT, padx=8)
+        self.items = {}  # name -> {"proc": Popen, "log": path, "pos": int, "lamp": Label, "port": int}
+
+        # ---- 顶部状态 ----
+        top = tk.Frame(root)
+        top.pack(pady=8, fill=tk.X, padx=14)
+        self.lamp = tk.Label(top, text="●", font=("Arial", 24), fg="gray")
+        self.lamp.pack(side=tk.LEFT, padx=6)
         self.status_var = tk.StringVar(value="未启动")
-        tk.Label(frm, textvariable=self.status_var, font=("Arial", 14)).pack(side=tk.LEFT)
+        tk.Label(top, textvariable=self.status_var, font=("Arial", 15)).pack(side=tk.LEFT)
 
-        # 大按钮
+        # ---- 组件运行状态面板 ----
+        comp_frm = tk.LabelFrame(root, text="组件运行状态", padx=10, pady=6)
+        comp_frm.pack(fill=tk.X, padx=14, pady=4)
+        for item in C.LAUNCH_ITEMS:
+            row = tk.Frame(comp_frm)
+            row.pack(fill=tk.X, pady=2)
+            lamp = tk.Label(row, text="○", fg="gray", font=("Arial", 13))
+            lamp.pack(side=tk.LEFT, padx=4)
+            name = item["name"]
+            tk.Label(row, text=name, width=30, anchor="w").pack(side=tk.LEFT)
+            port = item.get("port")
+            tk.Label(row, text=("端口 %d" % port) if port else "", width=10).pack(side=tk.LEFT)
+            tk.Button(row, text="日志", width=6,
+                      command=lambda p=item["log"]: self.open_log(p)).pack(side=tk.RIGHT, padx=2)
+            self.items[name] = {"proc": None, "log": os.path.join(REPO_ROOT, item["log"]),
+                                "pos": 0, "lamp": lamp, "port": port}
+
+        # ---- 大按钮 ----
         btn_frm = tk.Frame(root)
-        btn_frm.pack(pady=12)
+        btn_frm.pack(pady=10)
         self.btn_start = tk.Button(btn_frm, text="▶ 启动", width=14, height=2,
                                    bg="#2e7d32", fg="white", command=self.on_start)
         self.btn_start.pack(side=tk.LEFT, padx=12)
@@ -49,91 +77,116 @@ class LauncherApp:
                                   bg="#c62828", fg="white", command=self.on_stop,
                                   state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=12)
+        tk.Button(btn_frm, text="打开看板", width=10, height=2,
+                  command=lambda: webbrowser.open("http://localhost:8000")).pack(side=tk.LEFT, padx=6)
 
-        # 日志框
-        tk.Label(root, text="状态日志:").pack(anchor="w", padx=14)
-        self.txt = scrolledtext.ScrolledText(root, height=15, state=tk.DISABLED)
-        self.txt.pack(fill=tk.BOTH, expand=True, padx=14, pady=6)
+        # ---- 日志面板 ----
+        tk.Label(root, text="实时日志（启停台 + 采集程序 + 看板）:").pack(anchor="w", padx=14)
+        self.txt = scrolledtext.ScrolledText(root, height=16, state=tk.DISABLED, font=("Consolas", 9))
+        self.txt.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 启动日志尾巴轮询
+        self.root.after(500, self._tail_logs)
 
-    def log(self, msg):
+    # ---------- 日志 ----------
+    def _append(self, text):
         self.txt.configure(state=tk.NORMAL)
-        self.txt.insert(tk.END, msg + "\n")
+        self.txt.insert(tk.END, text)
         self.txt.see(tk.END)
         self.txt.configure(state=tk.DISABLED)
 
-    def _ensure_python(self):
-        py = C.find_python()
-        if py and C.python_works(py):
-            return py
-        # 让用户现场选 PyCharm 用的那个 python.exe
-        path = filedialog.askopenfilename(
-            title="选择工控机 Python 解释器(即 PyCharm 用的 python.exe)",
-            filetypes=[("Python 可执行文件", "python.exe")],
-        )
-        if not path:
-            return None
-        if not C.python_works(path):
-            messagebox.showerror(
-                "解释器不可用",
-                "该 python.exe 缺少依赖(pypylon / opencv / flask 等),\n"
-                "请选择 PyCharm 实际用的那个解释器。",
-            )
-            return None
-        C.save_python(path)
-        return path
+    def log(self, msg):
+        self._append("[启停台] " + msg + "\n")
 
+    def _tail_logs(self):
+        """实时尾巴读取各子进程日志文件并显示（不必开 Terminal 也能看运行过程）。"""
+        for name, info in self.items.items():
+            p = info["proc"]
+            if p is None or p.poll() is not None:
+                continue
+            try:
+                with open(info["log"], "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(info["pos"])
+                    chunk = f.read()
+                    if chunk:
+                        info["pos"] = f.tell()
+                        self._append("── %s ──\n%s" % (name, chunk))
+            except Exception:
+                pass
+        self.root.after(500, self._tail_logs)
+
+    # ---------- 解释器 ----------
+    def _resolve_python(self):
+        """派生子进程用的解释器：优先与 GUI 同目录的 python.exe（保证同一环境）。"""
+        exe = sys.executable
+        d = os.path.dirname(exe)
+        cand = os.path.join(d, "python.exe")
+        if os.path.exists(cand):
+            return cand
+        return C.find_python() or exe
+
+    # ---------- 启停 ----------
     def on_start(self):
-        py = self._ensure_python()
-        if not py:
-            self.log("[错误] 未配置可用的 Python 解释器, 已取消启动")
-            return
-        # 防呆1: 本 launcher 若仍残留未停止的子进程, 先停掉再起
-        if any(p and p.poll() is None for p in self.procs.values()):
+        py = self._resolve_python()
+        self.log("[信息] 使用解释器: %s" % py)
+        # 防呆1：残留子进程先停
+        if any(info["proc"] and info["proc"].poll() is None for info in self.items.values()):
             self.log("[防呆] 本启停台仍有未停止的子进程, 先停止...")
             self.on_stop()
-        # 防呆2: 清理占用相机的旧 web_capture(别的启停台/手动 cmd 拉的),
-        # 防止双开撞锁(报错 The device is controlled by another application)
+        # 防呆2：清理占用相机的旧 web_capture
         self._cleanup_strays()
-        self.log(f"[信息] 使用解释器: {py}")
+
         started = 0
         for item in C.LAUNCH_ITEMS:
             try:
                 p, log_path = PM.start_item(py, item, REPO_ROOT)
-                self.procs[item["name"]] = p
-                self.log(f"[启动] {item['name']} (PID={p.pid})  日志: {log_path}")
+                name = item["name"]
+                self.items[name]["proc"] = p
+                self.items[name]["log"] = log_path
+                self.items[name]["pos"] = 0
+                self._set_comp_running(name, True)
+                self.log("[启动] %s (PID=%d)  日志: %s" % (name, p.pid, log_path))
                 started += 1
                 if item.get("open_url"):
                     webbrowser.open(item["open_url"])
             except Exception as e:
-                self.log(f"[错误] 启动 {item['name']} 失败: {e}")
+                self.log("[错误] 启动 %s 失败: %s" % (item["name"], e))
         if started:
             self._set_running()
 
     def on_stop(self):
-        for name, p in list(self.procs.items()):
+        for name, info in self.items.items():
+            p = info["proc"]
+            if p is None:
+                continue
             ok = PM.stop_item(p)
-            self.log(f"[{'已停止' if ok else '强杀兜底'} ] {name} (PID={p.pid})")
-        self.procs.clear()
+            self.log("[%s] %s (PID=%d)" % ("已停止" if ok else "强杀兜底", name, p.pid))
+            info["proc"] = None
+            self._set_comp_running(name, False)
         self._set_stopped()
 
     def _cleanup_strays(self):
-        """防呆: 启动前扫描系统里是否已有别的 web_capture.py 占着相机, 有则先优雅停掉。"""
         my_pid = os.getpid()
         exclude = {my_pid}
-        for p in self.procs.values():
+        for info in self.items.values():
+            p = info["proc"]
             if p and p.pid:
                 exclude.add(p.pid)
         strays = PM.find_stray_web_capture(exclude)
         if not strays:
             return
-        self.log(f"[防呆] 检测到相机已被其他进程占用: PID={strays}, 先优雅停止释放相机...")
+        self.log("[防呆] 检测到相机已被其他进程占用: PID=%s, 先优雅停止释放相机..." % strays)
         ok = PM.stop_pids(strays)
-        if ok:
-            self.log("[防呆] 旧进程已释放相机, 可继续启动")
-        else:
-            self.log("[防呆] 旧进程未能完全停止, 若仍报'被另一程序控制'请到任务管理器结束 python.exe")
+        self.log("[防呆] 旧进程已释放相机" if ok else
+                 "[防呆] 旧进程未能完全停止, 若仍报'被另一程序控制'请到任务管理器结束 python.exe")
+
+    def _set_comp_running(self, name, running):
+        info = self.items.get(name)
+        if not info:
+            return
+        info["lamp"].configure(fg="#2e7d32" if running else "gray",
+                               text="●" if running else "○")
 
     def _set_running(self):
         self.status_var.set("运行中")
@@ -147,16 +200,27 @@ class LauncherApp:
         self.btn_start.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.DISABLED)
 
+    def open_log(self, rel):
+        path = os.path.join(REPO_ROOT, rel)
+        if not os.path.exists(path):
+            messagebox.showinfo("提示", "日志文件尚不存在:\n%s" % path)
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e))
+
     def on_close(self):
-        if self.procs:
-            if not messagebox.askyesno("确认", "程序仍在运行, 关闭窗口会先停止程序吗?"):
+        running = [n for n, i in self.items.items() if i["proc"] and i["proc"].poll() is None]
+        if running:
+            if not messagebox.askyesno("确认", "以下程序仍在运行: %s\n关闭窗口会先停止它们吗?" % "、".join(running)):
                 return
             self.on_stop()
         self.root.destroy()
 
 
 def _hide_own_console():
-    """若本 GUI 进程是被控制台解释器(python.exe/py.exe)拉起的, 启动时隐藏自身控制台窗口,
+    """若本 GUI 是被控制台解释器(python.exe/py.exe)拉起的, 启动时隐藏自身控制台窗口,
     保证无论怎么启动 GUI 都无黑框。用 pythonw 启动时无控制台, GetConsoleWindow 返回 0 自动跳过。"""
     if sys.platform != "win32":
         return
