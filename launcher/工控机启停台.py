@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-工控机一键启停台（GUI, tkinter, Python 自带零额外依赖）  —— 推倒重做版
+工控机一键启停台（GUI, tkinter, Python 自带零额外依赖）  —— 推导版
 
 现场人员：双击桌面"启动启停台"快捷方式 -> 点 [▶ 启动] / [■ 停止]。
 
 设计要点（针对过去反馈逐个根治）：
 1) 窗口一定弹到最前面：root.lift() + 短暂 -topmost，杜绝"进程在、窗口看不见"。
-2) 解释器单一来源：bat 已用仓库 .venv 的解释器拉起本 GUI；本 GUI 派生子进程时，
+2) 解释器单一来源、不弹窗：bat 已用仓库 .venv 的解释器拉起本 GUI；本 GUI 派生子进程时，
    直接用"与 GUI 同目录的 python.exe"，保证子进程与 GUI 同一环境（不再出现
-   bat 用系统 pyw、子进程用 venv 的不一致）。
+   bat 用系统 pyw、子进程用 venv 的不一致）。不再弹"选择解释器"文件框。
 3) 实时日志面板：过去"看不到 log"——现在 GUI 直接尾巴读取 web_capture / 看板的日志文件，
    实时显示在面板里，不必开 Terminal；日志文件同时落盘，可事后查看。
 4) 无黑框：GUI 用 _hide_own_console() 隐藏自身控制台窗口；子进程控制台也设为 SW_HIDE。
 5) 优雅停止：发 Ctrl+Break 触发 web_capture 的 finally 释放相机/PLC，超时再 taskkill 兜底。
 6) 防双开：启动前扫描并清理占用相机的旧 web_capture，避免"The device is controlled by
    another application"。
-7) 仅管进程启停，绝不读写 PLC（web_capture 本身只读）。
+7) 仅管进程启停，绝不读写 PLC（web_capture 本身只读）。主程序 web_capture.py 一行不改。
 """
 import os
 import sys
@@ -116,9 +116,10 @@ class LauncherApp:
                 pass
         self.root.after(500, self._tail_logs)
 
-    # ---------- 解释器 ----------
+    # ---------- 解释器（单一来源，不弹窗） ----------
     def _resolve_python(self):
-        """派生子进程用的解释器：优先与 GUI 同目录的 python.exe（保证同一环境）。"""
+        """派生子进程用的解释器：优先与 GUI 同目录的 python.exe（保证同一环境），
+        其次仓库 venv，最后 sys.executable。全程不弹窗、不打断现场。"""
         exe = sys.executable
         d = os.path.dirname(exe)
         cand = os.path.join(d, "python.exe")
