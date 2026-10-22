@@ -79,9 +79,9 @@ def collect_cars(src):
     if subdirs_with_imgs:                        # (a) 按车模式
         cars.extend(subdirs_with_imgs)
         if direct_imgs:
-            cars.append(("<散图>", [os.path.join(src, f) for f in direct_imgs]))
+            cars.append(("散图", [os.path.join(src, f) for f in direct_imgs]))
     elif direct_imgs:                            # (b) 纯散图模式
-        cars.append(("<散图>", [os.path.join(src, f) for f in direct_imgs]))
+        cars.append(("散图", [os.path.join(src, f) for f in direct_imgs]))
     else:                                       # (c) 递归兜底
         all_imgs = []
         for r, _, files in os.walk(src):
@@ -89,7 +89,7 @@ def collect_cars(src):
                 if f.lower().endswith(IMG_EXTS):
                     all_imgs.append(os.path.join(r, f))
         if all_imgs:
-            cars.append(("<散图>", sorted(all_imgs)))
+            cars.append(("散图", sorted(all_imgs)))
     return cars
 
 
