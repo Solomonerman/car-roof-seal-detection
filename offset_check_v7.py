@@ -81,14 +81,14 @@ OFFSET_DEV_FRAC = 0.50     # v7d：整段偏移占比门槛。有效偏离段总
 # 分级区间（用户 2026-10-08 拍板，按"偏移距离"分 4 级）：
 #   正常     : [33.00, 35.00)                  -> level 0
 #   轻微偏移 : [30.00, 33.00) ∪ [35.00, 38.00) -> level 1（可接受，不报警）
-#   中度偏移 : [28.00, 30.00) ∪ [38.00, 40.00) -> level 2（报警提醒工人注意胶条状态）
-#   漏水风险 : < 28.00 或 >= 40.00             -> level 3（需工人返工）
+#   中度偏移 : [28.00, 30.00) ∪ [38.00, 40.50) -> level 2（报警提醒工人注意胶条状态）
+#   漏水风险 : < 28.00 或 >= 40.50             -> level 3（需工人返工）
 OFFSET_LV_NORMAL_LO = 33.00
 OFFSET_LV_NORMAL_HI = 35.00
 OFFSET_LV_SLIGHT_LO = 30.00
 OFFSET_LV_SLIGHT_HI = 38.00
 OFFSET_LV_MODERATE_LO = 28.00
-OFFSET_LV_MODERATE_HI = 40.00
+OFFSET_LV_MODERATE_HI = 40.50
 OFFSET_LEVELS = {0: "正常", 1: "轻微偏移", 2: "中度偏移", 3: "漏水风险"}
 OFFSET_LEVEL_UNKNOWN = -1
 OFFSET_LEVEL_UNKNOWN_NAME = "未检出"
@@ -108,9 +108,9 @@ def classify_offset_level(x):
         return 0, OFFSET_LEVELS[0]
     if x < OFFSET_LV_SLIGHT_HI:             # [35.00, 38.00)
         return 1, OFFSET_LEVELS[1]
-    if x < OFFSET_LV_MODERATE_HI:           # [38.00, 40.00)
+    if x < OFFSET_LV_MODERATE_HI:           # [38.00, 40.50)
         return 2, OFFSET_LEVELS[2]
-    return 3, OFFSET_LEVELS[3]              # >= 40.00
+    return 3, OFFSET_LEVELS[3]              # >= 40.50
 SEAL_END_TRIM = 0.10       # 距离检测去掉每段首/尾 10%（两端偏差大，不计入中心线距离）
 
 
