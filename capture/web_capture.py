@@ -233,7 +233,7 @@ def log_capture_event(**fields):
         evt.update(fields)
         line = json.dumps(evt, ensure_ascii=False)
         with _exec_log_lock:
-            with open(CAPTURE_EXEC_LOG, "a", encoding="utf-8") as f:
+            with open(CAPTURE_EXEC_LOG, "a", encoding="utf-8-sig") as f:
                 f.write(line + "\n")
                 f.flush()
         return line

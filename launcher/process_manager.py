@@ -31,7 +31,7 @@ def start_item(py, item, repo_root):
     cmd = [py] + list(item["cmd"])
     log_path = os.path.join(repo_root, item["log"])
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    logf = open(log_path, "a", encoding="utf-8")
+    logf = open(log_path, "a", encoding="utf-8-sig")
     kwargs = dict(cwd=repo_root, stdout=logf, stderr=subprocess.STDOUT)
     if _HAS_WIN:
         # 完全隐藏子进程控制台窗口(SW_HIDE): 不进任务栏、桌面不可见, 不会被误关;
