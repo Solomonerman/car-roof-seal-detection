@@ -72,8 +72,8 @@ WHITE_SAFE_DEEP_FRAC = 0.50     # 浅段内有此比例以上列在窗口内找�
 RANSAC_SEED = 12345         # 固定种子：让 RANSAC 直线降级可复现（否则每次随机抽中不同内点，偏移乱跳）
 
 # ---------- 偏移公差带与偏离判定（用户拍板）----------
-OFFSET_SPEC_LO = 32.0      # v7c：偏移下限(mm) 由 30.0 上调为 32.0（用户拍板：距离<32 或 >40.5mm 判偏离）
-OFFSET_SPEC_HI = 40.5      # v7：偏移上限(mm) 与漏水线 OFFSET_LV_MODERATE_HI 统一为 40.5（方案B：公差带[32,40.5]与漏水红线一致，用户2026-10-23拍板）
+OFFSET_SPEC_LO = 32.0      # v7c：偏移下限(mm) 由 30.0 上调为 32.0（用户拍板：距离<32 或 >41.0mm 判偏离）
+OFFSET_SPEC_HI = 41.0      # v7：偏移上限(mm) 与漏水线 OFFSET_LV_MODERATE_HI 统一为 41.0（方案B：公差带[32,41.0]与漏水红线一致；漏水线2026-10-23由40.0→40.5，2026-10-26再→41.0）
 OFFSET_MIN_RUN_COLS = 15   # 连续超差列数阈值：≥此值才计为「有效偏离段」；单点/少数噪点=误报
 OFFSET_DEV_FRAC = 0.50     # v7d：整段偏移占比门槛。有效偏离段总长 / 整段评估列数 > 此值 才判整段偏移(deviated=True)；否则视为局部波动、整段正常
 
@@ -81,14 +81,14 @@ OFFSET_DEV_FRAC = 0.50     # v7d：整段偏移占比门槛。有效偏离段总
 # 分级区间（用户 2026-10-08 拍板，按"偏移距离"分 4 级）：
 #   正常     : [33.00, 35.00)                  -> level 0
 #   轻微偏移 : [30.00, 33.00) ∪ [35.00, 38.00) -> level 1（可接受，不报警）
-#   中度偏移 : [28.00, 30.00) ∪ [38.00, 40.50) -> level 2（报警提醒工人注意胶条状态）
-#   漏水风险 : < 28.00 或 >= 40.50             -> level 3（需工人返工）
+#   中度偏移 : [28.00, 30.00) ∪ [38.00, 41.00) -> level 2（报警提醒工人注意胶条状态）
+#   漏水风险 : < 28.00 或 >= 41.00             -> level 3（需工人返工）
 OFFSET_LV_NORMAL_LO = 33.00
 OFFSET_LV_NORMAL_HI = 35.00
 OFFSET_LV_SLIGHT_LO = 30.00
 OFFSET_LV_SLIGHT_HI = 38.00
 OFFSET_LV_MODERATE_LO = 28.00
-OFFSET_LV_MODERATE_HI = 40.50
+OFFSET_LV_MODERATE_HI = 41.00
 OFFSET_LEVELS = {0: "正常", 1: "轻微偏移", 2: "中度偏移", 3: "漏水风险"}
 OFFSET_LEVEL_UNKNOWN = -1
 OFFSET_LEVEL_UNKNOWN_NAME = "未检出"
@@ -108,9 +108,9 @@ def classify_offset_level(x):
         return 0, OFFSET_LEVELS[0]
     if x < OFFSET_LV_SLIGHT_HI:             # [35.00, 38.00)
         return 1, OFFSET_LEVELS[1]
-    if x < OFFSET_LV_MODERATE_HI:           # [38.00, 40.50)
+    if x < OFFSET_LV_MODERATE_HI:           # [38.00, 41.00)
         return 2, OFFSET_LEVELS[2]
-    return 3, OFFSET_LEVELS[3]              # >= 40.50
+    return 3, OFFSET_LEVELS[3]              # >= 41.00
 SEAL_END_TRIM = 0.10       # 距离检测去掉每段首/尾 10%（两端偏差大，不计入中心线距离）
 
 
