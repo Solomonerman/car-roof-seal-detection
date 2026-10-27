@@ -22,7 +22,7 @@ LAUNCH_ITEMS = [
         "cmd": ["capture/web_capture.py", "--plc-auto"],
         "port": 5000,
         "log": "logs/工控机_web_capture.log",
-        "open_url": None,          # 用户选择只开看板, 不开采集页
+        "open_url": "http://localhost:5000",   # 启动后自动开相机实时取景页
     },
     {
         "name": "监控看板 ui.app",
