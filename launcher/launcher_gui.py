@@ -79,7 +79,10 @@ class LauncherApp:
                                   state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=12)
         tk.Button(btn_frm, text="打开看板", width=10, height=2,
-                  command=lambda: webbrowser.open("http://localhost:8000")).pack(side=tk.LEFT, padx=6)
+                  command=lambda: webbrowser.open(
+                      next((it["open_url"] for it in C.LAUNCH_ITEMS
+                            if it.get("port") == 8000 and it.get("open_url")),
+                           "http://localhost:8000/board"))).pack(side=tk.LEFT, padx=6)
 
         # ---- 日志面板 ----
         tk.Label(root, text="实时日志（启停台 + 采集程序 + 看板）:").pack(anchor="w", padx=14)

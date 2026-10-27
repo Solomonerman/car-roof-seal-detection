@@ -29,7 +29,7 @@ LAUNCH_ITEMS = [
         "cmd": ["-m", "uvicorn", "ui.app:app", "--port", "8000"],
         "port": 8000,
         "log": "logs/工控机_ui.log",
-        "open_url": "http://127.0.0.1:8000/board",   # 启动后自动开全屏看板(/board, 显示OK/NG)
+        "open_url": "http://localhost:8000/board",   # 启动后自动开全屏看板(/board, 显示OK/NG)
     },
 ]
 
