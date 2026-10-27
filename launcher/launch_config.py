@@ -22,14 +22,14 @@ LAUNCH_ITEMS = [
         "cmd": ["capture/web_capture.py", "--plc-auto"],
         "port": 5000,
         "log": "logs/工控机_web_capture.log",
-        "open_url": "http://localhost:5000",   # 启动后自动开相机实时取景页
+        "open_url": None,          # 用户选择只开看板, 不开采集页
     },
     {
         "name": "监控看板 ui.app",
         "cmd": ["-m", "uvicorn", "ui.app:app", "--port", "8000"],
         "port": 8000,
         "log": "logs/工控机_ui.log",
-        "open_url": "http://localhost:8000/board",   # 启动后自动开全屏看板(/board, 显示OK/NG)
+        "open_url": "http://localhost:8000",   # 启动后自动开看板
     },
 ]
 
