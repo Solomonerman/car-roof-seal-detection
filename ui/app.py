@@ -18,6 +18,7 @@ import html as _html
 import base64 as _b64mod
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -454,7 +455,8 @@ def _build_mosaic(proc_dir_rel):
         ok = bool((s or {}).get("ok", True))
         lv = int((s or {}).get("offset_level", 0) or 0)
         wi = bool((s or {}).get("width_in_spec", True))
-        return arr, kind, ok, lv, wi, b
+        loc_ok = bool((s or {}).get("loc_ok", True))
+        return arr, kind, ok, lv, wi, b, loc_ok
 
     mask_tiles = [_tile(b, "mask", masks) for b in bases]
     offset_tiles = [_tile(b, "offset", offs) for b in bases]
@@ -475,7 +477,7 @@ def _build_mosaic(proc_dir_rel):
         CELL_H = MAX_MOSAIC_H // 3           # 保底，避免异常比例导致图太小
 
     def _process(tile):
-        arr, kind, ok, lv, wi, b = tile
+        arr, kind, ok, lv, wi, b, loc_ok = tile
         if arr is None or arr.size == 0:
             arr = np.zeros((CELL_H, CELL_W, 3), np.uint8)
         else:
@@ -483,7 +485,7 @@ def _build_mosaic(proc_dir_rel):
         fn = _frame_no(b)
         label = ("宽度检测（帧%02d）" if kind == "mask" else "偏移检测（帧%02d）") % fn
         _draw_caption(arr, label)
-        _draw_status(arr, ok, lv, mask=(kind == "mask"), width_in_spec=wi)
+        _draw_status(arr, ok, lv, mask=(kind == "mask"), width_in_spec=wi, loc_ok=loc_ok)
         return arr
 
     mask_imgs = [_process(t) for t in mask_tiles]
@@ -531,7 +533,49 @@ def _draw_caption(vis, text):
                 scale, (255, 255, 255), 2)
 
 
-def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
+def _load_cn_font(size):
+    """按优先级尝试系统中文字体（Windows 常见路径），全部失败回退默认字体。"""
+    for fp in ("C:/Windows/Fonts/simhei.ttf",
+               "C:/Windows/Fonts/msyh.ttc",
+               "C:/Windows/Fonts/simsun.ttc"):
+        try:
+            return ImageFont.truetype(fp, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_chinese_centered(vis, text, max_height_px, color=(0, 255, 255)):
+    """用 PIL 在 BGR 图上居中绘制中文（OpenCV 原生 putText 不支持中文）。
+
+    - max_height_px：字高上限（像素），实际字高不超过它；若整行宽度超出
+      图片宽度则等比缩小以自适应（避免被截断）。
+    - color：BGR，默认黄色 (0, 255, 255)。
+    原地修改 vis。
+    """
+    h, w = vis.shape[:2]
+    pad = 6
+    max_w = max(1, w - 2 * pad)
+    size = max(12, int(max_height_px))
+    _d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    font = _load_cn_font(size)
+    tw = _d.textbbox((0, 0), text, font=font)[2]
+    if tw > max_w:                       # 超宽则等比缩到 fit 宽度
+        size = max(12, int(size * max_w / tw))
+        font = _load_cn_font(size)
+    bbox = _d.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    cx = max(0, (w - tw) // 2)
+    cy = max(0, (h - th) // 2)
+    rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(rgb)
+    d = ImageDraw.Draw(img)
+    d.rectangle([cx - pad, cy - pad, cx + tw + pad, cy + th + pad], fill=(0, 0, 0))
+    d.text((cx, cy), text, font=font, fill=(color[2], color[1], color[0]))
+    vis[:] = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True, loc_ok=True):
     """每张结果图：整图粗边框 + 底部居中 OK/NG 大字（加粗）。
 
     外框颜色：
@@ -568,6 +612,11 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True):
     cv2.rectangle(vis, (cx - 10, yb - 10), (cx + tw + 10, yb + th + 10), (0, 0, 0), -1)
     cv2.putText(vis, text, (cx, yb + th), cv2.FONT_HERSHEY_SIMPLEX,
                 scale, color, thick)
+    # 未检测到胶条（loc_ok=False：定位器未定位到任何胶条框）→ 黄色居中提示，
+    # 字高≤OK/NG的70%且自适应不超格子宽度；与 OK/NG 大字共存便于现场复核
+    if not loc_ok:
+        _draw_chinese_centered(vis, "未检测到胶条，请再次确认",
+                               max_height_px=int(th * 0.7), color=(0, 255, 255))
 
 
 def _make_label_strip(text: str, width: int, height: int):
