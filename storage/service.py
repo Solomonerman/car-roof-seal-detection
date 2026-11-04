@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sqlite3
 from common.interfaces import InspectionRecord
 from storage.database import Database
@@ -110,6 +111,7 @@ class StorageService:
         self._save_count += 1
         if self._save_count % _PRUNE_EVERY == 0:
             self.prune()
+            self._prune_process_data()
 
     def prune(self, keep_days=KEEP_DAYS, hard_cap=KEEP_RECORDS):
         """清理过期/超额记录及其图片，防磁盘无限增长。
@@ -176,3 +178,41 @@ class StorageService:
                     pass
         with sqlite3.connect(self.db.db_path) as conn:
             conn.execute("DELETE FROM records WHERE id=?", (rid,))
+
+    def _prune_process_data(self, keep_days=KEEP_DAYS):
+        """滚动清理 data/process_data 下的检测过程文件夹，只保留最近 keep_days 天。
+
+        文件夹名以 'YYYYMMDD_HHMMSS' 开头（web_capture._run_detection 生成），
+        按该时间戳判定年龄；解析失败退回文件夹 mtime 兜底。keep_days<=0 不清理。
+        """
+        if not keep_days or keep_days <= 0:
+            return
+        proc_root = os.path.join("data", "process_data")
+        if not os.path.isdir(proc_root):
+            return
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=keep_days)
+        removed = 0
+        for name in os.listdir(proc_root):
+            full = os.path.join(proc_root, name)
+            if not os.path.isdir(full):
+                continue
+            dt = None
+            m = re.match(r"(\d{8})_(\d{6})", name)
+            if m:
+                try:
+                    dt = datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+                except ValueError:
+                    dt = None
+            if dt is None:
+                try:
+                    dt = datetime.datetime.fromtimestamp(os.path.getmtime(full))
+                except Exception:
+                    continue
+            if dt < cutoff:
+                try:
+                    shutil.rmtree(full, ignore_errors=True)
+                    removed += 1
+                except Exception:
+                    pass
+        if removed:
+            print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 清理 process_data 超过{keep_days}天文件夹 {removed} 个")
