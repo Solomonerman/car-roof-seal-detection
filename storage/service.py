@@ -46,12 +46,12 @@ def _stamp_from_name(fname):
 
 # 保留策略（防现场磁盘无限增长、最终写满崩溃的最后一道闸）：
 #   磁盘水位式滚动清理（产量不稳场景，按剩余空间反推删旧）：
-#   - 剩余空间 < DISK_FREE_LOW_GB(15G) 触发清理，删到 >= DISK_FREE_HIGH_GB(25G) 停手；
+#   - 剩余空间 < DISK_FREE_LOW_GB(15G) 触发清理，删到 >= DISK_FREE_HIGH_GB(20G) 停手；
 #   - 顺序：先删 process_data 过程图（最旧先删），不足再删 inspection 照片（最旧先删）；
 #   - 保底：今天的数据永不删除；空间够就一直留，产量低的时期自动攒更长保留期。
 # DISK_FREE_LOW_GB<=0 关闭清理。
 DISK_FREE_LOW_GB = 15.0
-DISK_FREE_HIGH_GB = 25.0
+DISK_FREE_HIGH_GB = 20.0
 _PRUNE_EVERY = 20      # 每 N 次 save 检查一次磁盘水位（磁盘检查开销极小）
 
 _svc = None
