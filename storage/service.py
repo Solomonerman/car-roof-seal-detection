@@ -43,9 +43,13 @@ def _stamp_from_name(fname):
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# 保留最近 N 条记录，超出则清理旧记录+对应图片（0=不清理，谨慎可设大值）。
-# 这是防止现场磁盘无限增长、最终写满崩溃的最后一道闸。
-KEEP_RECORDS = 3000
+# 保留策略（防现场磁盘无限增长、最终写满崩溃的最后一道闸）：
+#   - 时间维度：保留最近 KEEP_DAYS 天（默认60天≈2个月）的记录与照片；
+#   - 数量维度：记录总数超过 KEEP_RECORDS 仍按最旧清理，作为节拍突增/时钟异常的兜底。
+# 两者同时生效：先按时间删过期记录，若仍超硬上限再按 id 最旧删。
+# KEEP_DAYS<=0 关闭时间清理；KEEP_RECORDS<=0 关闭数量兜底（谨慎，可能写满磁盘）。
+KEEP_DAYS = 60
+KEEP_RECORDS = 60000
 _PRUNE_EVERY = 20      # 每 N 次 save 执行一次清理（降频，避免每次都扫库）
 
 _svc = None
@@ -107,43 +111,68 @@ class StorageService:
         if self._save_count % _PRUNE_EVERY == 0:
             self.prune()
 
-    def prune(self, keep=KEEP_RECORDS):
-        """清理最旧记录及其图片，防磁盘无限增长。keep<=0 表示不清理。"""
-        if not keep or keep <= 0:
-            return
+    def prune(self, keep_days=KEEP_DAYS, hard_cap=KEEP_RECORDS):
+        """清理过期/超额记录及其图片，防磁盘无限增长。
+
+        - 时间维度：删除 timestamp 早于 (now - keep_days) 的记录与照片；
+        - 数量维度：若仍超过 hard_cap，再按 id 最旧删（节拍突增/时钟异常兜底）。
+        keep_days<=0 关闭时间清理；hard_cap<=0 关闭数量兜底。
+        """
         try:
-            n = self.db.count()
-            if n <= keep:
-                return
-            excess = n - keep
-            with sqlite3.connect(self.db.db_path) as conn:
-                rows = conn.execute(
-                    "SELECT id, image_refs FROM records ORDER BY id ASC LIMIT ?",
-                    (excess,),
-                ).fetchall()
-            for rid, refs_json in rows:
-                try:
-                    refs = json.loads(refs_json) if refs_json else []
-                except Exception:
-                    refs = []
-                car_dir = None
-                for ref in refs:
-                    rel = ref.split("/")[1:]          # 去掉 bucket 段
-                    p = os.path.join(self.store.local_dir, *rel)
-                    car_dir = os.path.dirname(p)
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except Exception:
-                        pass
-                # 清理已空的 车→天 文件夹，避免留下一堆空目录
-                if car_dir:
-                    for d in (car_dir, os.path.dirname(car_dir)):
-                        try:
-                            os.rmdir(d)
-                        except OSError:
-                            pass
+            if keep_days and keep_days > 0:
+                cutoff = (datetime.datetime.now()
+                          - datetime.timedelta(days=keep_days))
+                cutoff_iso = cutoff.isoformat(timespec="seconds")
                 with sqlite3.connect(self.db.db_path) as conn:
-                    conn.execute("DELETE FROM records WHERE id=?", (rid,))
+                    rows = conn.execute(
+                        "SELECT id, image_refs FROM records "
+                        "WHERE timestamp IS NOT NULL AND timestamp < ?",
+                        (cutoff_iso,),
+                    ).fetchall()
+                if rows:
+                    print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 清理过期记录 {len(rows)} 条（保留最近{keep_days}天）")
+                for rid, refs_json in rows:
+                    self._delete_record_files(rid, refs_json)
+
+            if hard_cap and hard_cap > 0:
+                n = self.db.count()
+                if n > hard_cap:
+                    excess = n - hard_cap
+                    with sqlite3.connect(self.db.db_path) as conn:
+                        rows = conn.execute(
+                            "SELECT id, image_refs FROM records "
+                            "ORDER BY id ASC LIMIT ?",
+                            (excess,),
+                        ).fetchall()
+                    if rows:
+                        print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 超上限{hard_cap}条，清理最旧 {len(rows)} 条")
+                    for rid, refs_json in rows:
+                        self._delete_record_files(rid, refs_json)
         except Exception as e:
             print(f"[存储] 清理失败: {e}")
+
+    def _delete_record_files(self, rid, refs_json):
+        """删除单条记录对应的照片文件+空文件夹，并从 DB 删除该记录。"""
+        try:
+            refs = json.loads(refs_json) if refs_json else []
+        except Exception:
+            refs = []
+        car_dir = None
+        for ref in refs:
+            rel = ref.split("/")[1:]          # 去掉 bucket 段
+            p = os.path.join(self.store.local_dir, *rel)
+            car_dir = os.path.dirname(p)
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        # 清理已空的 车→天 文件夹，避免留下一堆空目录
+        if car_dir:
+            for d in (car_dir, os.path.dirname(car_dir)):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+        with sqlite3.connect(self.db.db_path) as conn:
+            conn.execute("DELETE FROM records WHERE id=?", (rid,))
