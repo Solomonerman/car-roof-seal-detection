@@ -45,13 +45,14 @@ def _stamp_from_name(fname):
 
 
 # 保留策略（防现场磁盘无限增长、最终写满崩溃的最后一道闸）：
-#   - 时间维度：保留最近 KEEP_DAYS 天（默认60天≈2个月）的记录与照片；
-#   - 数量维度：记录总数超过 KEEP_RECORDS 仍按最旧清理，作为节拍突增/时钟异常的兜底。
-# 两者同时生效：先按时间删过期记录，若仍超硬上限再按 id 最旧删。
-# KEEP_DAYS<=0 关闭时间清理；KEEP_RECORDS<=0 关闭数量兜底（谨慎，可能写满磁盘）。
-KEEP_DAYS = 60
-KEEP_RECORDS = 60000
-_PRUNE_EVERY = 20      # 每 N 次 save 执行一次清理（降频，避免每次都扫库）
+#   磁盘水位式滚动清理（产量不稳场景，按剩余空间反推删旧）：
+#   - 剩余空间 < DISK_FREE_LOW_GB(20G) 触发清理，删到 >= DISK_FREE_HIGH_GB(40G) 停手；
+#   - 顺序：先删 process_data 过程图（最旧先删），不足再删 inspection 照片（最旧先删）；
+#   - 保底：今天的数据永不删除；空间够就一直留，产量低的时期自动攒更长保留期。
+# DISK_FREE_LOW_GB<=0 关闭清理。
+DISK_FREE_LOW_GB = 20.0
+DISK_FREE_HIGH_GB = 40.0
+_PRUNE_EVERY = 20      # 每 N 次 save 检查一次磁盘水位（磁盘检查开销极小）
 
 _svc = None
 def get_service():
@@ -110,48 +111,106 @@ class StorageService:
     def _maybe_prune(self):
         self._save_count += 1
         if self._save_count % _PRUNE_EVERY == 0:
-            self.prune()
-            self._prune_process_data()
+            self.prune_by_space()
 
-    def prune(self, keep_days=KEEP_DAYS, hard_cap=KEEP_RECORDS):
-        """清理过期/超额记录及其图片，防磁盘无限增长。
+    def _disk_free_gb(self):
+        """返回数据所在磁盘的剩余空间(GB)。取 data/inspection 所在卷。"""
+        p = os.path.abspath(self.store.local_dir)
+        while p and not os.path.isdir(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        return shutil.disk_usage(p).free / (1024.0 ** 3)
 
-        - 时间维度：删除 timestamp 早于 (now - keep_days) 的记录与照片；
-        - 数量维度：若仍超过 hard_cap，再按 id 最旧删（节拍突增/时钟异常兜底）。
-        keep_days<=0 关闭时间清理；hard_cap<=0 关闭数量兜底。
+    def prune_by_space(self, low_gb=DISK_FREE_LOW_GB, high_gb=DISK_FREE_HIGH_GB):
+        """磁盘水位式滚动清理（产量不稳场景，按剩余空间反推删旧）。
+
+        - 剩余空间 < low_gb 触发清理，删到 >= high_gb 停手；
+        - 顺序：先删 process_data 过程图（最旧先删），不足再删 inspection 照片（最旧先删）；
+        - 保底：今天的数据永不删除。low_gb<=0 关闭清理。
         """
+        if not low_gb or low_gb <= 0:
+            return
         try:
-            if keep_days and keep_days > 0:
-                cutoff = (datetime.datetime.now()
-                          - datetime.timedelta(days=keep_days))
-                cutoff_iso = cutoff.isoformat(timespec="seconds")
-                with sqlite3.connect(self.db.db_path) as conn:
-                    rows = conn.execute(
-                        "SELECT id, image_refs FROM records "
-                        "WHERE timestamp IS NOT NULL AND timestamp < ?",
-                        (cutoff_iso,),
-                    ).fetchall()
-                if rows:
-                    print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 清理过期记录 {len(rows)} 条（保留最近{keep_days}天）")
-                for rid, refs_json in rows:
-                    self._delete_record_files(rid, refs_json)
-
-            if hard_cap and hard_cap > 0:
-                n = self.db.count()
-                if n > hard_cap:
-                    excess = n - hard_cap
-                    with sqlite3.connect(self.db.db_path) as conn:
-                        rows = conn.execute(
-                            "SELECT id, image_refs FROM records "
-                            "ORDER BY id ASC LIMIT ?",
-                            (excess,),
-                        ).fetchall()
-                    if rows:
-                        print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 超上限{hard_cap}条，清理最旧 {len(rows)} 条")
-                    for rid, refs_json in rows:
-                        self._delete_record_files(rid, refs_json)
+            free = self._disk_free_gb()
+            if free >= low_gb:
+                return
+            now = datetime.datetime.now()
+            today = now.date()
+            print(f"[存储][{now:%m-%d %H:%M}] 磁盘剩余 {free:.1f}G < {low_gb}G，开始滚动清理（目标 {high_gb}G，先过程图后照片）")
+            removed_proc = self._prune_process_data_until(high_gb, today)
+            removed_rec = 0
+            if self._disk_free_gb() < high_gb:
+                removed_rec = self._prune_inspection_until(high_gb, today)
+            print(f"[存储][{now:%m-%d %H:%M}] 清理结束：过程图 {removed_proc} 个、照片记录 {removed_rec} 条，剩余 {self._disk_free_gb():.1f}G")
         except Exception as e:
             print(f"[存储] 清理失败: {e}")
+
+    @staticmethod
+    def _folder_dt(name, mtime):
+        """process_data 文件夹名前缀 YYYYMMDD_HHMMSS → 判定时刻；失败退回 mtime。"""
+        m = re.match(r"(\d{8})_(\d{6})", name)
+        if m:
+            try:
+                return datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            except ValueError:
+                pass
+        return datetime.datetime.fromtimestamp(mtime)
+
+    def _prune_process_data_until(self, target_gb, today):
+        """从最旧开始删 process_data 文件夹，删到磁盘剩余 >= target_gb。今天不删。"""
+        proc_root = os.path.join("data", "process_data")
+        if not os.path.isdir(proc_root):
+            return 0
+        entries = []
+        for name in os.listdir(proc_root):
+            full = os.path.join(proc_root, name)
+            if not os.path.isdir(full):
+                continue
+            try:
+                dt = self._folder_dt(name, os.path.getmtime(full))
+            except Exception:
+                continue
+            if dt.date() == today:
+                continue
+            entries.append((dt, full))
+        entries.sort(key=lambda x: x[0])
+        removed = 0
+        for dt, full in entries:
+            if self._disk_free_gb() >= target_gb:
+                break
+            try:
+                shutil.rmtree(full, ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 滚动清理 process_data 最旧 {removed} 个文件夹（保今天，删到剩余 {target_gb}G）")
+        return removed
+
+    def _prune_inspection_until(self, target_gb, today):
+        """从最旧开始删 inspection 记录+照片，删到磁盘剩余 >= target_gb。今天不删。"""
+        removed = 0
+        today_s = today.isoformat()
+        while self._disk_free_gb() < target_gb:
+            with sqlite3.connect(self.db.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, image_refs FROM records "
+                    "WHERE timestamp IS NOT NULL AND substr(timestamp,1,10) != ? "
+                    "ORDER BY id ASC LIMIT 20",
+                    (today_s,),
+                ).fetchall()
+            if not rows:
+                break
+            for rid, refs_json in rows:
+                self._delete_record_files(rid, refs_json)
+                removed += 1
+                if self._disk_free_gb() >= target_gb:
+                    break
+        if removed:
+            print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 滚动清理 inspection 最旧 {removed} 条记录+照片（保今天，删到剩余 {target_gb}G）")
+        return removed
 
     def _delete_record_files(self, rid, refs_json):
         """删除单条记录对应的照片文件+空文件夹，并从 DB 删除该记录。"""
@@ -178,41 +237,3 @@ class StorageService:
                     pass
         with sqlite3.connect(self.db.db_path) as conn:
             conn.execute("DELETE FROM records WHERE id=?", (rid,))
-
-    def _prune_process_data(self, keep_days=KEEP_DAYS):
-        """滚动清理 data/process_data 下的检测过程文件夹，只保留最近 keep_days 天。
-
-        文件夹名以 'YYYYMMDD_HHMMSS' 开头（web_capture._run_detection 生成），
-        按该时间戳判定年龄；解析失败退回文件夹 mtime 兜底。keep_days<=0 不清理。
-        """
-        if not keep_days or keep_days <= 0:
-            return
-        proc_root = os.path.join("data", "process_data")
-        if not os.path.isdir(proc_root):
-            return
-        cutoff = datetime.datetime.now() - datetime.timedelta(days=keep_days)
-        removed = 0
-        for name in os.listdir(proc_root):
-            full = os.path.join(proc_root, name)
-            if not os.path.isdir(full):
-                continue
-            dt = None
-            m = re.match(r"(\d{8})_(\d{6})", name)
-            if m:
-                try:
-                    dt = datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-                except ValueError:
-                    dt = None
-            if dt is None:
-                try:
-                    dt = datetime.datetime.fromtimestamp(os.path.getmtime(full))
-                except Exception:
-                    continue
-            if dt < cutoff:
-                try:
-                    shutil.rmtree(full, ignore_errors=True)
-                    removed += 1
-                except Exception:
-                    pass
-        if removed:
-            print(f"[存储][{datetime.datetime.now():%m-%d %H:%M}] 清理 process_data 超过{keep_days}天文件夹 {removed} 个")
