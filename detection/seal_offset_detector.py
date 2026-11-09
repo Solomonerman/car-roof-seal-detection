@@ -38,6 +38,7 @@ WIDTH_SPEC_LO = 16.0
 WIDTH_SPEC_HI = 32.0
 WIDTH_MIN_RUN_COLS = 15                    # 宽度连续超差列数阈值（抗单列噪点）
 SMALL_BOX_AREA_RATIO = 0.02                 # 小框面积占比阈值: 面积 < 此值*整图面积 且 框内无胶条 → 视为误检丢弃(按OK), 避免角落假框制造假NG
+MIN_BOX_WIDTH_PX = 220                      # 红框筛选: 宽度(长边,px) < 220 的框视为碎片误检, 算法收到红框后直接剔除不参与检测(2026-11-09 用户定)
 # 偏移报警：仅『漏水风险』(level=3) 才判 offset 缺陷并计 NG；中度/轻微仅展示、不判NG
 OFFSET_NG_LEVEL = 3
 
@@ -197,6 +198,13 @@ class SealOffsetDetector:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         ih, iw = gray.shape[:2]
         boxes = self._loc.locate(bgr)
+        # 红框交付后统一筛选(用户定 2026-11-09)：宽度(长边) < MIN_BOX_WIDTH_PX 的框剔除，不参与检测。
+        # 与定位来源无关(YOLO/红框回退同闸口)。若筛后为空 → 走下方"未定位到胶条框"整图兜底(不判NG)。
+        n_raw = len(boxes)
+        boxes = [b for b in boxes if b[2] >= MIN_BOX_WIDTH_PX]
+        if len(boxes) < n_raw:
+            print(f"[SealOffset][INFO] 帧 {os.path.basename(path)} 红框宽度筛选: "
+                  f"剔除 {n_raw - len(boxes)} 个宽<{MIN_BOX_WIDTH_PX}px 的碎片框")
         loc_failed = (len(boxes) == 0)     # YOLO/红框未定位到任何胶条框
         if loc_failed:
             # 无定位框：整图兜底为单一 ROI（现场无标注框 / 定位失败时不致整图漏检）
