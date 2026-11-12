@@ -1,45 +1,37 @@
 # -*- coding: utf-8 -*-
 """PLC 检测结果回写模块（生产安全）。
 
-⚠️ 红线：DB 写地址【尚未向现场确认】，总开关默认关闭（ENABLED=False）。
-   当前状态：接口就绪、代码可测，但不会向 PLC 写任何数据。
-   启用条件：用户明确授权 + 电气确认写地址 + 非生产时段单独评审。
+写地址（电气确认 2026-11-12）：DB890.DBX231.7（单个 bit）
+信号值：1=报警 / 0=放行
 
 信号设计（用户 2026-11-12 拍板）：
-  ① OK              → 放行（SIGNAL_PASS=1）
-  ② NG              → 拦截报警（SIGNAL_BLOCK=0）
+  ① OK              → 放行（bit=0）
+  ② NG              → 报警（bit=1）
   ③ 未检测到胶条     → 放行（按 OK；图上黄字 + loc_ok=False 留痕人工复核）
-  ④ 检测异常         → 拦截报警（安全侧兜底）
+  ④ 检测异常         → 报警（安全侧兜底）
 
-  合并后 PLC 信号为二值：1=放行 / 0=拦截报警。
-
-  ⚠️ 实现层坑：④"检测异常"时程序可能崩溃走不到回写这一步。
-  PLC 侧须定"超时未收到信号 = 默认拦截"兜底规则（需电气配合）。
+  ⚠️ 实现层坑：程序崩溃时走不到回写。
+  兜底方案：① handle_car_signal 外层 try/except 里 send_alarm()；
+            ② PLC 侧建议做"超时未收到信号=报警"双保险（需电气配合）。
 
 调用时机：web_capture.py handle_car_signal 自动链路、真实检测完成后调用 send_result()。
 手动拍摄 / 免检车 / 车型未接入 → 不回写（本模块不处理）。
-
-待确认项（电气）：
-  1. 写回用哪个 DB 块 / 字节偏移？（DB_WRITE_DB / DB_WRITE_OFFSET）
-  2. 是否需要回写滑橇号/PIN 以便 PLC 对应来车？
-  3. 握手方式：写完是否需要置位/清零？超时拦截的 PLC 侧逻辑？
 """
 
-import time
-
-# ===================== 总开关与地址（红线：未确认不写）=====================
-ENABLED = False           # 总开关：用户明确授权后改 True
-DB_WRITE_DB = None        # 写入的 DB 块号（如 130），待电气确认
-DB_WRITE_OFFSET = None    # 写入的字节偏移（如 10），待电气确认
+# ===================== 总开关与地址 =====================
+ENABLED = True            # 已启用（电气确认地址 2026-11-12）
+DB_WRITE_DB = 890         # DB890
+DB_WRITE_BYTE = 231       # 字节偏移 231
+DB_WRITE_BIT = 7          # bit 7（DBX231.7）
 
 # ===================== PLC 连接参数（与 plc_monitor 一致）=====================
 PLC_IP = "172.30.173.6"
 PLC_RACK = 0
 PLC_SLOT = 2
 
-# ===================== 信号值定义 =====================
-SIGNAL_PASS = 1           # 放行
-SIGNAL_BLOCK = 0          # 拦截报警
+# ===================== 信号值定义（用户指定）=====================
+SIGNAL_PASS = 0           # 放行
+SIGNAL_BLOCK = 1          # 报警
 
 # snap7 可用性检测（沙箱/无 snap7 环境下安全降级）
 try:
@@ -57,8 +49,8 @@ def classify_result(det):
     """把 DetectionResult 分成 4 种情况，返回 (case_id, signal, should_write, desc)。
 
     分类规则：
-      case 4（检测异常）→ 拦截：defects 含 label="pending" 且 meta.reason 含"检测异常"
-      case 2（NG）      → 拦截：det.ok == False
+      case 4（检测异常）→ 报警：defects 含 label="pending" 且 meta.reason 含"检测异常"
+      case 2（NG）      → 报警：det.ok == False
       case 3（未检测到）→ 放行：det.ok==True 且含 label="loc_warn"
       case 1（OK）      → 放行：其余
 
@@ -72,7 +64,7 @@ def classify_result(det):
         (case_id, signal_value, should_write, description)
     """
     if det is None:
-        return (0, 0, False, "det=None-不回写")
+        return (0, SIGNAL_PASS, False, "det=None-不回写")
 
     defects = det.defects or []
     labels = [getattr(d, "label", "") for d in defects]
@@ -83,17 +75,17 @@ def classify_result(det):
                    if getattr(d, "label", "") == "pending"]
         reason = str(reasons[0].get("reason", "")) if reasons else ""
         if "检测异常" in reason:
-            return (4, SIGNAL_BLOCK, True, f"检测异常-拦截: {reason}")
+            return (4, SIGNAL_BLOCK, True, f"检测异常-报警: {reason}")
         if "无照片" in reason:
-            return (0, 0, False, "无照片-不回写")
+            return (0, SIGNAL_PASS, False, "无照片-不回写")
         if "算法未接入" in reason:
-            return (0, 0, False, "算法未接入-不回写")
-        # 其他未知 pending → 安全侧拦截
-        return (4, SIGNAL_BLOCK, True, f"未知异常-拦截: {reason}")
+            return (0, SIGNAL_PASS, False, "算法未接入-不回写")
+        # 其他未知 pending → 安全侧报警
+        return (4, SIGNAL_BLOCK, True, f"未知异常-报警: {reason}")
 
     # ---- 正常检测结果的 3 种 ----
     if not det.ok:
-        return (2, SIGNAL_BLOCK, True, "NG-拦截报警")
+        return (2, SIGNAL_BLOCK, True, "NG-报警拦截")
 
     if "loc_warn" in labels:
         return (3, SIGNAL_PASS, True, "未检测到胶条-放行(人工复核)")
@@ -101,12 +93,43 @@ def classify_result(det):
     return (1, SIGNAL_PASS, True, "OK-放行")
 
 
+def _write_bit(signal):
+    """把 signal(0/1) 写到 DB890.DBX231.7（读-改-写 1 字节）。
+
+    返回 (success, detail)。
+    """
+    if not HAS_SNAP7:
+        return (False, "snap7 未安装")
+    client = None
+    try:
+        client = snap7.client.Client()
+        client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
+        # 读-改-写：先读整字节 231，改 bit7，再写回
+        buf = client.read_area(S7AreaDB, DB_WRITE_DB, DB_WRITE_BYTE, 1)
+        val = buf[0]
+        if signal:  # 报警=1：置位 bit7
+            val |= (1 << DB_WRITE_BIT)
+        else:       # 放行=0：清零 bit7
+            val &= ~(1 << DB_WRITE_BIT) & 0xFF
+        buf[0] = val
+        client.write_area(S7AreaDB, DB_WRITE_DB, DB_WRITE_BYTE, buf)
+        return (True, f"DB{DB_WRITE_DB}.DBX{DB_WRITE_BYTE}.{DB_WRITE_BIT}={signal}")
+    except Exception as e:
+        return (False, f"PLC写入失败: {e}")
+    finally:
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+
 def send_result(det, skid=None, pin=""):
     """检测结果回写 PLC 入口。
 
     参数:
         det: DetectionResult（web_capture 的检测结果）
-        skid: 滑橇号（预留，待确认是否需回写）
+        skid: 滑橇号（预留）
         pin: PIN 码（预留）
 
     返回:
@@ -122,31 +145,27 @@ def send_result(det, skid=None, pin=""):
         print(f"[PLC回写] 总开关未开启(case={case_id} {desc})，不写 PLC")
         return (False, "总开关未开启")
 
-    if not HAS_SNAP7:
-        print(f"[PLC回写] snap7 未安装，无法写 PLC(case={case_id})")
-        return (False, "snap7 未安装")
+    ok, detail = _write_bit(signal)
+    if ok:
+        print(f"[PLC回写] ✅ {detail} (case={case_id} {desc} skid={skid} pin={pin})")
+    else:
+        print(f"[PLC回写] ❌ {detail} (case={case_id})")
+    return (ok, f"case={case_id} signal={signal} {desc} | {detail}")
 
-    if DB_WRITE_DB is None or DB_WRITE_OFFSET is None:
-        print(f"[PLC回写] ⚠️ 写地址未确认(DB_WRITE_DB/DB_WRITE_OFFSET=None)，拒写(case={case_id})")
-        return (False, "写地址未确认")
 
-    # ---- snap7 写入 ----
-    client = None
-    try:
-        client = snap7.client.Client()
-        client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
-        # 写 1 字节信号值到指定 DB 地址
-        buf = bytearray([signal & 0xFF])
-        client.db_write(DB_WRITE_DB, DB_WRITE_OFFSET, buf)
-        print(f"[PLC回写] ✅ 已写 DB{DB_WRITE_DB}.DBB{DB_WRITE_OFFSET}={signal} "
-              f"(case={case_id} {desc} skid={skid} pin={pin})")
-        return (True, f"case={case_id} signal={signal} {desc}")
-    except Exception as e:
-        print(f"[PLC回写] ❌ PLC 写入失败(case={case_id}): {e}")
-        return (False, f"PLC写入失败: {e}")
-    finally:
-        if client is not None:
-            try:
-                client.disconnect()
-            except Exception:
-                pass
+def send_alarm(reason="程序异常兜底"):
+    """紧急报警：强制写报警信号(bit=1)。
+
+    用于程序崩溃/异常时的兜底——在 try/except 里调用，
+    确保即使主流程出错也能给 PLC 一个报警信号。
+    PLC 侧建议配合"超时未收到=报警"双保险。
+    """
+    if not ENABLED:
+        print(f"[PLC回写] send_alarm: 总开关未开启，跳过 ({reason})")
+        return (False, "总开关未开启")
+    ok, detail = _write_bit(SIGNAL_BLOCK)
+    if ok:
+        print(f"[PLC回写] 🚨 报警已发: {detail} ({reason})")
+    else:
+        print(f"[PLC回写] 🚨 报警发送失败: {detail} ({reason})")
+    return (ok, detail)

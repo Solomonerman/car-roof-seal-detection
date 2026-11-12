@@ -1348,15 +1348,23 @@ def handle_car_signal(ctx):
     write_sidecar(ctx, files, det, db_ok, key, captured,
                   folder=rec.folder if (rec and captured) else "")
 
-    # PLC 回写检测结果（二值信号：放行/拦截报警）。
-    # 仅自动链路 + 真实检测（captured 且 det 非 None）才回写；
-    # 免检/未接入/手动拍摄不写。总开关默认关，零行为变化。
-    if captured and det is not None:
+    # PLC 回写检测结果（bit 信号：0=放行 / 1=报警）。
+    # 仅自动链路 + 真实检测（captured）才回写；免检/未接入/手动拍摄不写。
+    # 崩溃兜底：回写本身出错时 send_alarm() 强制发报警(bit=1)。
+    if captured:
         try:
-            from plc.plc_writeback import send_result
-            send_result(det, skid=skid, pin=pin)
+            from plc.plc_writeback import send_result, send_alarm
+            if det is not None:
+                send_result(det, skid=skid, pin=pin)
+            else:
+                send_alarm("det=None(检测链路异常)")
         except Exception as e:
-            print(f"[PLC回写] 调用异常(不影响主流程): {e}")
+            print(f"[PLC回写] 调用异常: {e}")
+            try:
+                from plc.plc_writeback import send_alarm
+                send_alarm(f"回写异常: {e}")
+            except Exception:
+                pass
 
     # 兜底清理调试目录（自动图已移入 data/inspection，这里只清手动调试残留）
     _prune_scratch()
