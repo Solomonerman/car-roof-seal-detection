@@ -396,7 +396,10 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         <span class="plc-hint">开启时 NG→报警(1)、OK→放行(0)；关闭时 PLC 始终收到放行(0)，界面 NG 照常显示</span>
       </div>
       <script>
+      var _plcBusy=false;
       function togglePlc(){{
+        if(_plcBusy)return;
+        _plcBusy=true;setTimeout(function(){{_plcBusy=false;}},1500);
         fetch('/api/plc_toggle',{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{
           var b=document.getElementById('plcBtn');
           if(d.enabled){{b.textContent='PLC信号: 开';b.className='plc-btn on';}}
