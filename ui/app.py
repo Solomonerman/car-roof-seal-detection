@@ -194,6 +194,40 @@ def records():
     return {"count": _db.count(), "items": items}
 
 
+# ===================== PLC 信号开关（UI 控制）=====================
+_PLC_CFG_PATH = os.path.join(ROOT, "data", "plc_writeback_config.json")
+
+
+@app.get("/api/plc_toggle")
+def plc_toggle_get():
+    """读取 PLC 信号开关状态。"""
+    try:
+        with open(_PLC_CFG_PATH, "r", encoding="utf-8") as f:
+            cfg = _json.load(f)
+        return {"enabled": bool(cfg.get("enabled", True))}
+    except Exception:
+        return {"enabled": True}   # 默认开
+
+
+@app.post("/api/plc_toggle")
+def plc_toggle_set():
+    """切换 PLC 信号开关（开↔关），保存到配置文件（跨重启记忆）。"""
+    try:
+        try:
+            with open(_PLC_CFG_PATH, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except Exception:
+            cfg = {}
+        current = bool(cfg.get("enabled", True))
+        cfg["enabled"] = not current
+        os.makedirs(os.path.dirname(_PLC_CFG_PATH), exist_ok=True)
+        with open(_PLC_CFG_PATH, "w", encoding="utf-8") as f:
+            _json.dump(cfg, f)
+        return {"enabled": cfg["enabled"]}
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+
 def _esc(s) -> str:
     """HTML 转义，防止查询输入注入页面。"""
     return _html.escape(str(s), quote=True)
@@ -294,6 +328,15 @@ def index(skid: str = Query("", description="滑橇号筛选"),
     date_esc = _esc(date)
     ng_checked = "checked" if only_ng else ""
 
+    # PLC 信号开关当前状态（UI 按钮显示用）
+    try:
+        with open(_PLC_CFG_PATH, "r", encoding="utf-8") as _f:
+            _plc_on = bool(_json.load(_f).get("enabled", True))
+    except Exception:
+        _plc_on = True
+    _plc_btn_txt = "PLC信号: 开" if _plc_on else "PLC信号: 关"
+    _plc_btn_cls = "plc-btn on" if _plc_on else "plc-btn off"
+
     return f"""
     <html><head>
       <meta charset="utf-8">
@@ -330,6 +373,11 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         .defects li.ng {{ color:#d23b3b; font-weight:bold; }}
         .defects li.unknown {{ color:#888; }}
         .muted {{ color:#999; font-size:13px; }}
+        .plc-bar {{ background:#fff; border:1px solid #cdd; border-radius:8px; padding:8px 12px; margin-bottom:12px; display:flex; align-items:center; gap:10px; }}
+        .plc-btn {{ padding:5px 18px; border:0; border-radius:4px; font-size:14px; font-weight:bold; cursor:pointer; }}
+        .plc-btn.on {{ background:#2e9e4f; color:#fff; }}
+        .plc-btn.off {{ background:#d23b3b; color:#fff; }}
+        .plc-hint {{ color:#888; font-size:12px; }}
       </style>
     </head>
     <body>
@@ -343,6 +391,19 @@ def index(skid: str = Query("", description="滑橇号筛选"),
         <a class="reset" href="/">重置</a>
         <a class="reset" href="/board">全屏看板</a>
       </form>
+      <div class="plc-bar">
+        <button id="plcBtn" class="{_plc_btn_cls}" onclick="togglePlc()">{_plc_btn_txt}</button>
+        <span class="plc-hint">开启时 NG→报警(1)、OK→放行(0)；关闭时 PLC 始终收到放行(0)，界面 NG 照常显示</span>
+      </div>
+      <script>
+      function togglePlc(){{
+        fetch('/api/plc_toggle',{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{
+          var b=document.getElementById('plcBtn');
+          if(d.enabled){{b.textContent='PLC信号: 开';b.className='plc-btn on';}}
+          else{{b.textContent='PLC信号: 关';b.className='plc-btn off';}}
+       }});
+      }}
+      </script>
       <div class="banner">本页仅显示已拍照（有检测）的车；检测仅针对连拍中第 {DET_FRAME_FROM}~{DET_FRAME_TO} 张（胶条位置），原始照片与检测叠加图同尺寸放大展示供工人目视检查。</div>
       <div class="sum">记录总数：{total}（每 8 秒自动刷新）｜ 本页显示 {len(recs)} 条｜ NG：<b style="color:#d23b3b">{ng}</b></div>
       {cards_html}

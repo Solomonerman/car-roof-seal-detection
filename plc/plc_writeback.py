@@ -16,7 +16,13 @@
 
 调用时机：web_capture.py handle_car_signal 自动链路、真实检测完成后调用 send_result()。
 手动拍摄 / 免检车 / 车型未接入 → 不回写（本模块不处理）。
+
+UI 开关（2026-11-13）：data/plc_writeback_config.json {"enabled": true/false}，
+8000 看板提供开关按钮，关=始终写 0（放行），开=正常写检测结果信号。
 """
+
+import json as _json
+import os as _os
 
 # ===================== 总开关与地址 =====================
 ENABLED = True            # 已启用（电气确认地址 2026-11-12）
@@ -32,6 +38,21 @@ PLC_SLOT = 2
 # ===================== 信号值定义（用户指定）=====================
 SIGNAL_PASS = 0           # 放行
 SIGNAL_BLOCK = 1          # 报警
+
+# ===================== UI 开关配置文件 =====================
+_CONFIG_PATH = _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+    "data", "plc_writeback_config.json")
+
+
+def _read_toggle():
+    """读取 UI 开关状态：True=开(正常发信号) / False=关(始终发0放行)。默认 True。"""
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = _json.load(f)
+        return bool(cfg.get("enabled", True))
+    except Exception:
+        return True   # 文件不存在/读不了 → 默认开（安全侧：正常发信号）
 
 # snap7 可用性检测（沙箱/无 snap7 环境下安全降级）
 try:
@@ -96,8 +117,12 @@ def classify_result(det):
 def _write_bit(signal):
     """把 signal(0/1) 写到 DB890.DBX231.7（读-改-写 1 字节）。
 
+    UI 开关关时：始终写 0（放行），不发报警（覆盖 send_result 和 send_alarm）。
     返回 (success, detail)。
     """
+    # UI 开关：关=始终发 0（放行）
+    if not _read_toggle():
+        signal = SIGNAL_PASS
     if not HAS_SNAP7:
         return (False, "snap7 未安装")
     client = None
