@@ -650,8 +650,19 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True, loc_ok
           NG（任何 NG，含宽度超差/缺失/漏水风险）→ 红色
           OK → 跟随偏移等级配色（与照片一致）：正常=绿 / 轻微=黄 / 中度=橙
     底部 OK/NG 大字颜色与外框保持一致。
+    未检测到胶条（loc_ok=False）：不做判定显示——灰框、不画 OK/NG 大字，
+    仅黄色居中提示人工复核（PLC 信号仍按 OK 放行）。
     """
     h, w = vis.shape[:2]
+    if not loc_ok:
+        # 未检测到胶条：不显示 OK/NG、不做判定（中性灰框），仅黄字提示复核
+        bt = max(6, int(min(h, w) * 0.012))
+        cv2.rectangle(vis, (0, 0), (w - 1, h - 1), (128, 128, 128), bt)  # 中性灰框
+        _scale = 4.0
+        (_tw, _th), _ = cv2.getTextSize("OK", cv2.FONT_HERSHEY_SIMPLEX, _scale, 4)
+        _draw_chinese_centered(vis, "未检测到胶条，请再次确认",
+                               max_height_px=int(_th * 0.7), color=(0, 255, 255))
+        return
     if mask:
         # 宽度检测图：仅按宽度合格与否上色（绿/红）
         ng = not width_in_spec
@@ -676,11 +687,6 @@ def _draw_status(vis, ok, offset_level=0, mask=False, width_in_spec=True, loc_ok
     cv2.rectangle(vis, (cx - 10, yb - 10), (cx + tw + 10, yb + th + 10), (0, 0, 0), -1)
     cv2.putText(vis, text, (cx, yb + th), cv2.FONT_HERSHEY_SIMPLEX,
                 scale, color, thick)
-    # 未检测到胶条（loc_ok=False：定位器未定位到任何胶条框）→ 黄色居中提示，
-    # 字高≤OK/NG的70%且自适应不超格子宽度；与 OK/NG 大字共存便于现场复核
-    if not loc_ok:
-        _draw_chinese_centered(vis, "未检测到胶条，请再次确认",
-                               max_height_px=int(th * 0.7), color=(0, 255, 255))
 
 
 def _make_label_strip(text: str, width: int, height: int):
@@ -721,6 +727,13 @@ def _board_tablerow(fn: int, s) -> str:
     if not s:
         return (f"<tr><td>{fn:02d}</td><td colspan='5' class='muted'>"
                 f"无逐图数据</td></tr>")
+    # 未检测到胶条（loc_ok=False）：不做判定显示——不显示合格/超差与 OK/NG，
+    # 数据不可靠留空待人工复核（PLC 信号仍按 OK 放行）
+    if not bool(s.get("loc_ok", True)):
+        return (f"<tr><td>{fn:02d}</td>"
+                f"<td class='muted'>-</td><td class='muted'>-</td>"
+                f"<td class='muted'>-</td><td class='muted'>-</td>"
+                f"<td class='muted'>未检测到胶条</td></tr>")
     # 宽度列：优先展示『所有检测到的胶条段』(逗号隔开)；旧数据无该字段时回退代表值
     ws_all = s.get("widths_all_mm") or []
     if ws_all:
