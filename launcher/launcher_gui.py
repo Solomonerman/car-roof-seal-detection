@@ -81,6 +81,10 @@ class LauncherApp:
         tk.Button(btn_frm, text="打开看板", width=10, height=2,
                   command=lambda: webbrowser.open("http://localhost:8000")).pack(side=tk.LEFT, padx=6)
 
+        # ---- 操作注意（现场防呆提示）----
+        tk.Label(root, text="操作注意：关闭程序后请等 1 分钟再开启（等相机释放占用），否则可能提示相机被其他程序控制",
+                 fg="#b71c1c", font=("Microsoft YaHei", 9)).pack(anchor="w", padx=14)
+
         # ---- 日志面板 ----
         tk.Label(root, text="实时日志（启停台 + 采集程序 + 看板）:").pack(anchor="w", padx=14)
         self.txt = scrolledtext.ScrolledText(root, height=16, state=tk.DISABLED, font=("Consolas", 9))
